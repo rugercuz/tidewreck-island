@@ -27,6 +27,7 @@ export const MSG = {
   BUILD_PORTAL: 'buildPortal',    // {}
   ENTER_PORTAL: 'enterPortal',    // {}
   CHAT: 'chat',                   // {text}
+  BONK_FISH: 'bonkFish',          // {flopperId, dmg} whack your landed catch to finish it
 
   // server -> client
   ROOM_STATE: 'roomState',        // full lobby state {code, name, players:[], hostId, settings, started}
@@ -53,6 +54,45 @@ export const MSG = {
   GAME_WON: 'gameWon',            // {stats} portal escape!
   PORTAL_STATE: 'portalState',    // {built, canBuild, missing:[artifactIds]}
   CHAT_MSG: 'chatMsg',            // {fromName, text}
+  WEATHER: 'weather',             // {type, until} weather changed (also included in WORLD_STATE)
+  FLOPPER: 'flopper',             // {state:'spawn'|'hit'|'dead'|'escaped', flopperId, fish?, hp?, maxHp?}
+  LIGHTNING: 'lightning',         // {p:[x,y,z], targetId|null} a strike lands (storm hazard)
+};
+
+// ---------------- Weather ----------------
+// Server rerolls weather at dawn and dusk (weighted random). Pity system:
+// PITY_CLEAR_DAYS without rain/storm forces one (60% storm / 40% rain).
+// Effects: waveScale multiplies ocean wave amplitude (client shader + CPU fn must
+// use it), luck/tierBias add to fishing rolls, biteSpeed divides bite delay,
+// eventChanceMult multiplies nightly horror-event odds. weight = random pick weight.
+export const WEATHER = {
+  clear:    { name: 'Clear Skies',  waveScale: 1.0, luck: 0,    tierBias: 0,   biteSpeed: 1.0, eventChanceMult: 1.0, weight: 34 },
+  overcast: { name: 'Overcast',     waveScale: 1.4, luck: 0.05, tierBias: 0.3, biteSpeed: 1.1, eventChanceMult: 1.2, weight: 22 },
+  fog:      { name: 'Dead Fog',     waveScale: 0.8, luck: 0.10, tierBias: 0.5, biteSpeed: 0.9, eventChanceMult: 1.5, weight: 14,
+              hazard: 'Visibility collapses. Predators hunt bolder (+50% aggro range).' },
+  rain:     { name: 'Rain Squall',  waveScale: 1.9, luck: 0.15, tierBias: 0.8, biteSpeed: 1.3, eventChanceMult: 1.6, weight: 18,
+              hazard: 'Heavy chop. The boat wallows and drifts.' },
+  storm:    { name: 'Thunderstorm', waveScale: 2.8, luck: 0.30, tierBias: 1.5, biteSpeed: 1.5, eventChanceMult: 2.5, weight: 12,
+              hazard: 'Lightning strikes open water. Monstrous waves.' },
+};
+export const WEATHER_RULES = {
+  CHANGES_PER_DAY: 2,             // reroll at dawn (timeOfDay ~0.06) and dusk (NIGHT_START)
+  PITY_CLEAR_DAYS: 2,             // days without rain/storm before pity forces one
+  PITY_STORM_CHANCE: 0.6,         // pity picks storm 60% / rain 40%
+  LIGHTNING_PERIOD: [6, 14],      // seconds between strikes during a storm
+  LIGHTNING_DMG: 20,              // players on open water (not on island, above surface) can be hit
+  FOG_AGGRO_MULT: 1.5,
+};
+
+// ---------------- Landed-catch bonking ----------------
+// A caught fish lands on deck ALIVE and flopping. Whack it (bare hands or any
+// melee weapon) until its flopper HP hits 0 to stow it in your inventory.
+// Ignore it too long and it flops back into the sea.
+export const FLOPPER = {
+  BASE_HP: 10,
+  HP_PER_TIER: 5,      // flopperHp = BASE_HP + tier * HP_PER_TIER
+  HAND_DMG: 10,        // barehand whack (no weapon needed, slower swing)
+  ESCAPE_SECONDS: 25,
 };
 
 // ---------------- Mutations (special fish effects) ----------------
@@ -119,6 +159,16 @@ export const FISH = [
   { id: 'megalodon',  name: 'Megalodon',          tier: 10, value: 8200, kg: [8000, 20000],model: { shape: 'shark', size: 9.0,  colors: [0x3e4e5a, 0x26323c], belly: 0xb8c4cc, teeth: true } },
   { id: 'seaserpent', name: 'Sea Serpent',        tier: 10, value: 8800, kg: [3000, 9000], model: { shape: 'serpent', size: 10.0, colors: [0x2a6a4a, 0x14402a], belly: 0x8ac8a0, emissive: 0x2aff88, frills: true } },
   { id: 'leviathan',  name: 'Abyssal Leviathan',  tier: 10, value: 9500, kg: [10000, 30000], model: { shape: 'blob', size: 8.0, colors: [0x1a1428, 0x0c0a16], belly: 0x3a3052, emissive: 0x6644ff, teeth: true } },
+  // --- Weather-exclusive fish - only join their tier's pool while their
+  //     weather type is active (in areas whose tier range includes them).
+  { id: 'raindancer', name: 'Rain Dancer',    tier: 3, value: 70,   kg: [0.8, 2.5],  weather: 'rain',
+    model: { shape: 'slim',  size: 0.45, colors: [0x4a90b8, 0x2e5f7d], belly: 0xd0e8f5, finTint: 0x88ccee } },
+  { id: 'stormrider', name: 'Stormrider Eel', tier: 6, value: 560,  kg: [15, 40],    weather: 'storm',
+    model: { shape: 'eel',   size: 2.0,  colors: [0x2a2a3e, 0x16162a], belly: 0x8888b0, emissive: 0xffee44 } },
+  { id: 'mistwraith', name: 'Mist Wraith',    tier: 7, value: 900,  kg: [4, 12],     weather: 'fog',
+    model: { shape: 'angler', size: 0.8, colors: [0x9aa8b0, 0x6a7880], belly: 0xdde8ec, emissive: 0xbbddee } },
+  { id: 'thunderfin', name: 'Thunderfin',     tier: 8, value: 1900, kg: [120, 300],  weather: 'storm',
+    model: { shape: 'shark', size: 3.0,  colors: [0x1e2a4a, 0x101830], belly: 0xaabbdd, emissive: 0x66aaff, finTint: 0xffee44 } },
   // --- Tier X ("tier +10") - juvenile event creatures. Catchable ONLY after
   //     surviving the matching horror event. Each yields a permanent artifact.
   { id: 'serpenthatchling', name: 'Serpent Hatchling', tier: 11, value: 16000, kg: [200, 500], requiresEvent: 'serpent',
@@ -165,10 +215,13 @@ export const SHOP = [
   { id: 'squidbait',kind: 'bait', name: 'Squid Chunk',  price: 120,  pack: 10, tierBias: 1,   luck: 0.1,  desc: 'Big fish bait.' },
   { id: 'glowbait', kind: 'bait', name: 'Glowbait',     price: 400,  pack: 10, tierBias: 1.5, luck: 0.2,  desc: 'Deep dwellers cannot resist light.' },
   { id: 'voidbait', kind: 'bait', name: 'Voidbait',     price: 1500, pack: 10, tierBias: 2,   luck: 0.35, desc: 'Do not look at it too long. Doubles mutation odds.' },
-  // weapons
-  { id: 'harpoon',  kind: 'weapon', name: 'Harpoon',       price: 500,   dmg: 25, rate: 0.8, range: 25, desc: 'Throw, retrieve, repeat.' },
-  { id: 'speargun', kind: 'weapon', name: 'Speargun',      price: 2500,  dmg: 45, rate: 1.4, range: 35, desc: 'Works underwater. Very persuasive.' },
-  { id: 'trident',  kind: 'weapon', name: 'Storm Trident', price: 10000, dmg: 90, rate: 1.0, range: 45, desc: 'Crackles with charge. The sea respects it.' },
+  // weapons — attack: 'melee' | 'ranged' | 'both'. Melee weapons also bonk
+  // landed catches (see FLOPPER); ranged-only ones cannot.
+  { id: 'bonker',   kind: 'weapon', attack: 'melee',  name: 'Fish Bonker',   price: 150,   dmg: 25, rate: 1.2, range: 3,   desc: 'A club for finishing the catch. Also fine for rude fish.' },
+  { id: 'harpoon',  kind: 'weapon', attack: 'ranged', name: 'Harpoon',       price: 500,   dmg: 25, rate: 0.8, range: 25,  desc: 'Throw, retrieve, repeat.' },
+  { id: 'cutlass',  kind: 'weapon', attack: 'melee',  name: 'Rusty Cutlass', price: 1200,  dmg: 50, rate: 1.6, range: 3.5, desc: 'Swish. Slash. Sashimi.' },
+  { id: 'speargun', kind: 'weapon', attack: 'ranged', name: 'Speargun',      price: 2500,  dmg: 45, rate: 1.4, range: 35,  desc: 'Works underwater. Very persuasive.' },
+  { id: 'trident',  kind: 'weapon', attack: 'both',   name: 'Storm Trident', price: 10000, dmg: 90, meleeDmg: 65, rate: 1.0, range: 45, desc: 'Crackles with charge. Jab it or unleash it.' },
   // luck charms (stack multiplicatively with bait luck)
   { id: 'charm1', kind: 'charm', name: 'Bronze Talisman', price: 600,   luck: 0.10, desc: '+10% luck. A warm feeling.' },
   { id: 'charm2', kind: 'charm', name: 'Silver Talisman', price: 2500,  luck: 0.25, desc: '+25% luck. The sea winks at you.' },
