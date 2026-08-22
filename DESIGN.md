@@ -1,0 +1,158 @@
+# TIDEWRECK ISLAND — Architecture Contract
+
+Co-op 3D multiplayer fishing party game. A team of 2–8 friends lives on an island.
+Sell fish to meet an ever-growing quota — miss it and a tsunami ends the run.
+Survive horror events, catch all three Tier-X creatures, build the portal, escape. That's the win.
+
+**This file is the contract.** Every module is written by a different author in parallel.
+If you deviate from an interface here, the game breaks. Read `shared/constants.js` too — it is
+the single source of truth for all game data (fish, shop, areas, events, protocol names).
+
+## Stack & hard rules
+
+- Node >= 18, ES modules everywhere (`"type": "module"`).
+- Server: Express (static) + Socket.io. Client: Three.js r185 via importmap name `three`
+  (served from `/lib/three.module.js`). Socket.io client from `/socket.io/socket.io.js` (global `io`).
+- **NO `three/addons` imports. NO external assets, URLs, CDNs, textures, models, or audio files.**
+  Everything is procedural: geometry built in code, textures via canvas, audio via WebAudio synthesis.
+- Vanilla DOM for UI. No frameworks, no build step. The game must run with `npm install && npm start`.
+- Every file must be complete and syntactically valid — no TODOs, stubs, or placeholder functions.
+- Only write the files you own. Import freely from `shared/constants.js` and other modules per this contract.
+- Guard against momentarily-null refs (`if (!ctx.state.world) return;`) — modules init before the game starts.
+- Target 60 fps on a mid laptop: merge geometry where easy, reuse materials, keep particle counts sane.
+
+## File ownership
+
+| Owner | Files |
+|---|---|
+| server | `server/index.js`, `server/rooms.js`, `server/game.js`, `server/fishing.js` |
+| client-core | `public/index.html`, `public/js/main.js`, `public/js/net.js` |
+| world | `public/js/world.js` |
+| water | `public/js/water.js` |
+| player | `public/js/player.js` |
+| boat | `public/js/boat.js` |
+| fish-models | `public/js/fish.js` |
+| fishing | `public/js/fishing.js` |
+| enemies | `public/js/enemies.js` |
+| events | `public/js/events.js` |
+| audio | `public/js/audio.js` |
+| ui | `public/js/ui.js`, `public/style.css` |
+
+## Client architecture
+
+`main.js` builds a shared context `ctx`, initializes every module, runs the render loop.
+
+```js
+ctx = {
+  THREE, scene, camera, renderer, clock,
+  net,   // from net.js: { send(type, data), on(type, cb), id() }
+  bus,   // tiny emitter: { on(evt, cb), off(evt, cb), emit(evt, data) }
+  state: {
+    phase: 'menu' | 'lobby' | 'playing' | 'over',
+    myId: null, myName: '', myColor: 0,       // color = index into PLAYER_COLORS
+    world: null,          // latest WORLD_STATE payload from server (see constants MSG.WORLD_STATE)
+    room: null,           // latest ROOM_STATE payload
+    gear: { rod: 1, boat: 1, weapons: [], charms: [], diving: 1, activeBait: null, activeWeapon: null },
+    baits: {},            // baitId -> count
+    inventory: [],        // [{invId, fishId, mutation, weightKg, value}]
+    hp: 100, air: 1,      // air = 0..1 fraction remaining
+    underwater: false, onBoat: false, seat: -1,
+    currentArea: null,    // areaId the local player/boat is inside, else null
+    eventActive: null,    // 'serpent' | 'kraken' | 'bloop' | null
+    activeTool: 'rod',    // 'rod' | 'weapon' — ui/hotkeys 1 & 2 switch; fishing acts only on 'rod', weapons only on 'weapon'
+    timeOfDay: 0.3,       // 0..1, client-interpolated between WORLD_STATE ticks
+  },
+  input: { keys: new Set(), mouseDown: false, pointerLocked: false },  // keys hold e.code values
+  getWaterHeight: (x, z, t) => 0,   // OVERWRITTEN by water.js. Everyone samples waves through this.
+  world: null, water: null, playerMod: null, boat: null, fishing: null,
+  enemies: null, events: null, audio: null, ui: null,   // module handles, set by main.js after each init
+}
+```
+
+**Init order** (main.js, at page load — the island renders behind the menu as a slow orbiting shot):
+`audio, world, water, player, boat, fishing, enemies, events, ui`. Each module exports
+`init<Name>(ctx)` returning a handle object stored on ctx, and main calls `ctx.<handle>.update(dt, t)`
+every frame in the same order. `t` is seconds since page load (`clock.getElapsedTime()`), `dt` capped at 0.05.
+
+**Module exports (exact names):**
+
+- `world.js` → `export function initWorld(ctx)` → handle `{ update(dt,t), getTerrainHeight(x,z), setNightSnap(on), setPortalBuilt(on), portalPos, shopPos, ringPos, dockPos }`
+- `water.js` → `initWater(ctx)` → `{ update(dt,t), splash(pos, size) }`; sets `ctx.getWaterHeight`
+- `player.js` → `initPlayer(ctx)` → `{ update(dt,t), createCharacter(colorIndex, name), local, remotes }`.
+  `createCharacter` returns `{ group, bones: { root, head, armL, armR, legL, legR, handR }, setAnim(name), update(dt,t) }`
+  with anims `idle|walk|run|swim|cast|reel|sit|drive`; `handR` is the rod/weapon attach Object3D.
+  `local.char` is the local player's character (fishing.js attaches rod models to `local.char.bones.handR`).
+- `boat.js` → `initBoat(ctx)` → `{ update(dt,t), group, isDriver(), nearBoat(pos), velocity, seatWorld(seatIndex, outVec3), seatCount() }`
+- `fish.js` → `export function createFishMesh(fishDef, mutation, scaleMult = 1)` → `THREE.Group` with `group.userData.update(t)` swim/wiggle animation. Pure factory, no init.
+- `fishing.js` → `initFishing(ctx)` → `{ update(dt,t), isCasting() }`
+- `enemies.js` → `initEnemies(ctx)` → `{ update(dt,t) }`
+- `events.js` → `initEvents(ctx)` → `{ update(dt,t) }`
+- `audio.js` → `initAudio(ctx)` → `{ update(dt,t), cutMusic(), sfx(name, opts), setUnderwater(on), startMusic(), setVolume(v01) }`
+- `ui.js` → `initUI(ctx)` → `{ update(dt,t), toast(text, kind), openShop(), closeAll() }`
+
+**Bus events** (names are load-bearing):
+
+| event | payload | emitted by | consumed by |
+|---|---|---|---|
+| `phase` | newPhase string | main/ui | all |
+| `worldState` | WORLD_STATE payload | main (on msg) | world, ui, events |
+| `underwater` | bool | player | water, audio, ui |
+| `boardBoat` / `leaveBoat` | {seat} / {} | player/boat | boat, fishing, ui |
+| `castStart` / `bite` / `catch` | see MSG | fishing | audio, ui |
+| `eventStart` / `eventEnd` | {type} / {type, survived, unlocked} | main (on msg) | events, audio, world, ui, enemies |
+| `localDamaged` | {dmg, cause} | enemies/events | ui, audio, player |
+| `sunDir` | THREE.Vector3 (normalized, updated each frame) | world | water |
+
+**index.html** must contain exactly: `<canvas id="game"></canvas>`, `<div id="ui"></div>`,
+`<link rel="stylesheet" href="style.css">`, importmap `{ "imports": { "three": "./lib/three.module.js" } }`,
+`<script src="/socket.io/socket.io.js"></script>`, `<script type="module" src="js/main.js"></script>`.
+ui.js builds ALL menu/HUD DOM inside `#ui` and owns `style.css` entirely.
+
+## World layout
+
+- Island: circular-ish, radius ~120 m centered at origin, procedural low-poly terrain
+  (analytic height function — `getTerrainHeight` must match the visible mesh). Beach ring,
+  grassy hills, palm trees. Sea level y = 0.
+- Landmarks (world.js decides exact spots, exposes positions): wooden **dock** on the south
+  shore (toward Home Shallows), **shop hut** near the dock, ancient **stone ring** on a hill
+  (portal site), campfire spawn point.
+- Fishing **areas** per `AREAS` in constants: mark each with a distinct glowing buoy ring;
+  seabed at `depth`. Ocean floor elsewhere ~ -30 m, sloping down toward the abyss area.
+- Day/night: sun + moon orbit driven by `ctx.state.timeOfDay` (main interpolates using
+  ECON.DAY_SECONDS between server ticks). Warm sunrises/sunsets, star field at night,
+  visible **god rays** (additive shafts, both above water looking toward sun and underwater).
+  `setNightSnap(true)` = horror override: instant black-red night sky, heavy fog, red moon —
+  restore on `setNightSnap(false)`.
+
+## Gameplay flow (server-authoritative)
+
+Lobby: create room (name, max players 2–8, difficulty chill/normal/hard = quota ×0.7/1/1.4) →
+4-letter room code → friends join → everyone readies → host starts.
+
+In game: shared **team wallet** (constants ECON.START_WALLET), personal gear/inventory.
+Cast in an area you've unlocked → server rolls bite delay (2–6 s) → BITE → client reel
+minigame → REEL_DONE → server rolls fish (tier within area range biased by rod level +
+bait tierBias + luck; mutation roll scaled by luck, voidbait doubles it) → CAST_RESULT.
+Sell at the shop hut → wallet += value, quota progress += value. Quota completes →
+next target ×1.55, deadline = +3 days. Deadline passes unmet → TSUNAMI → game over.
+Tsunami Ward purchase pushes deadline +3 days, price ×1.5 each time.
+Horror events fire at night per EVENTS schedule (server picks; guaranteed by pityDay).
+Surviving one unlocks its Tier-X fish in the Abyss. First catch of each Tier-X fish awards
+its permanent artifact. 10 quotas + 3 artifacts → build portal at the stone ring → everyone
+steps in → GAME_WON.
+
+Death: hp 0 → knocked out (screen dims, can't act); revived automatically at the campfire
+at the next sunrise, or when an event ends. All players down during an event = event failed
+(it will re-run another night). Server relays MOVE→PLAYERS_MOVE (~12 Hz) and DRIVE_BOAT→BOAT_STATE;
+runs 10 Hz tick for day cycle, enemies, events; 1 Hz WORLD_STATE.
+
+## Visual bar (all scene modules)
+
+Renderer: `outputColorSpace = SRGBColorSpace`, `ACESFilmicToneMapping`, shadows PCFSoft
+(sun light only, shadow camera covering the island). Stylized-vivid low-poly look:
+saturated but cohesive palette, `flatShading` on terrain/props, fog matched to sky color.
+Characters: charming low-poly fisherfolk (~1.7 m) — body, head with canvas-texture face,
+hat, arms/legs animated procedurally (walk/run/swim/cast/sit/drive), player-color clothing,
+floating name tag (canvas sprite). Rods get visibly cooler per level (driftwood → glowing
+mythline). Fish read as their species at a glance; mutations are unmistakable (see
+MUTATIONS.fx). Boat upgrades change the hull visibly (dinghy → lamp-rigged abyss-runner).

@@ -1,0 +1,66 @@
+# 🎣 Tidewreck Island
+
+A co-op 3D multiplayer fishing party game for 2–8 friends. Built with Three.js and Socket.io — no build step, no external assets, everything procedural.
+
+**The pitch:** your crew is stranded on an island. Sell fish to meet an ever-growing quota, or a tsunami wipes you out. Upgrade rods, boats, baits, and weapons; sail out to deeper, scarier waters; survive three horror events (the music cutting out is your only warning); catch the three Tier-X creatures for their artifacts; build the portal at the stone ring and escape together.
+
+## Features
+
+- 🌊 **3D island + open ocean** with day/night cycle, god rays, and a wavy shader ocean you can dive under
+- 🚤 **Shared boat** with buoyancy physics — your whole crew rides together, one drives
+- 🐟 **38 fish across 11 tiers** — from the humble Sardine to the Megalodon, Sea Serpent, and Abyssal Leviathan
+- ✨ **6 mutations**: Golden, Rainbow, Void, Spectral, Molten, Crystal — rare, gorgeous, and worth a fortune
+- 🏪 **Shop & progression**: 5 rods, 4 boats, 5 baits, 3 weapons, luck charms, diving gear, and the Tsunami Ward
+- 📈 **Quota pressure**: the target grows ×1.55 every cycle; miss the deadline and the wave comes
+- 👹 **Horror events**: The Serpent, The Kraken, The Bloop. The soundtrack cuts to silence, day snaps to night, and something the size of a building surfaces. Survive to unlock their catchable offspring
+- ⚔️ **Enemies & weapons**: barracuda packs, reef sharks, abyss stalkers — fight back with harpoon, speargun, or Storm Trident
+- 🎵 **Fully synthesized soundtrack & SFX** via WebAudio — zero audio files
+- 🏠 **Rooms**: create an island with a 4-letter code, set max players and difficulty, and share it with friends
+
+## Run locally
+
+```bash
+npm install
+npm start
+```
+
+Open http://localhost:3000 — open a second tab to test multiplayer solo.
+
+## Controls
+
+| Key | Action |
+|---|---|
+| WASD / Shift | Move / run |
+| Mouse | Look (click canvas to lock) |
+| LMB (hold) | Charge cast · hook · reel · attack |
+| E | Interact (boat / shop / portal) |
+| Space / C | Jump · swim up / dive |
+| 1 / 2 | Rod / weapon |
+| B | Cycle bait |
+| I | Inventory |
+| Enter | Chat |
+
+## Deploy free (so friends can join online)
+
+The server is a single Node process serving both the game and the WebSocket — ideal for free hosts.
+
+### Render (recommended, easiest)
+
+1. Push this repo to GitHub.
+2. Go to [render.com](https://render.com) → **New → Web Service** → connect the repo.
+3. It reads `render.yaml` automatically (or set: build `npm install`, start `npm start`, free instance type).
+4. Share the `https://your-app.onrender.com` URL with friends.
+
+Note: free Render instances sleep after 15 min idle — the first visit takes ~30s to wake.
+
+### Railway / Fly.io / Glitch
+
+All work the same way: import the GitHub repo, it detects Node, runs `npm start`, done. The server binds `process.env.PORT` automatically.
+
+## How to win
+
+Complete the quota **10 times**, survive all **3 horror events**, catch each **Tier-X** creature for its artifact (Serpent Scale, Kraken Beak Shard, Heart of the Bloop), then build the portal at the stone ring and step through — together.
+
+---
+
+Made with Claude Code. 🌊
