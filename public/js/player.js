@@ -1697,6 +1697,8 @@ export function initPlayer(ctx) {
     const char = local.char;
     if (!local.spawned) { respawn(); local.spawned = true; }
     if (boardCooldown > 0) boardCooldown -= dt;
+    if (vaultCd > 0) vaultCd -= dt;
+    if (vaultT > 0) vaultT -= dt;
     if (castFlash > 0) castFlash -= dt;
 
     const ko = st.hp <= 0;
@@ -1788,7 +1790,7 @@ export function initPlayer(ctx) {
 
     const feetUnder = local.pos.y < waterY - 0.28;
     if (!local.swimming) {
-      if (!ko && depth > SWIM_DEPTH_ENTER && feetUnder) {
+      if (!ko && vaultT <= 0 && depth > SWIM_DEPTH_ENTER && feetUnder) {
         local.swimming = true;
         splash(local.pos.x, waterY, local.pos.z, clamp(0.6 + Math.abs(local.vel.y) * 0.12, 0.6, 2.0));
         local.vel.y *= 0.15;
@@ -1806,6 +1808,39 @@ export function initPlayer(ctx) {
       const diveDown = isDown('KeyC');
       const goUp = isDown('Space');
       const spd = running ? SWIM_SPRINT : SWIM_SPEED;
+
+      // Water-exit vault: Space at the surface next to a climbable edge
+      // (shore, dock decking, a boat hull) mantles you out of the sea.
+      if (!under && !ko && vaultCd <= 0 && justDown('Space')) {
+        const px = local.pos.x + Math.sin(local.yaw) * VAULT_REACH;
+        const pz = local.pos.z + Math.cos(local.yaw) * VAULT_REACH;
+        let ledgeY = surfaceH(px, pz, local.pos.y + 2.2);
+        const B = ctx.boat;
+        if (B && typeof B.deckInfo === 'function') {
+          const di = B.deckInfo(px, pz, local.pos.y + 2.2, _deckA);
+          if (di && Number.isFinite(di.y) && di.y > ledgeY) ledgeY = di.y;
+        }
+        const rise = ledgeY - waterY;
+        if (rise >= VAULT_MIN_RISE && rise <= VAULT_MAX_RISE) {
+          local.swimming = false;
+          local.grounded = false;
+          vaultT = VAULT_HOLD;
+          vaultCd = VAULT_CD;
+          // Enough launch to clear the ledge from however deep our feet float.
+          const needRise = Math.max(0.9, ledgeY - local.pos.y + 0.45);
+          local.vel.y = Math.max(VAULT_UP, Math.sqrt(2 * Math.abs(GRAVITY) * needRise));
+          // Air friction eats ~(v / AIR_ACCEL) metres of travel - push hard
+          // enough that the mantle actually carries us over the lip.
+          const fwdImp = Math.max(VAULT_FWD, AIR_ACCEL * (VAULT_REACH + 0.5));
+          local.vel.x = Math.sin(local.yaw) * fwdImp;
+          local.vel.z = Math.cos(local.yaw) * fwdImp;
+          splash(local.pos.x, waterY, local.pos.z, 1.1);
+          if (ctx.audio && ctx.audio.sfx) ctx.audio.sfx('vault');
+          setUnderwater(false);
+          updateArea(local.pos.x, local.pos.z);
+          return;
+        }
+      }
 
       // horizontal (follows camera pitch while fully submerged)
       wishDir(_v2, local.yaw, fwd, str);

@@ -7,15 +7,16 @@ A co-op 3D multiplayer fishing party game for 2–8 friends. Built with Three.js
 ## Features
 
 - 🌊 **3D island + open ocean** with day/night cycle, god rays, and a wavy shader ocean you can dive under
-- 🚤 **Shared boat** with buoyancy physics — your whole crew rides together, one drives
+- 🚤 **Walkable boats** with buoyancy physics — four hull classes (5.5 m dinghy to 14 m Abyss-Runner); the whole crew stands, walks, and fishes on deck while one drives at the helm
+- 🤿 **Diving is worth it (and dangerous)**: seabed treasure that scales with depth — pearl clams, coin stashes, sunken chests, relics, abyssal geodes. Chests can hold found-only baits and five **one-of-a-kind charms** (Pearl of the Deep, Siren's Locket, Barnacle Idol, Drowned Crown, Tidal Bell) — one each per run, first finder keeps it. Watch your air, and watch the shadows: drifting Dagger Jellies sting, and Moray Ambushers lurk nearly invisible beside the treasure
 - 🐟 **44 fish across 11 tiers** — from the humble Sardine to the Megalodon, Sea Serpent, and Abyssal Leviathan
 - ✨ **6 mutations**: Golden, Rainbow, Void, Spectral, Molten, Crystal — rare, gorgeous, and worth a fortune
 - ⛈️ **Weather with a pity system**: Clear, Overcast, Dead Fog, Rain Squall, Thunderstorm — real wave-height changes, fishing luck boosts, lightning hazards, weather-exclusive fish, and storms that make horror events 2.5× more likely. Stay dry too long and the pity system sends the storm to find you
-- 🔨 **Kill your catch**: fish land on deck *alive and flopping* — bonk them (bare hands or melee) before they flop back into the sea
+- 🔨 **Kill your catch**: fish land at your feet *alive and flopping* — bonk them before they escape, then scoop up the glowing prize. Space vaults you out of the water onto shore, dock, or boat
 - 🏪 **Shop & progression**: 5 rods, 4 boats, 5 baits, 5 weapons (melee + ranged), luck charms, diving gear, and the Tsunami Ward
 - 📈 **Quota pressure**: the target grows ×1.55 every cycle; miss the deadline and the wave comes
 - 👹 **Horror events**: The Serpent, The Kraken, The Bloop. The soundtrack cuts to silence, day snaps to night, and something the size of a building surfaces. Survive to unlock their catchable offspring
-- ⚔️ **Enemies & weapons**: barracuda packs, reef sharks, abyss stalkers — fight back with harpoon, speargun, or Storm Trident
+- ⚔️ **Enemies & weapons**: barracuda packs, reef sharks, abyss stalkers, jellies, morays, and the Depthmaw — fight back with club, cutlass, harpoon, speargun, or Storm Trident
 - 🎵 **Fully synthesized soundtrack & SFX** via WebAudio — zero audio files
 - 🏠 **Rooms**: create an island with a 4-letter code, set max players and difficulty, and share it with friends
 
@@ -58,39 +59,6 @@ Note: free Render instances sleep after 15 min idle — the first visit takes ~3
 ### Railway / Fly.io / Glitch
 
 All work the same way: import the GitHub repo, it detects Node, runs `npm start`, done. The server binds `process.env.PORT` automatically.
-
-## Roadmap — what's left to finish
-
-Development was paused mid-wave-4. `main` is the last **fully verified, playable build**
-(movement, fishing + bonking, walkable boats, weather, all three horror events, collision,
-audio, customization all tested live). The unfinished wave-4 work lives on the
-[`wave4-wip`](https://github.com/rugercuz/tidewreck-island/tree/wave4-wip) branch —
-**written but interrupted before integration testing. Do not merge it blindly**; test each
-piece against the "Wave 4 addendum" contract at the end of `DESIGN.md` (on that branch),
-which is the full spec. Remaining work:
-
-1. **Diving loot** (mostly written on the branch): seabed treasure per area (pearl clams →
-   abyssal geodes), sunken chests containing found-only baits (Glow Grub, Abyss Leech) and
-   five one-of-a-kind charms (Pearl of the Deep, Siren's Locket, Barnacle Idol, Drowned
-   Crown, Tidal Bell). Data is complete in `shared/constants.js` on the branch; server spawning
-   + pickup and the new `public/js/loot.js` exist but are untested.
-2. **Wire `loot.js` into the game loop** — it was never added to `public/js/main.js`:
-   import `initLoot`, call it after `initEnemies`, store as `ctx.loot`, add its
-   `update(dt, t)` to the frame loop in the same order.
-3. **Flopper fixes** (written, untested): caught fish must land at the catcher's feet — on
-   the boat deck (riding it), on the dock planks (currently it can fall in the water under
-   the dock), never floating mid-air; killed fish become glowing walk-over pickups.
-4. **Water-exit vault** (written, untested): Space while swimming near a low edge vaults you
-   onto shore/dock/boat.
-5. **New dive predators**: drifting Dagger Jellies + loot-guarding Moray/Depthmaw ambushers.
-   Server AI is written; the **enemy visuals in `public/js/enemies.js` were NOT done** —
-   the jelly bell and coiled-ambusher models/animations still need building (spec in the
-   addendum).
-6. **Re-verify after integrating**: boot the game, then check — camera-relative WASD +
-   jump (see `DESIGN.md`; this has regressed before), the full catch → bonk → pickup →
-   inventory loop from dock/deck/beach, loot pickup underwater, and no console errors.
-   Tip: as host, type `/event serpent|kraken|bloop` in chat to force a horror event for
-   testing.
 
 ## How to win
 

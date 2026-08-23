@@ -51,6 +51,13 @@ const MELEE_JAB_RANGE = 4.0;   // 'both' weapons jab instead of firing inside th
 const MELEE_NEAR = 1.3;        // closer than this the arc test is skipped
 const MELEE_MAX_TARGETS = 3;   // a wide swing may catch a small shoal
 
+// Wave 4 behaviours ('drift' jellies, 'ambush' morays/depthmaws)
+const AMBUSH_TELEGRAPH = 0.3;  // seconds of uncoil wind-up before the lunge
+const AMBUSH_LURK_DIM = 0.25;  // material brightness multiplier while lurking
+const AMBUSH_SURGE = [1.4, 1.2];  // [min, random extra] seconds between re-lunges
+const STING_RANGE_PAD = 1.25;  // metres past the jelly radius that counts as contact
+const STING_SFX_GAP = 0.4;     // seconds before a sting may make noise again
+
 // ------------------------------------------------------------------
 // Scratch objects — module level so per-frame allocation stays at zero
 // ------------------------------------------------------------------
@@ -325,7 +332,189 @@ class ParticleField {
 }
 
 // ------------------------------------------------------------------
+// Dagger Jelly — built here, not by createFishMesh. A lathed bell with an
+// additive over-shell, a stinging rim, a few glowing organs and a skirt of
+// trailing stingers. Geometry and base materials are shared across every
+// jelly in the world; buildVisual() clones the materials per instance so the
+// hit-flash pipeline can tint them independently.
+// ------------------------------------------------------------------
+let _JELLY = null;
+function jellyAssets() {
+  if (_JELLY) return _JELLY;
+  // bell profile, apex (0,1) down to the rim (r,0)
+  const prof = [
+    [0.000, 1.000], [0.130, 0.985], [0.250, 0.930], [0.345, 0.830],
+    [0.415, 0.690], [0.452, 0.530], [0.468, 0.360], [0.462, 0.200],
+    [0.440, 0.075], [0.400, 0.000], [0.330, 0.020],
+  ];
+  const S = 0.9;   // ENEMIES.daggerjelly.size
+  const pts = [];
+  for (let i = 0; i < prof.length; i++) {
+    pts.push(new THREE.Vector2(Math.max(0.0006, prof[i][0] * S), prof[i][1] * S * 0.66));
+  }
+  const bell = new THREE.LatheGeometry(pts, 18);
+  bell.translate(0, -0.27, 0);
+  bell.computeVertexNormals();
+
+  const strand = new THREE.CylinderGeometry(0.017, 0.004, 1, 4, 1);
+  strand.translate(0, -0.5, 0);
+  const arm = new THREE.BoxGeometry(0.055, 1, 0.014);
+  arm.translate(0, -0.5, 0);
+  const rim = new THREE.TorusGeometry(0.4 * S, 0.026, 5, 20);
+  rim.rotateX(Math.PI / 2);
+  rim.translate(0, -0.262, 0);
+  const organ = new THREE.SphereGeometry(0.052, 7, 5);
+
+  _JELLY = {
+    geo: { bell, strand, arm, rim, organ },
+    mat: {
+      bell: new THREE.MeshStandardMaterial({
+        color: 0x63e89b, emissive: 0x2ad478, emissiveIntensity: 0.8,
+        roughness: 0.34, metalness: 0.0, transparent: true, opacity: 0.4,
+        depthWrite: false, side: THREE.DoubleSide,
+      }),
+      shell: new THREE.MeshBasicMaterial({
+        color: 0x8dffbe, transparent: true, opacity: 0.24,
+        blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide,
+      }),
+      rim: new THREE.MeshBasicMaterial({
+        color: 0xd2ffe0, transparent: true, opacity: 0.7,
+        blending: THREE.AdditiveBlending, depthWrite: false,
+      }),
+      organ: new THREE.MeshBasicMaterial({
+        color: 0xa6ffcf, transparent: true, opacity: 0.5,
+        blending: THREE.AdditiveBlending, depthWrite: false,
+      }),
+      sting: new THREE.MeshBasicMaterial({
+        color: 0xbdff8a, transparent: true, opacity: 0.55,
+        blending: THREE.AdditiveBlending, depthWrite: false,
+      }),
+    },
+  };
+  return _JELLY;
+}
+
+function buildJellyMesh() {
+  const A = jellyAssets();
+  const g = new THREE.Group();
+
+  // everything that squeezes when the bell pulses lives under this pivot
+  const pivot = new THREE.Group();
+  g.add(pivot);
+  const bell = new THREE.Mesh(A.geo.bell, A.mat.bell);
+  bell.renderOrder = 2;
+  pivot.add(bell);
+  const shell = new THREE.Mesh(A.geo.bell, A.mat.shell);
+  shell.scale.setScalar(1.1);
+  shell.renderOrder = 3;
+  pivot.add(shell);
+  const rim = new THREE.Mesh(A.geo.rim, A.mat.rim);
+  rim.renderOrder = 4;
+  pivot.add(rim);
+  for (let i = 0; i < 4; i++) {
+    const a = (i / 4) * Math.PI * 2 + 0.6;
+    const o = new THREE.Mesh(A.geo.organ, A.mat.organ);
+    o.position.set(Math.cos(a) * 0.15, -0.06, Math.sin(a) * 0.15);
+    o.scale.set(0.85, 1.5, 0.85);
+    o.renderOrder = 3;
+    pivot.add(o);
+  }
+
+  // trailing stingers hung off the rim, each on its own swaying pivot
+  const strands = [];
+  for (let i = 0; i < 7; i++) {
+    const a = (i / 7) * Math.PI * 2;
+    const p = new THREE.Group();
+    p.position.set(Math.cos(a) * 0.345, -0.255, Math.sin(a) * 0.345);
+    const m = new THREE.Mesh(A.geo.strand, A.mat.sting);
+    const len = 0.95 + (i % 3) * 0.3;
+    m.scale.set(1, len, 1);
+    m.renderOrder = 2;
+    p.add(m);
+    p.userData.ph = a + i * 0.71;
+    p.userData.len = len;
+    g.add(p);
+    strands.push(p);
+  }
+  // four short oral arms under the bell
+  const arms = [];
+  for (let i = 0; i < 4; i++) {
+    const a = (i / 4) * Math.PI * 2 + 0.4;
+    const p = new THREE.Group();
+    p.position.set(Math.cos(a) * 0.11, -0.24, Math.sin(a) * 0.11);
+    p.rotation.y = -a;
+    const m = new THREE.Mesh(A.geo.arm, A.mat.rim);
+    m.scale.set(1, 0.46, 1);
+    m.renderOrder = 3;
+    p.add(m);
+    p.userData.ph = a * 1.7 + 0.9;
+    g.add(p);
+    arms.push(p);
+  }
+
+  g.userData.update = function (t) {
+    if (typeof t !== 'number' || !isFinite(t)) t = 0;
+    const s = Math.sin(t * 1.55);
+    const c = s > 0 ? s : s * 0.4;         // snap shut, drift back open
+    pivot.scale.set(1 + c * 0.13, 1 - c * 0.2, 1 + c * 0.13);
+    for (let i = 0; i < strands.length; i++) {
+      const p = strands[i];
+      const ph = p.userData.ph;
+      p.rotation.x = Math.sin(t * 0.92 + ph) * 0.3 - c * 0.15;
+      p.rotation.z = Math.cos(t * 0.79 + ph * 1.3) * 0.3;
+      p.children[0].scale.y = p.userData.len * (1 + c * 0.14);
+    }
+    for (let i = 0; i < arms.length; i++) {
+      const p = arms[i];
+      p.rotation.x = Math.sin(t * 1.35 + p.userData.ph) * 0.34 - c * 0.22;
+      p.rotation.z = Math.cos(t * 1.12 + p.userData.ph) * 0.2;
+    }
+  };
+  g.userData.update(0);
+  return g;
+}
+
+// ------------------------------------------------------------------
+// Ambusher coil — stacked rings the serpent body rests in while it lurks.
+// One geometry per enemy type; the material is per-instance so its opacity
+// can fade as the creature uncoils.
+// ------------------------------------------------------------------
+const _coilGeos = new Map();
+function coilGeometry(type, radius, tube) {
+  let g = _coilGeos.get(type);
+  if (!g) {
+    g = new THREE.TorusGeometry(radius, tube, 6, 16);
+    g.rotateX(Math.PI / 2);
+    _coilGeos.set(type, g);
+  }
+  return g;
+}
+
+function buildCoil(type, cfg) {
+  const geo = coilGeometry(type, cfg.radius, cfg.tube);
+  const mat = new THREE.MeshStandardMaterial({
+    color: cfg.color, roughness: 0.74, metalness: 0.05, flatShading: true,
+    emissive: cfg.emissive || 0x000000, emissiveIntensity: cfg.emissive ? 0.55 : 0,
+    transparent: true, opacity: 1,
+  });
+  const group = new THREE.Group();
+  const rings = cfg.rings || 3;
+  for (let i = 0; i < rings; i++) {
+    const m = new THREE.Mesh(geo, mat);
+    const k = 1 - i * 0.19;
+    m.scale.set(k, 0.85 + i * 0.1, k);
+    m.position.y = i * cfg.tube * 1.25;
+    m.rotation.y = i * 0.7;
+    m.castShadow = true;
+    m.receiveShadow = false;
+    group.add(m);
+  }
+  return { group, mat };
+}
+
+// ------------------------------------------------------------------
 // Enemy visual definitions — fishDef-like objects fed to createFishMesh
+// (or, where `build` is set, to a procedural builder in this file)
 // ------------------------------------------------------------------
 const ENEMY_VISUALS = {
   barracudaPack: {
@@ -352,10 +541,46 @@ const ENEMY_VISUALS = {
     eyeColor: 0xc4ffd4, eyeIdle: 0.24, eyeSize: 0.07,
     lure: 0x86ff9c, bob: 0.35, animBase: 0.8, wake: 0x6fffa0,
   },
+  // --- Wave 4: drifting stinger. No fishDef at all — see buildJellyMesh. ---
+  daggerjelly: {
+    build: buildJellyMesh, noOrient: true, noShadow: true, eyeCount: 0,
+    eyeColor: 0xbdff8a, eyeIdle: 0, eyeSize: 0.05,
+    lure: null, bob: 1.0, animBase: 0.75, wake: 0x9dff8a,
+    sting: { color: 0x9dff6a, size: 1.4 },
+    mote: 0xa8ff9a,
+  },
+  // --- Wave 4: seabed ambushers. Serpentine bodies coiled over the loot. ---
+  moray: {
+    fishDef: {
+      id: 'enemy_moray', name: 'Moray Ambusher', tier: 6, value: 0, kg: [20, 60],
+      model: { shape: 'eel', size: 2.4, colors: [0x5f6d42, 0x333f20], belly: 0xb6c088, teeth: true },
+    },
+    eyeColor: 0xffc24a, eyeIdle: 0.04, eyeSize: 0.06,
+    lure: null, bob: 0.25, animBase: 1.15, wake: 0xbfe6c8,
+    coil: { color: 0x46512e, rings: 3, radius: 0.62, tube: 0.17 },
+  },
+  depthmaw: {
+    fishDef: {
+      id: 'enemy_depthmaw', name: 'Depthmaw', tier: 10, value: 0, kg: [900, 2400],
+      model: { shape: 'eel', size: 3.6, colors: [0x0b0b11, 0x050508], belly: 0x1c1016, emissive: 0xcc1a1e, teeth: true },
+    },
+    eyeColor: 0xff5a3a, eyeIdle: 0.06, eyeSize: 0.075,
+    lure: null, bob: 0.2, animBase: 0.95, wake: 0xff7a5a,
+    coil: { color: 0x0a0a10, emissive: 0x6b0d10, rings: 3, radius: 0.95, tube: 0.26 },
+    aura: { color: 0xff2a18, size: 1.5, idle: 0.1, hot: 0.85 },
+  },
 };
 
 function visualsFor(type) {
   return ENEMY_VISUALS[type] || ENEMY_VISUALS.reefshark;
+}
+
+// The server tags every ENEMY_STATE entry with its behaviour, but older
+// payloads (and the pre-wave-4 protocol) don't — fall back to the catalog,
+// then to the historical 'patrol'.
+function behaviorOf(e, def) {
+  const b = (e && e.behavior) || (def && def.behavior);
+  return (b === 'drift' || b === 'ambush' || b === 'patrol') ? b : 'patrol';
 }
 
 // A defensive stand-in used only if fish.js cannot produce a mesh for us
@@ -900,23 +1125,33 @@ export function initEnemies(ctx) {
     }
   }
 
+  // fish.js (and our own builders) share one material across many meshes, so
+  // clone each distinct source material exactly once per enemy: the tint/flash
+  // pipeline writes identical values to every mesh anyway, and one clone per
+  // type instead of one per mesh keeps the material count tiny.
+  const _matClones = new Map();
+  function cloneOnce(src, out) {
+    let m = _matClones.get(src);
+    if (m) return m;
+    m = src.clone();
+    _matClones.set(src, m);
+    out.push(snapshotMaterial(m));
+    return m;
+  }
+
   function harvestMaterials(obj, out) {
+    _matClones.clear();
     obj.traverse((c) => {
       if (!c.material) return;
       if (Array.isArray(c.material)) {
         const arr = [];
-        for (let i = 0; i < c.material.length; i++) {
-          const m = c.material[i].clone();
-          arr.push(m);
-          out.push(snapshotMaterial(m));
-        }
+        for (let i = 0; i < c.material.length; i++) arr.push(cloneOnce(c.material[i], out));
         c.material = arr;
       } else {
-        const m = c.material.clone();
-        c.material = m;
-        out.push(snapshotMaterial(m));
+        c.material = cloneOnce(c.material, out);
       }
     });
+    _matClones.clear();
   }
 
   function snapshotMaterial(m) {
@@ -937,20 +1172,28 @@ export function initEnemies(ctx) {
 
     const vis = visualsFor(type);
     let fishGroup = null;
-    try {
-      const make = fishFactory && fishFactory.createFishMesh;
-      if (typeof make === 'function') fishGroup = make(vis.fishDef, null, 1);
-    } catch (e) {
-      console.warn('[enemies] createFishMesh failed for ' + type + ', using fallback mesh:', e);
-      fishGroup = null;
+    if (typeof vis.build === 'function') {
+      // procedural body owned by this module (the jelly bell) — no fish factory
+      try { fishGroup = vis.build(); } catch (e) {
+        console.warn('[enemies] custom body build failed for ' + type + ':', e);
+        fishGroup = null;
+      }
+    } else {
+      try {
+        const make = fishFactory && fishFactory.createFishMesh;
+        if (typeof make === 'function') fishGroup = make(vis.fishDef, null, 1);
+      } catch (e) {
+        console.warn('[enemies] createFishMesh failed for ' + type + ', using fallback mesh:', e);
+        fishGroup = null;
+      }
     }
-    if (!fishGroup || !fishGroup.isObject3D) fishGroup = fallbackFishMesh(vis.fishDef);
+    if (!fishGroup || !fishGroup.isObject3D) fishGroup = fallbackFishMesh(vis.fishDef || visualsFor('reefshark').fishDef);
 
     // fixGroup carries the orientation correction; measurements below are
     // therefore already in "body faces +Z" space.
     const fixGroup = new THREE.Group();
     fixGroup.add(fishGroup);
-    orientFish(fishGroup, fixGroup);
+    if (!vis.noOrient) orientFish(fishGroup, fixGroup);
 
     _box.setFromObject(fixGroup);
     if (_box.isEmpty()) {
@@ -962,8 +1205,9 @@ export function initEnemies(ctx) {
 
     const mats = [];
     harvestMaterials(fishGroup, mats);
+    const shad = !vis.noShadow;
     fishGroup.traverse((c) => {
-      if (c.isMesh) { c.castShadow = true; c.receiveShadow = false; }
+      if (c.isMesh) { c.castShadow = shad; c.receiveShadow = false; }
     });
 
     // holder = lunge offset; attach = un-rotated space matching the measured box
@@ -973,9 +1217,11 @@ export function initEnemies(ctx) {
     holder.add(attach);
 
     // eyes: additive glow sprites parked at the head, dim until aggro
+    // (eyeCount 0 for bodies that have no head to speak of — the jelly)
     const eyeSize = Math.max(0.06, _boxSize.z * vis.eyeSize);
+    const eyeCount = vis.eyeCount === undefined ? 2 : vis.eyeCount;
     const eyes = [];
-    for (let i = 0; i < 2; i++) {
+    for (let i = 0; i < eyeCount; i++) {
       const s = makeGlowSprite(vis.eyeColor, eyeSize, vis.eyeIdle);
       s.position.set(
         (i ? 1 : -1) * Math.max(0.05, _boxSize.x * 0.3),
@@ -999,8 +1245,31 @@ export function initEnemies(ctx) {
       attach.add(lure);
     }
 
+    // menace aura: a soft additive bloom at the head, barely there while the
+    // creature lurks and hot once it commits (depthmaw's deep red glow)
+    let aura = null;
+    if (vis.aura) {
+      aura = makeGlowSprite(vis.aura.color, Math.max(0.5, _boxSize.z * vis.aura.size * 0.25), vis.aura.idle);
+      aura.position.set(0, _boxCtr.y + _boxSize.y * 0.06, _box.max.z - _boxSize.z * 0.14);
+      attach.add(aura);
+    }
+
+    // venom sting flash: expanding green pop when the drifter touches someone
+    let sting = null;
+    if (vis.sting) {
+      sting = makeGlowSprite(vis.sting.color, Math.max(0.4, _boxSize.x * vis.sting.size), 0);
+      sting.position.set(0, _boxCtr.y - _boxSize.y * 0.12, 0);
+      sting.visible = false;
+      attach.add(sting);
+    }
+
+    // the coil is NOT parented here: it must stay planted on the seabed while
+    // the body sinks into it, so createEnemy hangs it off the wrapper instead
+    const coil = vis.coil ? buildCoil(type, vis.coil) : null;
+    if (coil) coil.group.position.y = _boxCtr.y - _boxSize.y * 0.3;
+
     return {
-      holder, fixGroup, fishGroup, mats, eyes, lure,
+      holder, fixGroup, attach, fishGroup, mats, eyes, lure, aura, sting, coil,
       size: _boxSize.clone(), center: _boxCtr.clone(),
       hasAnim: !!(fishGroup.userData && typeof fishGroup.userData.update === 'function'),
     };
@@ -1009,6 +1278,17 @@ export function initEnemies(ctx) {
   function releaseVisual(type, visual) {
     if (visual.holder.parent) visual.holder.parent.remove(visual.holder);
     visual.holder.position.set(0, 0, 0);
+    // orientFish owns fixGroup.rotation.y — only the pose axes reset here
+    visual.fixGroup.rotation.x = 0;
+    visual.fixGroup.rotation.z = 0;
+    visual.attach.rotation.set(0, 0, 0);
+    if (visual.coil) {
+      if (visual.coil.group.parent) visual.coil.group.parent.remove(visual.coil.group);
+      visual.coil.group.scale.set(1, 1, 1);
+      visual.coil.mat.opacity = 1;
+    }
+    if (visual.aura) visual.aura.material.opacity = 0;
+    if (visual.sting) { visual.sting.material.opacity = 0; visual.sting.visible = false; }
     // restore neutral material state so the next user starts clean
     for (let i = 0; i < visual.mats.length; i++) {
       const s = visual.mats[i];
@@ -1031,6 +1311,9 @@ export function initEnemies(ctx) {
       visual.lure.userData.bulb.material.dispose();
       visual.lure.userData.halo.material.dispose();
     }
+    if (visual.aura) visual.aura.material.dispose();
+    if (visual.sting) visual.sting.material.dispose();
+    if (visual.coil) visual.coil.mat.dispose();   // geometry stays in the type cache
   }
 
   function createEnemy(e) {
@@ -1042,11 +1325,14 @@ export function initEnemies(ctx) {
     const wrapper = new THREE.Group();
     wrapper.rotation.order = 'YXZ';
     wrapper.add(visual.holder);
+    // the coil rides the wrapper, not the holder, so the body can sink into it
+    if (visual.coil) wrapper.add(visual.coil.group);
     root.add(wrapper);
 
+    const behavior = behaviorOf(e, def);
     const p = Array.isArray(e.p) ? e.p : [0, -2, 0];
     const rec = {
-      id: e.id, type, def, vis, visual, wrapper,
+      id: e.id, type, def, vis, visual, wrapper, behavior,
       hp: typeof e.hp === 'number' ? e.hp : def.hp,
       maxHp: def.hp,
       state: e.state || 'idle',
@@ -1067,7 +1353,12 @@ export function initEnemies(ctx) {
       dead: false, deadT: 0, sinkY: 0, sinkVel: 0,
       despawn: 0, seen: snapshotTick,
       bubbleT: 0, eyeLit: vis.eyeIdle,
-      _lf: -1, _lr: -1, _ld: -1,
+      // behaviour state: ambushers start coiled, drifters loll on their own axis
+      coil: behavior === 'ambush' ? 1 : 0,
+      uncoil: 0, nextSurge: 0, wakeT: 0, dim: 1,
+      sting: 0, lastSting: -10,
+      driftSpin: (Math.random() - 0.5) * 0.5,
+      _lf: -1, _lr: -1, _ld: -1, _ldim: -1,
     };
     enemies.set(e.id, rec);
     return rec;
@@ -1085,6 +1376,7 @@ export function initEnemies(ctx) {
     rec.deadT = 0;
     rec.rim = 0;
     rec.lunge = 0;
+    rec.uncoil = 0;
     rec.despawn = 0;   // the death animation owns the removal from here on
     sfx('enemyDie', 0.9, rec.renderPos);
     bubbles.burst(rec.renderPos.x, rec.renderPos.y, rec.renderPos.z, 14, 0.9,
@@ -1110,10 +1402,20 @@ export function initEnemies(ctx) {
       if (!rec) rec = createEnemy(e);
       rec.seen = snapshotTick;
       rec.despawn = 0;
+      if (typeof e.behavior === 'string') rec.behavior = behaviorOf(e, rec.def);
       if (e.state) {
         rec.state = e.state;
+        // 'lurk' is explicitly NOT hostile — that is the whole point of it
         const hostile = e.state === 'aggro' || e.state === 'attack' || e.state === 'lunge' || e.state === 'chase';
-        if (hostile && !rec.aggro) rec.telegraph = 1;
+        if (hostile && !rec.aggro) {
+          rec.telegraph = 1;
+          if (rec.behavior === 'ambush' && !rec.dead) {
+            // eyes flare, then a short uncoil wind-up before it commits
+            rec.uncoil = AMBUSH_TELEGRAPH;
+            rec.eyeLit = Math.max(rec.eyeLit, 0.65);
+            rec.nextSurge = AMBUSH_SURGE[0] + Math.random() * AMBUSH_SURGE[1];
+          }
+        }
         rec.aggro = hostile;
       }
       if (typeof e.hp === 'number') {
@@ -1152,6 +1454,35 @@ export function initEnemies(ctx) {
     if (rec.hp <= 0) startDeath(rec);
   }
 
+  // Venom pop: a green flash on the bell, a spit of stinging motes and (at
+  // most a few times a second) the sting sound.
+  function triggerSting(rec) {
+    rec.sting = 1;
+    rec.telegraph = Math.max(rec.telegraph, 0.5);
+    if (now - rec.lastSting < STING_SFX_GAP) return;
+    rec.lastSting = now;
+    sfx('jellySting', 0.85, rec.renderPos);
+    sparks.burst(rec.renderPos.x, rec.renderPos.y, rec.renderPos.z, 9, 2.0,
+      0.11, 0.32, 0x9dff6a, -0.6, 3.0, 0, 0, 0, 0);
+    camShake = Math.min(1.2, camShake + 0.34);
+  }
+
+  // The server is the authority on jelly damage, so also flash whichever
+  // drifter is closest when something stings the local player. Guarded so our
+  // own contact-range emit below doesn't come straight back in here.
+  let stingEmitting = false;
+  function onLocalDamaged(payload) {
+    if (stingEmitting || !payload || typeof payload.cause !== 'string') return;
+    let best = null, bestD = 49;   // 7 m — anything further isn't the culprit
+    for (const rec of enemies.values()) {
+      if (rec.dead || rec.behavior !== 'drift' || !rec.visual.sting) continue;
+      if (rec.def.name !== payload.cause) continue;
+      const d2 = rec.renderPos.distanceToSquared(_localPos);
+      if (d2 < bestD) { bestD = d2; best = rec; }
+    }
+    if (best) triggerSting(best);
+  }
+
   function clearAll() {
     for (const rec of enemies.values()) destroyEnemy(rec);
     enemies.clear();
@@ -1176,6 +1507,7 @@ export function initEnemies(ctx) {
   if (bus && typeof bus.on === 'function') {
     bus.on('enemyState', onEnemyState);
     bus.on('enemyHit', onEnemyHit);
+    bus.on('localDamaged', onLocalDamaged);
     bus.on('eventStart', () => { dreadMode = true; });
     bus.on('eventEnd', () => { dreadMode = false; });
     bus.on('phase', (p) => { if (p !== 'playing') clearAll(); });
@@ -1822,23 +2154,33 @@ export function initEnemies(ctx) {
   // ==================================================================
   // Per-frame enemy update
   // ==================================================================
+  // `dim` (< 1 only for lurking ambushers) drains both the albedo and the
+  // emissive so a coiled moray reads as a lump of seabed until it strikes.
   function applyMaterialState(rec) {
-    const flash = rec.flash, rim = rec.rim, fade = rec.fade;
-    if (Math.abs(flash - rec._lf) < 0.004 && Math.abs(rim - rec._lr) < 0.004 && Math.abs(fade - rec._ld) < 0.004) return;
-    rec._lf = flash; rec._lr = rim; rec._ld = fade;
+    const flash = rec.flash, rim = rec.rim, fade = rec.fade, dim = rec.dim;
+    if (Math.abs(flash - rec._lf) < 0.004 && Math.abs(rim - rec._lr) < 0.004 &&
+        Math.abs(fade - rec._ld) < 0.004 && Math.abs(dim - rec._ldim) < 0.004) return;
+    rec._lf = flash; rec._lr = rim; rec._ld = fade; rec._ldim = dim;
     const mats = rec.visual.mats;
+    const hasDim = dim < 0.999;
     for (let i = 0; i < mats.length; i++) {
       const s = mats[i];
       const m = s.mat;
-      if (s.emissive && m.emissive) {
+      const lit = !!(s.emissive && m.emissive);
+      if (s.color && m.color) {
+        m.color.copy(s.color);
+        if (hasDim) m.color.multiplyScalar(0.4 + dim * 0.6);
+        if (!lit) {
+          if (rim > 0.002) m.color.lerp(C_RIM, rim * 0.28);
+          if (flash > 0.002) m.color.lerp(C_WHITE, flash * 0.8);
+        }
+      }
+      if (lit) {
         m.emissive.copy(s.emissive);
+        if (hasDim) m.emissive.multiplyScalar(dim);
         if (rim > 0.002) m.emissive.lerp(C_RIM, clamp(rim * 0.55, 0, 0.8));
         if (flash > 0.002) m.emissive.lerp(C_WHITE, clamp(flash, 0, 1));
-        m.emissiveIntensity = s.ei + rim * 0.85 + flash * 2.6;
-      } else if (s.color && m.color) {
-        m.color.copy(s.color);
-        if (rim > 0.002) m.color.lerp(C_RIM, rim * 0.28);
-        if (flash > 0.002) m.color.lerp(C_WHITE, flash * 0.8);
+        m.emissiveIntensity = s.ei * (hasDim ? dim : 1) + rim * 0.85 + flash * 2.6;
       }
       if (fade < 0.999) {
         if (!m.transparent) { m.transparent = true; m.needsUpdate = true; }
@@ -1849,6 +2191,104 @@ export function initEnemies(ctx) {
         m.depthWrite = s.depthWrite;
         m.opacity = s.opacity;
       }
+    }
+  }
+
+  // A short spray of bubbles thrown off the tail as an ambusher drives forward.
+  function ambushWake(rec, n) {
+    const sy = Math.sin(rec.yaw), cy = Math.cos(rec.yaw);
+    const back = rec.visual.size.z * 0.3;
+    bubbles.burst(
+      rec.renderPos.x - sy * back, rec.renderPos.y + rec.visual.center.y * 0.4, rec.renderPos.z - cy * back,
+      n, 0.8, 0.1 * rec.def.size, 1.5, 0xdff2ff, 0.85, 1.1, -sy, 0.2, -cy, 0.9
+    );
+  }
+
+  // Ambush pose. Coiled and dim while it lurks; on aggro it rears back for
+  // AMBUSH_TELEGRAPH seconds, then drives forward along its travel direction
+  // and keeps surging while it hunts. Returns the rear-back amount so the
+  // caller can stretch the body with it.
+  function updateAmbush(rec, dt, t, aggro) {
+    const V = rec.visual;
+
+    // uncoil wind-up -> the strike
+    let rear = 0;
+    if (rec.uncoil > 0) {
+      rec.uncoil = Math.max(0, rec.uncoil - dt);
+      rear = Math.sin((1 - rec.uncoil / AMBUSH_TELEGRAPH) * Math.PI * 0.85);
+      if (rec.uncoil === 0) {
+        rec.lunge = 1;
+        sfx('morayLunge', 0.95, rec.renderPos);
+        ambushWake(rec, 9);
+        camShake = Math.min(1.3, camShake + 0.22);
+      }
+    } else if (aggro && rec.coil < 0.35) {
+      rec.nextSurge -= dt;
+      if (rec.nextSurge <= 0) {
+        rec.nextSurge = AMBUSH_SURGE[0] + Math.random() * AMBUSH_SURGE[1];
+        rec.lunge = Math.max(rec.lunge, 0.85);
+        ambushWake(rec, 5);
+      }
+    }
+
+    // coil 1 = fully wound on the seabed, 0 = extended and hunting
+    rec.coil = damp(rec.coil, aggro ? 0 : 1, aggro ? 9 : 1.8, dt);
+    rec.dim = AMBUSH_LURK_DIM + (1 - AMBUSH_LURK_DIM) * (1 - rec.coil);
+
+    // half-buried pose: sunk into the coil, nose lifted, tail tucked back
+    const coil = rec.coil;
+    V.holder.position.set(
+      0,
+      -V.size.y * 0.55 * coil,
+      -V.size.z * 0.3 * coil - V.size.z * 0.2 * rear + rec.lunge * V.size.z * 0.42
+    );
+    // the head sprites live in holder space, so they rear with the same angles
+    const rx = -0.45 * coil - 0.18 * rear;
+    const rz = 0.26 * coil;
+    V.fixGroup.rotation.x = rx;
+    V.fixGroup.rotation.z = rz;
+    V.attach.rotation.x = rx;
+    V.attach.rotation.z = rz;
+
+    if (V.coil) {
+      const o = clamp(coil * rec.fade, 0, 1);
+      V.coil.group.visible = o > 0.02;
+      V.coil.mat.opacity = o;
+      const b = 1 + Math.sin(t * 0.9 + rec.phase) * 0.03;
+      V.coil.group.scale.set(b, 2 - b, b);
+    }
+
+    // wake while the body is still driving forward
+    if (rec.lunge > 0.15) {
+      rec.wakeT -= dt;
+      if (rec.wakeT <= 0) { rec.wakeT = 0.06; ambushWake(rec, 2); }
+    }
+    return rear;
+  }
+
+  // Drift pose: the venom flash left behind when a jelly brushes someone,
+  // plus the occasional bioluminescent mote sloughing off the bell.
+  function updateDrift(rec, dt) {
+    const V = rec.visual;
+    rec.sting = Math.max(0, rec.sting - dt * 2.2);
+    if (V.sting) {
+      const o = rec.sting * rec.sting;
+      const on = o > 0.02;
+      if (V.sting.visible !== on) V.sting.visible = on;
+      if (on) {
+        V.sting.material.opacity = clamp(o * 0.95 * rec.fade, 0, 1);
+        const sz = Math.max(0.4, V.size.x * rec.vis.sting.size) * (0.75 + (1 - rec.sting) * 1.3);
+        V.sting.scale.set(sz, sz, 1);
+      }
+    }
+    if (rec.vis.mote && Math.random() < dt * 1.2) {
+      sparks.spawn(
+        rec.renderPos.x + (Math.random() - 0.5) * V.size.x,
+        rec.renderPos.y + 0.1,
+        rec.renderPos.z + (Math.random() - 0.5) * V.size.x,
+        (Math.random() - 0.5) * 0.12, 0.1 + Math.random() * 0.14, (Math.random() - 0.5) * 0.12,
+        0.07, 1.1, rec.vis.mote, 0, 0.8
+      );
     }
   }
 
@@ -1903,28 +2343,45 @@ export function initEnemies(ctx) {
     // ---- facing ----
     _v1.subVectors(rec.renderPos, rec.prevRender);
     const speed = dt > 0 ? _v1.length() / dt : 0;
-    let desiredYaw = rec.yaw, desiredPitch = rec.pitch;
-    if (!rec.dead && speed > 0.35) {
-      desiredYaw = Math.atan2(_v1.x, _v1.z);
-      const hor = Math.sqrt(_v1.x * _v1.x + _v1.z * _v1.z);
-      desiredPitch = -Math.atan2(_v1.y, Math.max(0.0001, hor));
-      desiredPitch = clamp(desiredPitch, -0.85, 0.85);
-    } else if (!rec.dead) {
-      desiredYaw = rec.toYaw;
-      desiredPitch = 0;
+    const drift = rec.behavior === 'drift';
+    if (drift && !rec.dead) {
+      // a jelly has no front — it turns on its own axis and lolls with the swell
+      rec.yaw += rec.driftSpin * dt;
+      rec.pitch = damp(rec.pitch, Math.sin(t * 0.53 + rec.phase) * 0.22, 2.0, dt);
+      rec.roll = damp(rec.roll, Math.cos(t * 0.41 + rec.phase * 1.7) * 0.22, 2.0, dt);
+      rec.toYaw = rec.yaw;
+      rec.fromYaw = rec.yaw;
+    } else {
+      let desiredYaw = rec.yaw, desiredPitch = rec.pitch;
+      if (!rec.dead && speed > 0.35) {
+        desiredYaw = Math.atan2(_v1.x, _v1.z);
+        const hor = Math.sqrt(_v1.x * _v1.x + _v1.z * _v1.z);
+        desiredPitch = -Math.atan2(_v1.y, Math.max(0.0001, hor));
+        desiredPitch = clamp(desiredPitch, -0.85, 0.85);
+      } else if (!rec.dead) {
+        desiredYaw = rec.toYaw;
+        desiredPitch = 0;
+      }
+      const yawErr = shortAngle(rec.yaw, desiredYaw);
+      const turn = yawErr * (1 - Math.exp(-(rec.dead ? 1.2 : 6.5) * dt));
+      rec.yaw += turn;
+      rec.pitch = damp(rec.pitch, desiredPitch, rec.dead ? 2 : 5, dt);
+      if (!rec.dead) rec.roll = damp(rec.roll, clamp(-turn / Math.max(dt, 0.001) * 0.12, -0.6, 0.6), 5, dt);
     }
-    const yawErr = shortAngle(rec.yaw, desiredYaw);
-    const turn = yawErr * (1 - Math.exp(-(rec.dead ? 1.2 : 6.5) * dt));
-    rec.yaw += turn;
-    rec.pitch = damp(rec.pitch, desiredPitch, rec.dead ? 2 : 5, dt);
-    if (!rec.dead) rec.roll = damp(rec.roll, clamp(-turn / Math.max(dt, 0.001) * 0.12, -0.6, 0.6), 5, dt);
 
     // ---- transform ----
-    const bob = rec.dead ? 0 : Math.sin(t * 1.15 + rec.phase) * 0.05 * vis.bob;
+    let bob = rec.dead ? 0 : Math.sin(t * 1.15 + rec.phase) * 0.05 * vis.bob;
+    let swayX = 0, swayZ = 0;
+    if (drift && !rec.dead) {
+      // slow bobbing drift — the server only moves it a little, the float is ours
+      bob = Math.sin(t * 0.55 + rec.phase) * 0.26 + Math.sin(t * 1.31 + rec.phase * 2.1) * 0.06;
+      swayX = Math.sin(t * 0.37 + rec.phase) * 0.13;
+      swayZ = Math.cos(t * 0.41 + rec.phase * 1.7) * 0.13;
+    }
     rec.wrapper.position.set(
-      rec.renderPos.x + rec.nudge.x,
+      rec.renderPos.x + rec.nudge.x + swayX,
       rec.renderPos.y + rec.nudge.y + rec.sinkY + bob,
-      rec.renderPos.z + rec.nudge.z
+      rec.renderPos.z + rec.nudge.z + swayZ
     );
     rec.wrapper.rotation.set(rec.pitch, rec.yaw, rec.roll);
 
@@ -1940,14 +2397,47 @@ export function initEnemies(ctx) {
     rec.telegraph = Math.max(0, rec.telegraph - dt * 2.6);
     rec.lunge = Math.max(0, rec.lunge - dt * 3.4);
     const pulse = rec.telegraph * rec.telegraph;
-    const s = 1 + pulse * 0.14 + rec.lunge * 0.22;
-    rec.wrapper.scale.set(s, s, s + rec.lunge * 0.18);
 
-    // dart forward while lunging
-    if (rec.lunge > 0.01) {
-      rec.visual.holder.position.z = rec.lunge * rec.visual.size.z * 0.22;
-    } else if (rec.visual.holder.position.z !== 0) {
-      rec.visual.holder.position.z = 0;
+    // ---- behaviour pose ----
+    let rear = 0;
+    if (rec.behavior === 'ambush' && !rec.dead) {
+      rear = updateAmbush(rec, dt, t, aggro);
+    } else {
+      if (rec.dim !== 1 || rec.coil > 0.0005) {
+        // a killed ambusher unwinds and brightens so the death read is clear
+        rec.dim = damp(rec.dim, 1, 4, dt);
+        rec.coil = damp(rec.coil, 0, 4, dt);
+        const rx = -0.45 * rec.coil, rz = 0.26 * rec.coil;
+        rec.visual.fixGroup.rotation.x = rx;
+        rec.visual.fixGroup.rotation.z = rz;
+        rec.visual.attach.rotation.x = rx;
+        rec.visual.attach.rotation.z = rz;
+        if (rec.visual.coil) {
+          rec.visual.coil.mat.opacity = clamp(rec.coil * rec.fade, 0, 1);
+          rec.visual.coil.group.visible = rec.coil > 0.02;
+        }
+      }
+      if (drift && !rec.dead) updateDrift(rec, dt);
+      // dart forward while lunging
+      rec.visual.holder.position.set(
+        0,
+        -rec.visual.size.y * 0.55 * rec.coil,
+        rec.lunge > 0.01 ? rec.lunge * rec.visual.size.z * 0.22 : 0
+      );
+    }
+
+    const s = 1 + pulse * 0.14 + rec.lunge * 0.22;
+    rec.wrapper.scale.set(s, s, s + rec.lunge * 0.18 + rear * 0.16);
+
+    // ---- menace aura ----
+    if (rec.visual.aura) {
+      const au = vis.aura;
+      const hot = rec.behavior === 'ambush' ? clamp(1 - rec.coil, 0, 1) : (aggro ? 1 : 0);
+      const beat = 0.72 + Math.sin(t * 1.35 + rec.phase) * 0.28;
+      const sp = rec.visual.aura;
+      sp.material.opacity = clamp((au.idle + (au.hot - au.idle) * hot) * beat * rec.fade, 0, 1);
+      const asz = Math.max(0.5, rec.visual.size.z * au.size * 0.25) * (0.9 + hot * 0.4 + pulse * 0.3);
+      sp.scale.set(asz, asz, 1);
     }
 
     // ---- swim animation ----
@@ -1960,7 +2450,9 @@ export function initEnemies(ctx) {
 
     // ---- eyes ----
     const eyeTarget = rec.dead ? 0 : (aggro ? 1 : (dreadMode ? vis.eyeIdle * 2.2 : vis.eyeIdle));
-    rec.eyeLit = damp(rec.eyeLit, eyeTarget, aggro ? 12 : 4, dt);
+    // ambushers snap their eyes open on the telegraph and cool off slowly
+    const eyeRate = aggro ? (rec.uncoil > 0 ? 26 : 12) : (rec.behavior === 'ambush' ? 1.6 : 4);
+    rec.eyeLit = damp(rec.eyeLit, eyeTarget, eyeRate, dt);
     const flicker = aggro ? (0.82 + Math.sin(t * 17 + rec.phase) * 0.18) : 1;
     const eyeBase = Math.max(0.06, rec.visual.size.z * vis.eyeSize);
     const eyeScale = eyeBase * (1 + pulse * 0.5 + (aggro ? 0.35 : 0));
@@ -1988,8 +2480,24 @@ export function initEnemies(ctx) {
       }
     }
 
+    // ---- drifting sting: contact, not aggro, is what hurts ----
+    if (drift && hasLocal && !rec.dead && rec.despawn === 0) {
+      const reach = rec.radius + STING_RANGE_PAD;
+      if (rec.renderPos.distanceToSquared(_localPos) < reach * reach && now - rec.lastBite > BITE_COOLDOWN) {
+        rec.lastBite = now;
+        triggerSting(rec);
+        bubbles.burst(_localPos.x, _localPos.y, _localPos.z, 5, 1.0,
+          0.08, 0.9, 0xdaffd0, 0.9, 1.4, 0, 0, 0, 0);
+        if (ctx.bus && typeof ctx.bus.emit === 'function') {
+          stingEmitting = true;
+          try { ctx.bus.emit('localDamaged', { dmg: rec.def.dmg, cause: rec.def.name }); }
+          finally { stingEmitting = false; }
+        }
+      }
+    }
+
     // ---- bite feedback on the local player (visuals only, damage is server-side) ----
-    if (aggro && hasLocal) {
+    if (aggro && hasLocal && !drift) {
       const d2 = rec.renderPos.distanceToSquared(_localPos);
       if (d2 < BITE_RANGE * BITE_RANGE && now - rec.lastBite > BITE_COOLDOWN) {
         rec.lastBite = now;

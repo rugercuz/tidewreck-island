@@ -21,6 +21,7 @@ import { initPlayer } from './player.js';
 import { initBoat } from './boat.js';
 import { initFishing } from './fishing.js';
 import { initEnemies } from './enemies.js';
+import { initLoot } from './loot.js';
 import { initEvents } from './events.js';
 import { initUI } from './ui.js';
 
@@ -512,6 +513,7 @@ const MODULES = [
   { key: 'boat', init: initBoat },
   { key: 'fishing', init: initFishing },
   { key: 'enemies', init: initEnemies },
+  { key: 'loot', init: initLoot },
   { key: 'events', init: initEvents },
   { key: 'ui', init: initUI },
 ];
