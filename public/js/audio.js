@@ -180,6 +180,9 @@ export function initAudio(ctx) {
   let underwater = false;
   let reelOn = false, nextReelTick = 0, reelHold = 0, reelTension = 0.4, reelVol = 0.6, nextCreak = 0;
   let motor = null, motorDirty = false, motorTimer = 0, motorAuto = true;
+  // wave 5 loops: the revive channel shimmer and the doomsday rumble bed
+  let chanNodes = null, chanAt = 0, chanSeen = 0;
+  let quakeNodes = null, quakeAt = 0, doomAt = -99;
   // per-call sfx modifiers, set by sfx() from opts (volume/vol/gain and pos)
   let curScale = 1, curPan = 0;
   let started = false;
@@ -1808,6 +1811,88 @@ export function initAudio(ctx) {
       bell(t + 0.07, mtof(93), 0.08, 0.7, sfxBus, revS);
     },
 
+    // ---------- wave 5: perfect cast, reviving, doomsday ----------
+    // PERFECT. Two bright notes and a sparkle tail — you will learn this one
+    // in a single session and start chasing it.
+    perfectCast(t, o) {
+      noise(t, 0.05, 0.1, sfxBus, { type: 'highpass', f0: 6200, atk: 0.001 });
+      bell(t, mtof(88), 0.2, 0.85, sfxBus, revM);            // ching...
+      bell(t + 0.085, mtof(95), 0.19, 1.7, sfxBus, revL);    // ...ching!
+      tone('triangle', mtof(100), t + 0.085, 0.55, 0.055, sfxBus, { atk: 0.002, rev: revL });
+      tone('sine', mtof(52), t, 0.7, 0.09, sfxBus, { atk: 0.006 });
+      // the sparkle tail
+      for (let i = 0; i < 7; i++) {
+        tone('sine', mtof(98 + Math.floor(Math.random() * 12)), t + 0.16 + i * 0.052, 0.42, 0.032, sfxBus, {
+          atk: 0.003, pan: (Math.random() - 0.5) * 1.35, rev: revL,
+        });
+      }
+      noise(t + 0.14, 0.5, 0.03, sfxBus, { type: 'highpass', f0: 8000, atk: 0.04, rev: revL });
+    },
+    // held while a revive channels; {on:false} ends it
+    reviveChannel(t, o) {
+      if (o && o.on === false) { channelStop(0.24); return; }
+      channelStart();
+    },
+    // they are back: a warm swell and the breath they take
+    revive(t, o) {
+      channelStop(0.1);
+      const chord = [60, 64, 67, 72];
+      for (let i = 0; i < chord.length; i++) {
+        tone('triangle', mtof(chord[i]), t + i * 0.045, 1.9, 0.085, sfxBus, {
+          atk: 0.22, hold: 0.75, rev: revL,
+        });
+      }
+      tone('sine', mtof(36), t, 2.4, 0.19, sfxBus, { atk: 0.12, hold: 1.0 });
+      bell(t + 0.42, mtof(79), 0.15, 2.2, sfxBus, revL);
+      bell(t + 0.58, mtof(84), 0.13, 2.8, sfxBus, revL);
+      // the gasp — an inhale, then a voiced breath through two formants
+      noise(t, 0.42, 0.13, sfxBus, { type: 'bandpass', f0: 600, f1: 2300, sweep: 0.36, Q: 1.6, atk: 0.12 });
+      tone('sawtooth', 148, t + 0.06, 0.34, 0.075, sfxBus, {
+        f1: 208, glide: 0.3, filter: 'bandpass', ff0: 720, fq: 6, atk: 0.04, shape: 'soft',
+      });
+      tone('sawtooth', 148, t + 0.06, 0.28, 0.04, sfxBus, {
+        f1: 208, glide: 0.24, filter: 'bandpass', ff0: 1320, fq: 9, atk: 0.04,
+      });
+      noise(t + 0.3, 0.6, 0.045, sfxBus, { type: 'highpass', f0: 6500, atk: 0.06, rev: revL });
+    },
+    // the Rescue Claw closing on a sunken crewmate
+    clawGrab(t, o) {
+      noise(t, 0.05, 0.24, sfxBus, { type: 'bandpass', f0: 1800, Q: 5, atk: 0.001 });
+      tone('square', 220, t, 0.09, 0.13, sfxBus, { f1: 96, atk: 0.001, filter: 'lowpass', ff0: 1800 });
+      tone('sine', 140, t, 0.32, 0.2, sfxBus, { f1: 56, glide: 0.22, atk: 0.002 });
+      // the metal ring under the clunk
+      tone('triangle', 1240, t + 0.008, 0.5, 0.05, sfxBus, { atk: 0.001, rev: revM });
+      tone('triangle', 1867, t + 0.012, 0.34, 0.028, sfxBus, { atk: 0.001, rev: revM });
+      // chain paying out
+      for (let i = 0; i < 7; i++) {
+        noise(t + 0.06 + i * 0.043 + Math.random() * 0.018, 0.03, 0.07, sfxBus, {
+          type: 'bandpass', f0: 2600 + Math.random() * 2600, Q: 14, atk: 0.001, pan: (Math.random() - 0.5) * 1.1,
+        });
+      }
+      for (let i = 0; i < 3; i++) SFX.bubble(t + 0.05 + i * 0.07, EMPTY);
+    },
+    // the ground going out from under the island; {on:false} ends it
+    doomQuake(t, o) {
+      if (o && o.on === false) { quakeStop(1.4); return; }
+      quakeStart();
+    },
+    // slow dread tolls over the doomsday wall
+    doomBell(t, o) {
+      const n = Math.round(cl(o && o.count, 1, 6, 3));
+      const f0 = 58;
+      for (let i = 0; i < n; i++) {
+        const tt = t + i * 2.3;
+        const g = Math.max(0.08, 0.26 - i * 0.02);
+        noise(tt, 0.07, 0.11, sfxBus, { type: 'bandpass', f0: 1400, Q: 3, atk: 0.001 });      // the clapper
+        tone('sine', f0 * 0.5, tt, 6.0, g * 0.9, sfxBus, { atk: 0.02, hold: 2.2, rev: revL, prio: true });
+        tone('sine', f0, tt, 5.2, g, sfxBus, { atk: 0.008, hold: 1.6, rev: revL, prio: true });
+        tone('triangle', f0 * 1.19, tt, 4.0, g * 0.5, sfxBus, { atk: 0.006, hold: 1.2, rev: revL });  // the minor third does the dread
+        tone('triangle', f0 * 2.0, tt, 3.0, g * 0.28, sfxBus, { atk: 0.004, hold: 0.8, rev: revL });
+        tone('sine', f0 * 2.98, tt, 1.6, g * 0.13, sfxBus, { atk: 0.003, rev: revL });
+      }
+      duckAmbience(0.35, 3.0);
+    },
+
     // ---------- shop / progression (boat.js, ui.js) ----------
     upgrade(t, o) {
       const lv = clamp(Math.round(o.level || 2), 1, 6);
@@ -1961,6 +2046,13 @@ export function initAudio(ctx) {
     climbOut: 'vault', vaultOut: 'vault', waterExit: 'vault', haulOut: 'vault',
     pickup: 'pickupPop', grab: 'pickupPop', pickupFlopper: 'pickupPop',
     collect: 'pickupPop', lootPickup: 'pickupPop',
+    // wave 5: perfect cast, reviving, doomsday
+    perfect: 'perfectCast', perfectThrow: 'perfectCast', castPerfect: 'perfectCast',
+    reviveHold: 'reviveChannel', reviveLoop: 'reviveChannel', reviving: 'reviveChannel',
+    revived: 'revive', reviveDone: 'revive', wakeUp: 'revive',
+    claw: 'clawGrab', rescueClaw: 'clawGrab', towBody: 'clawGrab', grabBody: 'clawGrab',
+    quake: 'doomQuake', doomRumble: 'doomQuake', groundShake: 'doomQuake',
+    bell: 'doomBell', dreadBell: 'doomBell', toll: 'doomBell',
     // ui
     blip: 'uiBlip', click: 'uiBlip', uiClick: 'uiBlip', select: 'uiBlip', tick: 'uiBlip',
     open: 'uiOpen', menuOpen: 'uiOpen', shopOpen: 'uiOpen',
@@ -1988,6 +2080,10 @@ export function initAudio(ctx) {
     chestOpen: 0.6, pearlPop: 0.25, coinScoop: 0.45, bottleUncork: 0.4,
     relicHum: 0.7, geodeChime: 0.5, uniqueFanfare: 2.5,
     jellySting: 0.12, morayLunge: 0.3, vault: 0.25, pickupPop: 0.12,
+    // wave 5 — REVIVED/BODY_TOWED arrive over net AND (usually) over the bus.
+    // The two loop toggles are deliberately absent: an on/off pair must never
+    // be swallowed by a dedup floor.
+    perfectCast: 0.25, revive: 0.4, clawGrab: 0.2, doomBell: 4.0,
   };
 
   let tickCount = 0;
@@ -2069,6 +2165,109 @@ export function initAudio(ctx) {
     const stopAt = t + 0.55;
     try { m.saw.stop(stopAt); m.sq.stop(stopAt); m.ns.stop(stopAt); m.putt.stop(stopAt); } catch (e) { /* noop */ }
     reg(stopAt + 0.1, [m.out, m.amp, m.lp, m.saw, m.sq, m.ns, m.nf, m.nG, m.putt, m.puttG, m.sawG, m.sqG]);
+  }
+
+  // ------------------------------------------------------------------
+  // wave 5 loops — revive channel + doomsday quake
+  // ------------------------------------------------------------------
+  // Both follow the motor's shape: a small always-bounded sub-graph with one
+  // envelope gain, torn down on stop, on a rebuild, and on any phase change.
+  // Every source runs through a level gain that is modulated on a SEPARATE
+  // node, so the envelope has exactly one writer (see the pad's tremolo).
+  function stopLoop(n, fade) {
+    if (!ac || !n) return;
+    const t = ac.currentTime;
+    const f = cl(fade, 0.05, 6, 0.3);
+    pCancel(n.out.gain, t);
+    pAt(n.out.gain, gVal(Math.max(0.0001, pNow(n.out.gain, 0.0001)), 0.0001), t);
+    pExp(n.out.gain, 0.0001, t + f);
+    const stopAt = t + f + 0.1;
+    for (let i = 0; i < n.osc.length; i++) { try { n.osc[i].stop(stopAt); } catch (e) { /* noop */ } }
+    for (let i = 0; i < n.src.length; i++) { try { n.src[i].stop(stopAt); } catch (e) { /* noop */ } }
+    reg(stopAt + 0.12, n.list);
+  }
+
+  // a soft rising shimmer while you hold E over a downed crewmate
+  function channelStart() {
+    if (!ac || !built || chanNodes) return;
+    const t = ac.currentTime;
+    const out = gainNode(0.0001);
+    out.connect(sfxBus);
+    out.connect(revM);
+    const sh = gainNode(1);         // shimmer LFO lives here, not on the envelope
+    sh.connect(out);
+
+    // two voices climbing a fifth apart — hope, arriving
+    const a = ac.createOscillator(); a.type = 'sine';
+    pAt(a.frequency, oHz(392), t); pTgt(a.frequency, oHz(784), t, 1.5);
+    const ag = gainNode(0.13); a.connect(ag); ag.connect(sh);
+    const b = ac.createOscillator(); b.type = 'triangle';
+    pAt(b.frequency, oHz(587), t); pTgt(b.frequency, oHz(1175), t, 1.8);
+    const bg = gainNode(0.05); b.connect(bg); bg.connect(sh);
+
+    // air opening up over the top
+    const ns = ac.createBufferSource(); ns.buffer = whiteBuf; ns.loop = true;
+    pSet(ns.playbackRate, rVal(0.9));
+    const nf = ac.createBiquadFilter(); nf.type = 'bandpass';
+    pAt(nf.frequency, fHz(1100), t); pTgt(nf.frequency, fHz(4200), t, 1.6);
+    pSet(nf.Q, qVal(1.6));
+    const ng = gainNode(0.05);
+    ns.connect(nf); nf.connect(ng); ng.connect(sh);
+
+    const lfo = ac.createOscillator(); lfo.type = 'sine'; pSet(lfo.frequency, oHz(5.2));
+    const lg = ac.createGain(); pSet(lg.gain, mVal(0.16, 1));
+    lfo.connect(lg); lg.connect(sh.gain);
+
+    a.start(t); b.start(t); ns.start(0); lfo.start(t);
+    pExp(out.gain, gVal(0.55), t + 0.25);
+    chanNodes = { out, list: [out, sh, a, ag, b, bg, ns, nf, ng, lfo, lg], osc: [a, b, lfo], src: [ns] };
+    chanAt = t;
+  }
+  function channelStop(fade) {
+    if (!chanNodes) return;
+    const n = chanNodes;
+    chanNodes = null;
+    stopLoop(n, fade === undefined ? 0.28 : fade);
+  }
+
+  // the doomsday bed: a sub rumble you feel in the floor
+  function quakeStart() {
+    if (!ac || !built || quakeNodes) return;
+    const t = ac.currentTime;
+    const out = gainNode(0.0001);
+    out.connect(sfxBus);
+    const bed = gainNode(1);        // the heave rides here; out.gain is the envelope
+    bed.connect(out);
+
+    const ns = ac.createBufferSource(); ns.buffer = brownBuf; ns.loop = true;
+    pSet(ns.playbackRate, rVal(0.26));
+    const lp = ac.createBiquadFilter(); lp.type = 'lowpass';
+    pSet(lp.frequency, fHz(72)); pSet(lp.Q, qVal(0.7));
+    const ng = gainNode(0.5);
+    ns.connect(lp); lp.connect(ng); ng.connect(bed);
+
+    // two subs beating slowly against each other
+    const s1 = ac.createOscillator(); s1.type = 'sine'; pSet(s1.frequency, oHz(23.5));
+    const s2 = ac.createOscillator(); s2.type = 'sine'; pSet(s2.frequency, oHz(27.2));
+    const sg = gainNode(0.3);
+    s1.connect(sg); s2.connect(sg); sg.connect(bed);
+
+    const lfo = ac.createOscillator(); lfo.type = 'sine'; pSet(lfo.frequency, oHz(0.21));
+    const lg = ac.createGain(); pSet(lg.gain, mVal(0.32, 1));
+    lfo.connect(lg); lg.connect(bed.gain);
+
+    ns.start(0); s1.start(t); s2.start(t); lfo.start(t);
+    pAt(out.gain, 0.0001, t);
+    pExp(out.gain, gVal(0.18), t + 0.8);
+    pExp(out.gain, gVal(0.5), t + 6.0);   // it keeps building until the water lands
+    quakeNodes = { out, list: [out, bed, ns, lp, ng, s1, s2, sg, lfo, lg], osc: [s1, s2, lfo], src: [ns] };
+    quakeAt = t;
+  }
+  function quakeStop(fade) {
+    if (!quakeNodes) return;
+    const n = quakeNodes;
+    quakeNodes = null;
+    stopLoop(n, fade === undefined ? 1.4 : fade);
   }
 
   // ------------------------------------------------------------------
@@ -2228,6 +2427,16 @@ export function initAudio(ctx) {
       const list = [m.out, m.amp, m.lp, m.saw, m.sq, m.ns, m.nf, m.nG, m.putt, m.puttG, m.sawG, m.sqG];
       for (let i = 0; i < list.length; i++) killNode(list[i]);
     }
+    if (chanNodes) {
+      const n = chanNodes;
+      chanNodes = null;
+      for (let i = 0; i < n.list.length; i++) killNode(n.list[i]);
+    }
+    if (quakeNodes) {
+      const n = quakeNodes;
+      quakeNodes = null;
+      for (let i = 0; i < n.list.length; i++) killNode(n.list[i]);
+    }
 
     for (let i = 0; i < persistRun.length; i++) { try { persistRun[i].stop(0); } catch (e) { /* noop */ } }
     for (let i = 0; i < persist.length; i++) { try { persist[i].disconnect(); } catch (e) { /* noop */ } }
@@ -2282,6 +2491,9 @@ export function initAudio(ctx) {
     musicParams(t);
     applyWeatherBed(true);
     reelOn = false; reelHold = 0;
+    chanSeen = 0;
+    // a rebuild in the middle of the doomsday must not silence the ground
+    if (t - doomAt < 40) quakeStart();
     pendingThunder.length = 0;
   }
 
@@ -2363,9 +2575,14 @@ export function initAudio(ctx) {
     bus.on('lootResult', (d) => onLootResult(d));
     bus.on('weather', (d) => setWeatherType(d && d.type ? d.type : d));
     bus.on('lightning', (d) => onLightning(d));
-    bus.on('tsunami', () => { cutMusic(); sfxDedup('tsunamiRoar', EMPTY, 3); });
-    bus.on('gameOver', () => { stopMusic(1.2); sfxDedup('gameOver', EMPTY, 3); });
-    bus.on('gameWon', () => { stopMusic(1.0); sfxDedup('gameWon', EMPTY, 3); });
+    bus.on('tsunami', () => onDoomsday());
+    bus.on('gameOver', () => { quakeStop(2.5); stopMusic(1.2); sfxDedup('gameOver', EMPTY, 3); });
+    bus.on('gameWon', () => { quakeStop(1.0); stopMusic(1.0); sfxDedup('gameWon', EMPTY, 3); });
+    // wave 5
+    bus.on('perfectCast', () => sfxDedup('perfectCast', EMPTY, 0.25));
+    bus.on('reviveChannel', (d) => onReviveChannel(d));
+    bus.on('revived', (d) => onRevived(d));
+    bus.on('bodyTowed', (d) => onBodyTowed(d));
     // shop, wallet, portal and the UI had no voice at all before wave 3
     bus.on('shopResult', (d) => onShop(d));
     bus.on('wallet', (d) => onWallet(d));
@@ -2505,6 +2722,54 @@ export function initAudio(ctx) {
     }
   }
 
+  // --- wave 5: reviving -------------------------------------------------
+  // The channel loop is driven by a stream of progress payloads; it stops on
+  // an explicit end, on a revive landing, and on its own if the stream dries
+  // up (see update) — a held note must never be able to get stuck on.
+  function onReviveChannel(d) {
+    if (!ensureContext(gestureSeen || started)) return;
+    let on = !!d && d !== false && d.active !== false && d.cancel !== true;
+    if (on && typeof d === 'object') {
+      const t01 = num(d.t01, num(d.t, num(d.progress, num(d.p, 0))));
+      on = t01 > 0.0001;
+    }
+    if (!on) { channelStop(0.22); chanSeen = 0; return; }
+    chanSeen = ac.currentTime;
+    sfx('reviveChannel', { on: true });
+  }
+
+  function onRevived(d) {
+    if (!ensureContext(gestureSeen || started)) return;
+    channelStop(0.1);
+    chanSeen = 0;
+    const me = myNetId();
+    const mine = !d || d.id == null || (me && String(d.id) === String(me));
+    sfxDedup('revive', mine ? EMPTY : { volume: 0.55 }, 0.35);
+  }
+
+  function onBodyTowed(d) {
+    if (!d || d.by == null || d.by === false) return;   // a release makes no noise
+    sfxDedup('clawGrab', EMPTY, 0.25);
+  }
+
+  // --- wave 5: doomsday -------------------------------------------------
+  // TSUNAMI now means the run is ending one way or another. Music cuts through
+  // the existing path, the horror layer hands the low end over to the quake
+  // bed, and the bells toll. Everything lands on the same master compressor +
+  // hard limiter as the rest of the mix, and the watchdog still owns the graph.
+  function onDoomsday() {
+    if (!ensureContext(gestureSeen || started)) return;
+    const now = ac.currentTime;
+    if (now - doomAt < 5) return;
+    doomAt = now;
+    cutMusic();
+    channelStop(0.15);
+    if (horrorNodes) stopHorror(1.2);
+    quakeStart();
+    sfxDedup('tsunamiRoar', EMPTY, 3);
+    sfx('doomBell', { count: 3 });
+  }
+
   function onPhase(p) {
     if (p === lastPhase) return;
     lastPhase = p;
@@ -2516,11 +2781,16 @@ export function initAudio(ctx) {
         evStateSeen = false;
         motorStop();
         reelOn = false;
+        channelStop(0.2);
+        quakeStop(0.8);
+        doomAt = -99;
         if (horrorNodes) stopHorror(0.6);
       }
     } else if (p === 'over') {
       motorStop();
       reelOn = false;
+      channelStop(0.2);
+      quakeStop(2.5);        // the ground settles as the end screen comes up
       if (horrorNodes) stopHorror(1.2);
       stopMusic(1.6);
     }
@@ -2535,9 +2805,11 @@ export function initAudio(ctx) {
       net.on(MSG.BITE, () => sfxDedup('bite', EMPTY, 0.4));
       net.on(MSG.CAST_RESULT, (d) => onCatch(d));
       net.on(MSG.QUOTA_DONE, () => sfxDedup('quotaDone', EMPTY, 1.0));
-      net.on(MSG.TSUNAMI, () => { cutMusic(); sfxDedup('tsunamiRoar', EMPTY, 3); });
-      net.on(MSG.GAME_OVER, () => { stopMusic(1.2); sfxDedup('gameOver', EMPTY, 3); });
-      net.on(MSG.GAME_WON, () => { stopMusic(1.0); sfxDedup('gameWon', EMPTY, 3); });
+      net.on(MSG.TSUNAMI, () => onDoomsday());
+      net.on(MSG.GAME_OVER, () => { quakeStop(2.5); stopMusic(1.2); sfxDedup('gameOver', EMPTY, 3); });
+      net.on(MSG.GAME_WON, () => { quakeStop(1.0); stopMusic(1.0); sfxDedup('gameWon', EMPTY, 3); });
+      net.on(MSG.REVIVED, (d) => onRevived(d));
+      net.on(MSG.BODY_TOWED, (d) => onBodyTowed(d));
       net.on(MSG.EVENT_START, (d) => onEventStart(d && d.type));
       net.on(MSG.EVENT_END, () => onEventEnd());
       net.on(MSG.ENEMY_HIT, () => sfxDedup('enemyHurt', EMPTY, 0.08));
@@ -2778,6 +3050,14 @@ export function initAudio(ctx) {
         motorApply(0.12);
       }
     }
+
+    // --- wave 5 loops: neither may ever get stuck on ---
+    if (chanNodes) {
+      // the emitter re-sends progress continuously; silence means it ended
+      if (chanSeen && now - chanSeen > 0.45) { channelStop(0.3); chanSeen = 0; }
+      else if (now - chanAt > 12) channelStop(0.3);     // absolute backstop
+    }
+    if (quakeNodes && now - quakeAt > 90) quakeStop(2.5);
 
     // --- reel ticks (reelHold > 0 means the caller re-arms it every frame) ---
     if (reelOn && reelHold > 0 && now > reelHold) { reelOn = false; reelHold = 0; }

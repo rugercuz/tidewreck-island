@@ -17,7 +17,9 @@
 //   ctx.fishing.floppers          Map flopperId -> record ({ pos, fish, ... })
 //   ctx.fishing.tryBonk(o, d, r)  -> flopperId | null
 //
-// Bus emits:  'castPower' {p}          while charging a cast
+// Bus emits:  'castPower' {p, band:[a,b]}  while charging a cast — band is the
+//                         CAST_PERFECT sweet window ui draws its two lines at
+//             'perfectCast' {p, band}  release landed inside the band
 //             'castStart' {areaId, baitId}
 //             'reelState' {tension, sweet:[a,b], progress}
 //             'bite'      BITE payload
@@ -30,11 +32,11 @@
 //   'castWhoosh' 'plop' 'bobberSet' 'bite' 'hookSet' 'reelLoop'
 //   'lineSnap' 'splash' 'catchSmall' 'catchMed' 'catchBig'
 //   'catchLegendary' 'catchMutation' 'lineMiss' 'reelIn'
-//   'bonk' 'stow' 'flopperEscape' 'pickupPop'
+//   'bonk' 'stow' 'flopperEscape' 'pickupPop' 'perfectCast'
 // =============================================================
 
 import * as THREE from 'three';
-import { MSG, AREAS, MUTATIONS, FLOPPER, fishById, shopById } from '/shared/constants.js';
+import { MSG, AREAS, MUTATIONS, FLOPPER, CAST_PERFECT, fishById, shopById } from '/shared/constants.js';
 import { createFishMesh } from './fish.js';
 
 // ---------------------------------------------------------------- temps
@@ -67,6 +69,19 @@ function shortAng(from, to) {
   if (d < -Math.PI) d += Math.PI * 2;
   return d;
 }
+
+// ---------------------------------------------------------------- perfect cast
+// The sweet window on the power meter. Shipped in every 'castPower' payload so
+// ui.js can draw the two lines exactly where the release is judged.
+const PERFECT_BAND = (() => {
+  const b = CAST_PERFECT && CAST_PERFECT.BAND;
+  let a = Array.isArray(b) && isFinite(b[0]) ? +b[0] : 0.78;
+  let c = Array.isArray(b) && isFinite(b[1]) ? +b[1] : 0.92;
+  a = clamp(a, 0, 1); c = clamp(c, 0, 1);
+  if (c < a) { const t = a; a = c; c = t; }
+  return [a, c];
+})();
+const isPerfectPower = (p) => (p >= PERFECT_BAND[0] && p <= PERFECT_BAND[1]);
 
 // ---------------------------------------------------------------- flopper tuning
 const FLOP_GRAV = 20;        // m/s^2 — snappier than real gravity, reads better
@@ -848,7 +863,8 @@ export function initFishing(ctx) {
     keyRPrev: false,
     keyEPrev: false,
 
-    powerMsg: { p: 0 },
+    perfect: false,      // last release landed in the CAST_PERFECT band
+    powerMsg: { p: 0, band: PERFECT_BAND },
     reelMsg: { tension: 0, sweet: [0.35, 0.65], progress: 0 },
     lastBaitLook: null,
   };
@@ -1195,12 +1211,30 @@ export function initFishing(ctx) {
   function beginCharge() {
     F.phase = 'charging';
     F.power = 0;
+    F.perfect = false;
     setAnim('cast');
     sfx('reelIn', { vol: 0.25 });
   }
 
+  // PERFECT THROW: golden burst off the rod tip + a short warm flash.
+  function perfectCastFx() {
+    tipWorld(_v7);
+    sparks.burst(_v7, 30, {
+      color: () => (Math.random() < 0.45 ? 0xfff4c8 : (Math.random() < 0.6 ? 0xffd77a : 0xffb03a)),
+      speed: 3.4, up: 1.15, size: 0.13, life: 0.75, gravity: 3.2, spread: 1.0, drag: 2.0,
+    });
+    // a quick warm bloom, nowhere near the legendary-catch whiteout
+    flashMat.color.set(0xffd77a);
+    if (flashMat.opacity < 0.22) flashMat.opacity = 0.22;
+    flash.visible = true;
+    F.shake = Math.max(F.shake, 0.34);
+    F.shakeSeed = Math.random() * 100;
+  }
+
   function releaseCast() {
     const p = F.power;
+    const perfect = isPerfectPower(p);
+    F.perfect = false;
     F.powerMsg.p = 0;
     bus.emit('castPower', F.powerMsg);
 
@@ -1250,6 +1284,15 @@ export function initFishing(ctx) {
     // The authoritative MSG.CAST_START goes out when the bobber actually lands.
     const pre = nearestArea(lx, lz);
     bus.emit('castStart', { areaId: pre ? pre.id : null, baitId: (state.gear && state.gear.activeBait) || null });
+
+    // ---- perfect throw (judged here; the flag rides along to the server when
+    // the bobber lands and MSG.CAST_START actually goes out)
+    if (perfect) {
+      F.perfect = true;
+      perfectCastFx();
+      bus.emit('perfectCast', { p, band: PERFECT_BAND });
+      sfx('perfectCast', { vol: 1 });
+    }
   }
 
   function landBobber() {
@@ -1271,6 +1314,7 @@ export function initFishing(ctx) {
     if (!area) {
       F.areaId = null;
       F.serverCast = false;
+      F.perfect = false;
       F.noAreaTimer = 3;
       toast('Too quiet here — find a marked fishing area', 'warn');
       return;
@@ -1278,7 +1322,12 @@ export function initFishing(ctx) {
     F.areaId = area.id;
     F.noAreaTimer = 0;
     const baitId = (state.gear && state.gear.activeBait) || null;
-    if (ctx.net && typeof ctx.net.send === 'function') ctx.net.send(MSG.CAST_START, { areaId: area.id, baitId });
+    if (ctx.net && typeof ctx.net.send === 'function') {
+      const payload = { areaId: area.id, baitId };
+      if (F.perfect) payload.perfect = true;   // server: +LUCK_BONUS, faster bite
+      ctx.net.send(MSG.CAST_START, payload);
+    }
+    F.perfect = false;
     F.serverCast = true;
   }
 
@@ -1289,6 +1338,7 @@ export function initFishing(ctx) {
     F.retractDur = fast ? 0.22 : 0.38;
     F.bobRetracting = bobber.visible;
     F.serverCast = false;
+    F.perfect = false;
     F.areaId = null;
     F.noAreaTimer = 0;
     F.powerMsg.p = 0;
@@ -1300,6 +1350,7 @@ export function initFishing(ctx) {
     if (F.phase === 'idle') return;
     if (F.serverCast && ctx.net && typeof ctx.net.send === 'function') ctx.net.send(MSG.CANCEL_CAST, {});
     F.serverCast = false;
+    F.perfect = false;
     if (reason && !silent) toast(reason, 'warn');
     endReelHud();
     if (bobber.visible) startRetract(true);
@@ -1313,6 +1364,7 @@ export function initFishing(ctx) {
     bobber.visible = false;
     lineObj.visible = false;
     F.power = 0;
+    F.perfect = false;
     F.bendAmount = 0;
     F.timeScaleTarget = 1;
     endReelHud();
@@ -2707,6 +2759,7 @@ export function initFishing(ctx) {
       if (F.phase === 'charging') {
         F.phase = 'idle';
         F.power = 0;
+        F.perfect = false;
         F.powerMsg.p = 0;
         bus.emit('castPower', F.powerMsg);
         setAnim('idle');
@@ -2730,13 +2783,14 @@ export function initFishing(ctx) {
           // it landed right beside you mid-wind-up: deal with it first
           F.phase = 'idle';
           F.power = 0;
+          F.perfect = false;
           F.powerMsg.p = 0;
           bus.emit('castPower', F.powerMsg);
           setAnim('idle');
           break;
         }
         if (!canStartCast()) {
-          F.phase = 'idle'; F.power = 0;
+          F.phase = 'idle'; F.power = 0; F.perfect = false;
           F.powerMsg.p = 0; bus.emit('castPower', F.powerMsg);
           setAnim('idle');
           break;

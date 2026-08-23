@@ -8,7 +8,7 @@
 import {
   MSG, MUTATIONS, FISH, ARTIFACTS, AREAS, SHOP, ECON, EVENTS,
   PLAYER_COLORS, PLAYER_MAX_HP, WEATHER, FLOPPER,
-  LOOT_TYPES, FOUND_BAITS, UNIQUE_CHARMS,
+  LOOT_TYPES, FOUND_BAITS, UNIQUE_CHARMS, CAST_PERFECT, REVIVE,
   fishById, shopById, quotaTarget, wardPrice,
 } from '/shared/constants.js';
 
@@ -195,6 +195,7 @@ function shopKindIcon(kind, item) {
     case 'bait': return baitIcon(item.id);
     case 'weapon': return weaponIcon(item.id);
     case 'charm': return `<svg viewBox="0 0 32 32" class="ico"><circle cx="16" cy="18" r="8.5" fill="${item.id === 'charm3' ? '#ffca4a' : item.id === 'charm2' ? '#d8e2ea' : '#c98b4a'}" stroke="rgba(0,0,0,.35)" stroke-width="1.2"/><path d="M16 12 l2.4 4.6 5 .8 -3.6 3.5 .9 5 -4.7 -2.4 -4.7 2.4 .9 -5 -3.6 -3.5 5 -.8z" fill="rgba(255,255,255,.55)"/><path d="M13 8 h6" stroke="#8a6a44" stroke-width="2" stroke-linecap="round"/></svg>`;
+    case 'revive': return reviveIcon(item.id);
     case 'diving': return '<svg viewBox="0 0 32 32" class="ico"><path d="M7 11 h18 a3 3 0 0 1 3 3 v3 a5 5 0 0 1 -5 5 h-2 l-2 3 h-4 l-2 -3 h-2 a5 5 0 0 1 -5 -5 v-3 a3 3 0 0 1 3 -3z" fill="#2c4a5e" stroke="#8fd8f0" stroke-width="1.4" stroke-linejoin="round"/><rect x="9" y="13" width="14" height="6" rx="2" fill="#9fe8ff" opacity=".75"/></svg>';
     case 'ward': return '<svg viewBox="0 0 32 32" class="ico"><path d="M16 3 l11 4 v9 c0 7 -5 11 -11 13 -6 -2 -11 -6 -11 -13 V7z" fill="#1b3d55" stroke="#7fe0ff" stroke-width="1.6" stroke-linejoin="round"/><path d="M16 9 v12 M11 14 q5 4 10 0" fill="none" stroke="#ffd979" stroke-width="1.8" stroke-linecap="round"/></svg>';
     default: return SVG_BAG;
@@ -487,6 +488,67 @@ function mutName(fishName, mutation) {
 }
 function tierLabel(t) { return (t >= 11) ? 'TX' : 'T' + t; }
 
+// ---------------------------------------------------------------
+// Wave 5 — perfect cast, reviving, doomsday
+// ---------------------------------------------------------------
+// The sweet band on the cast meter. fishing.js ships it on every
+// 'castPower' payload; this is the fallback so the lines are never wrong.
+const PERFECT_BAND = (() => {
+  const raw = (CAST_PERFECT && Array.isArray(CAST_PERFECT.BAND)) ? CAST_PERFECT.BAND : [0.78, 0.92];
+  const a = clamp01(num(raw[0], 0.78));
+  const b = clamp01(num(raw[1], 0.92));
+  return a <= b ? [a, b] : [b, a];
+})();
+function bandOf(d) {
+  const raw = d && (Array.isArray(d.band) ? d.band : (Array.isArray(d.perfect) ? d.perfect : null));
+  if (!raw || raw.length < 2) return PERFECT_BAND;
+  const a = clamp01(num(raw[0], PERFECT_BAND[0]));
+  const b = clamp01(num(raw[1], PERFECT_BAND[1]));
+  return a <= b ? [a, b] : [b, a];
+}
+
+// Revive numbers, read defensively — a missing constant must not break the HUD.
+const RV = {
+  hold: Math.max(0.2, num(REVIVE && REVIVE.SALTS_HOLD_SECONDS, 3)),
+  saltsRange: Math.max(0.5, num(REVIVE && REVIVE.SALTS_RANGE, 3)),
+  clawRange: Math.max(0.5, num(REVIVE && REVIVE.CLAW_RANGE, 3.5)),
+  kitHp: clamp01(num(REVIVE && REVIVE.KIT_HP, 0.4)),
+  saltsHp: clamp01(num(REVIVE && REVIVE.SALTS_HP, 0.5)),
+  noSaltsUnder: REVIVE ? REVIVE.NO_SALTS_UNDERWATER !== false : true,
+};
+
+// a downed crewmate, drawn as a marker you can find from anywhere
+const SVG_SKULL =
+  '<svg viewBox="0 0 24 24" class="ico"><path d="M12 2.3c-4.7 0-7.8 3.1-7.8 7.3 0 2.4 1 4 2.2 5 .6.5.9 1 .9 1.8v1.1c0 .9.8 1.7 1.7 1.7h6c.9 0 1.7-.8 1.7-1.7v-1.1c0-.8.3-1.3.9-1.8 1.2-1 2.2-2.6 2.2-5 0-4.2-3.1-7.3-7.8-7.3z" fill="currentColor"/>' +
+  '<circle cx="8.9" cy="10.3" r="2.2" fill="rgba(4,14,22,.85)"/><circle cx="15.1" cy="10.3" r="2.2" fill="rgba(4,14,22,.85)"/>' +
+  '<path d="M12 13.1l-1.2 2.3h2.4z" fill="rgba(4,14,22,.85)"/>' +
+  '<g fill="currentColor"><rect x="8.2" y="19" width="1.7" height="3.1" rx=".7"/><rect x="11.15" y="19" width="1.7" height="3.1" rx=".7"/><rect x="14.1" y="19" width="1.7" height="3.1" rx=".7"/></g></svg>';
+
+const REVIVE_SVG = {
+  // a jar of salts — cork, glass, bright grains
+  salts:
+    '<svg viewBox="0 0 32 32" class="ico"><path d="M12.5 3.5h7v3.2l-1 2.3h-5l-1-2.3z" fill="#c8a06a" stroke="#8a6a44" stroke-width="1.1" stroke-linejoin="round"/>' +
+    '<path d="M9 9h14a2.4 2.4 0 0 1 2.4 2.4v14.2A2.4 2.4 0 0 1 23 28H9a2.4 2.4 0 0 1-2.4-2.4V11.4A2.4 2.4 0 0 1 9 9z" fill="#123a52" stroke="#8fd8f0" stroke-width="1.4" stroke-linejoin="round"/>' +
+    '<g fill="#eafaff"><circle cx="12" cy="17" r="1.6"/><circle cx="17.4" cy="20.4" r="1.9"/><circle cx="21" cy="16.2" r="1.3"/><circle cx="13.6" cy="23" r="1.3"/><circle cx="19.6" cy="24" r="1"/></g></svg>',
+  // the rescue claw — chain, hoop, two hooked jaws
+  rescueclaw:
+    '<svg viewBox="0 0 32 32" class="ico"><circle cx="16" cy="4.4" r="2.4" fill="none" stroke="#9fbdd0" stroke-width="1.7"/>' +
+    '<path d="M16 6.8v5.4" stroke="#9fbdd0" stroke-width="2.2" stroke-linecap="round"/>' +
+    '<path d="M9.4 12.2h13.2l-2 4.2H11.4z" fill="#5a6b78" stroke="#cfe2f0" stroke-width="1.2" stroke-linejoin="round"/>' +
+    '<path d="M11.6 16.4q-4.4 4.6-4.2 10.4 3.6.6 5-3.4" fill="none" stroke="#cfe2f0" stroke-width="2.4" stroke-linecap="round"/>' +
+    '<path d="M20.4 16.4q4.4 4.6 4.2 10.4-3.6.6-5-3.4" fill="none" stroke="#cfe2f0" stroke-width="2.4" stroke-linecap="round"/></svg>',
+  // the kit — a white case with a red cross
+  revivalkit:
+    '<svg viewBox="0 0 32 32" class="ico"><path d="M11 7h10v3.2h4a2.4 2.4 0 0 1 2.4 2.4v12.6A2.4 2.4 0 0 1 25 27.6H7a2.4 2.4 0 0 1-2.4-2.4V12.6A2.4 2.4 0 0 1 7 10.2h4z" fill="#e6ecf0" stroke="#9fb4c0" stroke-width="1.3" stroke-linejoin="round"/>' +
+    '<path d="M12.6 7h6.8v3.2h-6.8z" fill="#9fb4c0"/>' +
+    '<path d="M14.1 13.6h3.8v3.4h3.4v3.8h-3.4v3.4h-3.8v-3.4h-3.4v-3.8h3.4z" fill="#e0554a"/></svg>',
+};
+function reviveIcon(id) { return REVIVE_SVG[id] || REVIVE_SVG.salts; }
+function reviveShortName(id) {
+  const it = shopById(id);
+  return it ? it.name : prettyKey(id);
+}
+
 // ===============================================================
 // initUI
 // ===============================================================
@@ -532,6 +594,15 @@ export function initUI(ctx) {
     castPowerT: -99,
     reelT: -99,
     reelOn: false,
+    // wave 5
+    doom: false,           // doomsday tsunami: the whole hud is hidden
+    perfectT: -99,
+    reviveOn: false,
+    reviveChT: -99,
+    reviveTarget: null,    // id we are channelling a revive on
+    towing: null,          // {id, name} while the Rescue Claw is hauling a body
+    downSeen: new Set(),   // ids we have already announced as down
+    downInit: false,
     tsunamiPulse: 0,
     damageFlash: 0,
     koShown: false,
@@ -581,6 +652,7 @@ export function initUI(ctx) {
 
   function toast(text, kind) {
     if (!text) return;
+    if (ui.doom) return;   // doomsday owns the screen — nothing pops over the wave
     const t = el('div', 'toast toast-' + (kind || 'info'));
     t.appendChild(el('span', 'toast-dot'));
     const body = el('span', 'toast-text');
@@ -1038,7 +1110,35 @@ export function initUI(ctx) {
 
     <div class="cast-power" id="castPower">
       <div class="cast-label">CAST POWER</div>
-      <div class="cast-track"><div class="cast-fill" id="castFill"></div><div class="cast-notch"></div></div>
+      <div class="cast-track">
+        <div class="cast-fill" id="castFill"></div>
+        <div class="cast-band" id="castBand"></div>
+      </div>
+      <div class="cast-band-hint">perfect throw</div>
+    </div>
+
+    <div class="perfect-burst" id="perfectBurst">
+      <span class="pb-rays"></span>
+      <b class="pb-txt" data-text="PERFECT!">PERFECT!</b>
+    </div>
+
+    <div class="downed-layer" id="downedLayer"></div>
+
+    <div class="revive-ring" id="reviveRing">
+      <div class="rr-ring">
+        <svg viewBox="0 0 72 72">
+          <circle class="rr-bg" cx="36" cy="36" r="30"></circle>
+          <circle class="rr-fg" id="rrFg" cx="36" cy="36" r="30"></circle>
+        </svg>
+        <span class="rr-ico">${SVG_HEART}</span>
+      </div>
+      <div class="rr-txt" id="rrTxt">Reviving…</div>
+      <div class="rr-hint">hold <kbd>E</kbd></div>
+    </div>
+
+    <div class="tow-hint" id="towHint">
+      <span class="th-ico">${REVIVE_SVG.rescueclaw}</span>
+      <span class="th-txt"><b id="towName">Crewmate</b><i>bring them to air</i></span>
     </div>
 
     <div class="reel-widget" id="reelWidget">
@@ -1063,6 +1163,8 @@ export function initUI(ctx) {
       <div class="ko-inner">
         <div class="ko-title">OUT COLD</div>
         <div class="ko-sub">You're out cold — sunrise revives you</div>
+        <div class="ko-kit" id="koKit"><kbd>R</kbd><span id="koKitTxt">Revival Kit</span></div>
+        <div class="ko-hint" id="koHint">A crewmate can revive you with Sea Salts</div>
       </div>
     </div>
 
@@ -1118,9 +1220,13 @@ export function initUI(ctx) {
   const elWallet = $('hudWallet'), elWalletNum = $('walletNum'), elWalletDelta = $('walletDelta');
   const elHpFill = $('hpFill'), elHpTxt = $('hpTxt'), elAirRow = $('airRow'), elAirFill = $('airFill'), elAirTxt = $('airTxt');
   const elPrompt = $('hudPrompt'), elPromptTxt = $('promptTxt');
-  const elCastPower = $('castPower'), elCastFill = $('castFill');
+  const elCastPower = $('castPower'), elCastFill = $('castFill'), elCastBand = $('castBand');
+  const elPerfect = $('perfectBurst');
+  const elDownedLayer = $('downedLayer');
+  const elReviveRing = $('reviveRing'), elRrFg = $('rrFg'), elRrTxt = $('rrTxt');
+  const elTowHint = $('towHint'), elTowName = $('towName');
   const elReel = $('reelWidget'), elReelZone = $('reelZone'), elReelMarker = $('reelMarker'), elReelRing = $('reelRing'), elReelPct = $('reelPct');
-  const elKO = $('koOverlay');
+  const elKO = $('koOverlay'), elKoKit = $('koKit'), elKoKitTxt = $('koKitTxt'), elKoHint = $('koHint');
   const elEventBanner = $('eventBanner'), elEbTitle = $('ebTitle'), elEbDesc = $('ebDesc');
   const elEventVig = $('eventVignette'), elDamageVig = $('damageVignette');
   const elQuotaBanner = $('quotaBanner'), elQbTitle = $('qbTitle'), elQbSub = $('qbSub');
@@ -1141,6 +1247,9 @@ export function initUI(ctx) {
   const RING_LEN = TAU * 26;
   elReelRing.style.strokeDasharray = RING_LEN.toFixed(2);
   elReelRing.style.strokeDashoffset = RING_LEN.toFixed(2);
+  const RR_LEN = TAU * 30;
+  elRrFg.style.strokeDasharray = RR_LEN.toFixed(2);
+  elRrFg.style.strokeDashoffset = RR_LEN.toFixed(2);
 
   // artifact tracker slots
   const artiKeys = Object.keys(ARTIFACTS);
@@ -1220,6 +1329,7 @@ export function initUI(ctx) {
     { k: 'bait', label: 'Baits' },
     { k: 'weapon', label: 'Weapons' },
     { k: 'charm', label: 'Charms' },
+    { k: 'revive', label: 'Rescue' },
     { k: 'diving', label: 'Diving' },
     { k: 'ward', label: 'Ward' },
     { k: 'sell', label: 'Sell' },
@@ -1241,6 +1351,7 @@ export function initUI(ctx) {
       <div class="end-kicker" id="endKicker"></div>
       <h2 class="end-title" id="endTitle"></h2>
       <p class="end-reason" id="endReason"></p>
+      <p class="end-note" id="endNote"></p>
       <div class="card end-stats" id="endStats"></div>
       <div class="end-credit" id="endCredit"></div>
       <button class="btn btn-big btn-primary" id="btnBackMenu"><span>BACK TO THE DOCK</span></button>
@@ -1251,6 +1362,7 @@ export function initUI(ctx) {
   const elEndKicker = endScreen.querySelector('#endKicker');
   const elEndTitle = endScreen.querySelector('#endTitle');
   const elEndReason = endScreen.querySelector('#endReason');
+  const elEndNote = endScreen.querySelector('#endNote');
   const elEndStats = endScreen.querySelector('#endStats');
   const elEndCredit = endScreen.querySelector('#endCredit');
 
@@ -1298,6 +1410,8 @@ export function initUI(ctx) {
     endScreen.classList.toggle('is-won', won);
     endScreen.classList.toggle('is-lost', !won);
     elEndBg.className = 'end-bg ' + (won ? 'bg-sunrise' : 'bg-tsunami');
+    endScreen.classList.remove('is-wipe');
+    let note = '';
     if (won) {
       setText(elEndKicker, 'the ring opened at dawn');
       setText(elEndTitle, 'YOU ESCAPED TIDEWRECK ISLAND');
@@ -1307,14 +1421,20 @@ export function initUI(ctx) {
       const reason = (data && data.reason) || 'tsunami';
       setText(elEndKicker, 'the run ends');
       if (reason === 'wipe') {
+        // a team wipe is its own ending: no quota failed, the island simply took its due
+        endScreen.classList.add('is-wipe');
+        setText(elEndKicker, 'nobody was left standing');
         setText(elEndTitle, 'THE CREW IS GONE');
-        setText(elEndReason, 'Everyone went under. The island keeps what it takes.');
+        setText(elEndReason, 'The sea took the whole crew.');
+        note = 'Every last one of you went under at once — so the water came up to collect the rest.';
       } else {
         setText(elEndTitle, 'THE TIDE CAME TO COLLECT');
         setText(elEndReason, 'The quota went unpaid. A black wall of water folded the island flat.');
       }
       setText(elEndCredit, 'the sea remembers. try again.');
     }
+    setText(elEndNote, note);
+    elEndNote.style.display = note ? '' : 'none';
     renderStats(data && data.stats);
     state.phase = 'over';
     applyPhase(true);
@@ -1333,9 +1453,57 @@ export function initUI(ctx) {
     if (!force && p === ui.phase) return;
     ui.phase = p;
     root.dataset.phase = p;
-    if (p !== 'playing') { closeShop(); closeInventory(); closeChat(false); clearFloppers(); ui.lootNear = null; }
+    if (p !== 'playing') {
+      closeShop(); closeInventory(); closeChat(false); clearFloppers(); ui.lootNear = null;
+      hideReviveRing(); setTowing(null); clearDownedMarkers();
+    }
+    // the doomsday blackout only ever lifts on the way back to the dock
+    if (p === 'menu' || p === 'lobby') endDoomsday();
     if (p === 'lobby') renderLobby();
     if (p === 'playing') { refreshHUDFromState(); refreshHotbar(); }
+  }
+
+  // =============================================================
+  // DOOMSDAY — the tsunami cinematic owns the whole screen
+  // =============================================================
+  // One class on the hud root hides EVERY hud element (chips, quota, wallet,
+  // hotbar, vitals, prompts, chat, banners, cards, the flopper strip). Nothing
+  // may re-show itself while it is on: toasts bail out early, the prompt and
+  // the transient widgets are force-hidden here and refuse to come back.
+  function startDoomsday() {
+    if (ui.doom) return;
+    ui.doom = true;
+    root.classList.add('doomsday');
+    hud.classList.add('is-doom');
+    closeShop();
+    closeInventory();
+    closeChat(false);
+    clearFloppers();
+    clearDownedMarkers();
+    hideReviveRing();
+    setTowing(null);
+    hideCastPower();
+    hidePerfect();
+    hideReel();
+    ui.lootNear = null;
+    ui.interact = null;
+    elPrompt.classList.remove('show');
+    elCatch.classList.remove('show');
+    elUnique.classList.remove('show');
+    elArtifactBanner.classList.remove('show');
+    elQuotaBanner.classList.remove('show');
+    elEventBanner.classList.remove('show');
+    elKO.classList.remove('show');
+    ui.koShown = false;
+    toastLayer.innerHTML = '';
+  }
+  function endDoomsday() {
+    if (!ui.doom && !root.classList.contains('doomsday')) return;
+    ui.doom = false;
+    root.classList.remove('doomsday');
+    hud.classList.remove('is-doom');
+    elTsunamiFlash.classList.remove('show');
+    root.classList.remove('shake-long');
   }
 
   // =============================================================
@@ -1417,6 +1585,7 @@ export function initUI(ctx) {
   }
 
   function showArtifactBanner(id) {
+    if (ui.doom) return;
     const a = ARTIFACTS[id];
     elAbIco.innerHTML = artifactIcon(id);
     setText(elAbName, a ? a.name : 'Unknown relic');
@@ -1580,7 +1749,7 @@ export function initUI(ctx) {
   }
 
   function onFlopper(d) {
-    if (!d || typeof d !== 'object') return;
+    if (!d || typeof d !== 'object' || ui.doom) return;
     const id = (d.flopperId != null) ? String(d.flopperId) : '';
     if (!id) return;
     const st = String(d.state || 'spawn');
@@ -1677,6 +1846,7 @@ export function initUI(ctx) {
   }
 
   function showUniqueCard(id) {
+    if (ui.doom) return;
     const def = UNIQUE_CHARMS[id];
     if (ui.uniques.indexOf(id) < 0) ui.uniques.push(id);
     if (ui.invOpen) renderCharmStrip();
@@ -1725,6 +1895,7 @@ export function initUI(ctx) {
   // LIGHTNING
   // =============================================================
   function lightningFlinch() {
+    if (ui.doom) return;
     elLightning.classList.remove('strike'); void elLightning.offsetWidth;
     elLightning.classList.add('strike');
     flashDamage();
@@ -1922,6 +2093,9 @@ export function initUI(ctx) {
     } else if (item.kind === 'charm') {
       const owned = Array.isArray(g.charms) ? g.charms : [];
       if (owned.indexOf(item.id) >= 0) return { s: 'owned', label: 'OWNED' };
+    } else if (item.kind === 'revive') {
+      // the claw is a one-time tool; salts and kits stack, so they never lock
+      if (item.id === 'rescueclaw' && revivesMap().rescueclaw > 0) return { s: 'owned', label: 'OWNED' };
     }
     const price = itemPrice(item);
     if (price > wallet) return { s: 'poor', label: 'BUY', note: 'purse too light' };
@@ -1960,6 +2134,20 @@ export function initUI(ctx) {
       if (canBonk(item)) bits.push('bonks your catch');
     } else if (item.kind === 'charm') {
       bits.push('+' + Math.round(item.luck * 100) + '% luck');
+    } else if (item.kind === 'revive') {
+      const rv = revivesMap();
+      if (item.id === 'rescueclaw') {
+        bits.push('permanent tool');
+        bits.push('reaches ' + RV.clawRange + ' m underwater');
+        bits.push(rv.rescueclaw > 0 ? 'on your belt' : 'not owned');
+      } else if (item.id === 'salts') {
+        bits.push('hold E for ' + RV.hold + 's within ' + RV.saltsRange + ' m');
+        bits.push('revives at ' + Math.round(RV.saltsHp * 100) + '% hp');
+        bits.push('you hold ×' + rv.salts);
+      } else {
+        bits.push('self-revive at ' + Math.round(RV.kitHp * 100) + '% hp');
+        bits.push('you hold ×' + rv.revivalkit);
+      }
     } else if (item.kind === 'diving') {
       bits.push(item.air + 's of air');
       bits.push('Level ' + item.level);
@@ -2068,6 +2256,14 @@ export function initUI(ctx) {
     if (ui.shopTab === 'ward') {
       elShopBody.insertBefore(el('div', 'shop-note',
         'The ward is a <b>team purchase</b>. Each one buys three more days — and costs 50% more than the last.'), list);
+    }
+    if (ui.shopTab === 'revive') {
+      const rv = revivesMap();
+      elShopBody.insertBefore(el('div', 'shop-note revive-note',
+        'Nobody stays down if the crew can reach them. In your pack: '
+        + '<b>Sea Salts ×' + rv.salts + '</b> · <b>Revival Kits ×' + rv.revivalkit + '</b> · '
+        + 'Rescue Claw <b>' + (rv.rescueclaw > 0 ? 'owned' : 'not owned') + '</b>. '
+        + 'If the WHOLE crew goes down at once, the island stops waiting.'), list);
     }
   }
 
@@ -2276,7 +2472,7 @@ export function initUI(ctx) {
   // CATCH CARD / EVENT BANNERS / VIGNETTES
   // =============================================================
   function showCatch(payload) {
-    if (!payload) return;
+    if (!payload || ui.doom) return;
     const caught = payload.caught != null ? payload.caught : true;
     const fish = payload.fish || (payload.fishId ? payload : null);
     if (!caught || !fish) {
@@ -2307,6 +2503,7 @@ export function initUI(ctx) {
   }
 
   function showEventBanner(type) {
+    if (ui.doom) return;
     const def = EVENTS[type];
     const title = (def ? def.name : String(type || 'IT')).toUpperCase();
     elEbTitle.setAttribute('data-text', title);
@@ -2331,6 +2528,7 @@ export function initUI(ctx) {
   }
 
   function flashDamage(amount) {
+    if (ui.doom) return;   // the doomsday shake owns the screen
     ui.damageFlash = 1;
     elDamageVig.classList.remove('hit'); void elDamageVig.offsetWidth;
     elDamageVig.classList.add('hit');
@@ -2340,6 +2538,7 @@ export function initUI(ctx) {
   }
 
   function showQuotaBanner(d) {
+    if (ui.doom) return;
     const n = num(d && d.n, 0);
     setText(elQbTitle, 'QUOTA ' + n + ' MET');
     const bits = [];
@@ -2361,19 +2560,50 @@ export function initUI(ctx) {
     if (x > 1.5) x = x / 100;
     return clamp01(x);
   }
+  // The sweet band: two bright lines with a soft glow between them. The
+  // payload owns the numbers (fishing.js ships band:[a,b]); this only paints.
+  let bandLo = -1, bandHi = -1;
+  function setCastBand(band) {
+    const a = clamp01(num(band && band[0], PERFECT_BAND[0]));
+    const b = clamp01(num(band && band[1], PERFECT_BAND[1]));
+    const lo = Math.min(a, b), hi = Math.max(a, b);
+    if (lo === bandLo && hi === bandHi) return;
+    bandLo = lo; bandHi = hi;
+    elCastBand.style.left = (lo * 100).toFixed(2) + '%';
+    elCastBand.style.width = Math.max(0.4, (hi - lo) * 100).toFixed(2) + '%';
+  }
+  function inBand(p) { return p >= bandLo && p <= bandHi; }
+
   function onCastPower(d) {
     let p;
     if (typeof d === 'number') p = d;
     else if (d && typeof d === 'object') p = num(d.power, num(d.value, num(d.p, num(d.charge, 0))));
     else p = 0;
     if (d === null || d === false || (d && d.active === false)) { elCastPower.classList.remove('show'); ui.castPowerT = -99; return; }
+    setCastBand(bandOf(d));
     p = normFrac(p, 0);
     ui.castPowerT = ui.now;
+    if (ui.doom) return;
     elCastPower.classList.add('show');
     elCastFill.style.width = (p * 100).toFixed(1) + '%';
     elCastFill.classList.toggle('is-max', p > 0.92);
+    elCastPower.classList.toggle('in-band', p > 0.001 && inBand(p));
   }
-  function hideCastPower() { elCastPower.classList.remove('show'); ui.castPowerT = -99; }
+  function hideCastPower() {
+    elCastPower.classList.remove('show', 'in-band');
+    ui.castPowerT = -99;
+  }
+
+  // PERFECT! — a short golden burst right where the bar was
+  function showPerfect() {
+    if (ui.doom) return;
+    if (!fresh('perfect', 250)) return;
+    ui.perfectT = ui.now;
+    elPerfect.classList.remove('show'); void elPerfect.offsetWidth;
+    elPerfect.classList.add('show');
+    elCastPower.classList.add('in-band');
+  }
+  function hidePerfect() { elPerfect.classList.remove('show'); ui.perfectT = -99; }
 
   function onReelState(d) {
     if (!d || d === false || d.active === false || d.done === true || d.state === 'done' || d.state === 'end') { hideReel(); return; }
@@ -2425,6 +2655,316 @@ export function initUI(ctx) {
     ui.reelOn = false;
     ui.reelT = -99;
     elReel.classList.remove('show', 'in-zone', 'is-strain');
+  }
+
+  // =============================================================
+  // REVIVING — downed markers, channel ring, tow hint, KO overlay
+  // =============================================================
+  // player.js owns the hold-E channel and every send (REVIVE_TEAMMATE /
+  // TOW_BODY); everything here reads its published state and paints it.
+  const PROJ = (ctx.THREE && ctx.THREE.Vector3) ? new ctx.THREE.Vector3() : null;
+  const dmRows = new Map();          // playerId -> marker record
+
+  function dist3(a, b) {
+    const dx = num(a.x, 0) - num(b.x, 0);
+    const dy = num(a.y, 0) - num(b.y, 0);
+    const dz = num(a.z, 0) - num(b.z, 0);
+    return Math.sqrt(dx * dx + dy * dy + dz * dz);
+  }
+
+  // gear.revives is the wave-5 payload {salts, rescueclaw, revivalkit}.
+  // An array of ids or flat gear fields are honoured too — never trust a shape.
+  function revivesMap() {
+    const g = state.gear || {};
+    const out = { salts: 0, rescueclaw: 0, revivalkit: 0 };
+    const r = g.revives;
+    if (Array.isArray(r)) {
+      for (const id of r) if (out[id] !== undefined) out[id]++;
+    } else if (r && typeof r === 'object') {
+      for (const k in out) {
+        const v = r[k];
+        out[k] = (v === true) ? 1 : Math.max(0, Math.floor(num(v, 0)));
+      }
+    }
+    if (!out.rescueclaw) {
+      const lists = [g.tools, g.items, g.revivals];
+      for (const l of lists) if (Array.isArray(l) && l.indexOf('rescueclaw') >= 0) out.rescueclaw = 1;
+      if (g.rescueclaw === true || num(g.rescueclaw, 0) > 0) out.rescueclaw = 1;
+    }
+    if (!out.salts) out.salts = Math.max(0, Math.floor(num(g.salts, 0)));
+    if (!out.revivalkit) out.revivalkit = Math.max(0, Math.floor(num(g.revivalkit, 0)));
+    return out;
+  }
+
+  function playerNameById(id) {
+    if (id == null || id === '') return 'Crewmate';
+    const key = String(id);
+    const w = state.world;
+    const lists = [
+      (w && Array.isArray(w.players)) ? w.players : null,
+      (state.room && Array.isArray(state.room.players)) ? state.room.players : null,
+    ];
+    for (const l of lists) {
+      if (!l) continue;
+      for (const p of l) if (p && String(p.id) === key && p.name) return String(p.name);
+    }
+    try {
+      const rem = ctx.playerMod && ctx.playerMod.remotes;
+      const r = (rem && typeof rem.get === 'function') ? rem.get(key) : null;
+      if (r && r.name) return String(r.name);
+    } catch (e) { /* remotes not ready */ }
+    return 'Crewmate';
+  }
+
+  function readDownEntry(key, v, out) {
+    if (!v) return;
+    if (typeof v === 'string' || typeof v === 'number') v = { id: String(v) };
+    if (typeof v !== 'object') return;
+    const id = (v.id != null) ? String(v.id) : String(key);
+    if (!id || id === 'undefined' || id === 'null') return;
+    const src = v.pos || v.p || v.position
+      || (v.char && v.char.group && v.char.group.position)
+      || (v.group && v.group.position) || null;
+    out.push({
+      id,
+      name: (typeof v.name === 'string' && v.name) ? v.name : playerNameById(id),
+      pos: vecOf(src, { x: 0, y: 0, z: 0 }),
+      under: (v.underwater != null) ? !!v.underwater : ((v.under != null) ? !!v.under : null),
+      towedBy: (v.towedBy != null) ? String(v.towedBy) : ((v.towed != null && v.towed !== false) ? String(v.towed) : null),
+    });
+  }
+  // ctx.playerMod.downed may be a Map, an array, a Set of ids or a plain object
+  function downedList() {
+    const out = [];
+    const src = ctx.playerMod && ctx.playerMod.downed;
+    if (!src) return out;
+    try {
+      if (typeof Map !== 'undefined' && src instanceof Map) src.forEach((v, k) => readDownEntry(k, v, out));
+      else if (Array.isArray(src)) src.forEach((v, i) => readDownEntry((v && v.id != null) ? v.id : i, v, out));
+      else if (typeof Set !== 'undefined' && src instanceof Set) src.forEach((v) => readDownEntry(v, v, out));
+      else if (typeof src === 'object') { for (const k in src) readDownEntry(k, src[k], out); }
+    } catch (e) { /* whatever shape that was, it is not ours */ }
+    return out;
+  }
+
+  // a body is "under" if the module said so, else ask the water
+  function bodyUnder(d) {
+    if (d.under != null) return d.under;
+    if (!d.pos) return false;
+    let sea = 0;
+    try {
+      if (typeof ctx.getWaterHeight === 'function') sea = num(ctx.getWaterHeight(d.pos.x, d.pos.z, ui.now), 0);
+    } catch (e) { sea = 0; }
+    return d.pos.y < sea - 0.35;
+  }
+
+  // ---- world-anchored markers (edge-clamped so a body is always findable) ----
+  function markerFor(id) {
+    let rec = dmRows.get(id);
+    if (rec) return rec;
+    const node = el('div', 'downed-marker');
+    node.innerHTML =
+      `<span class="dm-glyph">${SVG_SKULL}</span>` +
+      '<span class="dm-body"><b class="dm-name"></b><i class="dm-dist"></i></span>';
+    elDownedLayer.appendChild(node);
+    rec = { el: node, name: node.querySelector('.dm-name'), dist: node.querySelector('.dm-dist') };
+    dmRows.set(id, rec);
+    return rec;
+  }
+  function dropMarker(id) {
+    const rec = dmRows.get(String(id));
+    if (!rec) return;
+    if (rec.el.parentNode) rec.el.parentNode.removeChild(rec.el);
+    dmRows.delete(String(id));
+  }
+  function clearDownedMarkers() {
+    for (const id of Array.from(dmRows.keys())) dropMarker(id);
+    ui.downSeen.clear();
+    ui.downInit = false;
+    elDownedLayer.classList.remove('show');
+  }
+
+  function updateDownedMarkers() {
+    if (ui.doom || effectivePhase() !== 'playing') {
+      if (dmRows.size || ui.downSeen.size) clearDownedMarkers();
+      return;
+    }
+    const list = downedList();
+    if (!list.length && !dmRows.size && !ui.downSeen.size) { ui.downInit = true; return; }
+    const me = myId() ? String(myId()) : null;
+    const cam = ctx.camera;
+    const p = playerPos(TMP);
+    const W = window.innerWidth || 1280;
+    const H = window.innerHeight || 720;
+    const seen = new Set();
+    for (let i = 0; i < list.length; i++) {
+      const d = list[i];
+      if (me && d.id === me) continue;
+      seen.add(d.id);
+      if (!ui.downSeen.has(d.id)) {
+        ui.downSeen.add(d.id);
+        if (ui.downInit) toast(d.name + ' is down — get to them', 'bad');
+      }
+      if (!d.pos || !cam || !PROJ) continue;
+      const rec = markerFor(d.id);
+      PROJ.set(num(d.pos.x, 0), num(d.pos.y, 0) + 1.35, num(d.pos.z, 0));
+      try { PROJ.project(cam); } catch (e) { continue; }
+      let x = num(PROJ.x, 0), y = num(PROJ.y, 0);
+      const behind = num(PROJ.z, 0) > 1;
+      if (behind) { x = -x; y = -1; }
+      const off = behind || x < -1 || x > 1 || y < -1 || y > 1;
+      x = x < -0.93 ? -0.93 : (x > 0.93 ? 0.93 : x);
+      y = y < -0.86 ? -0.86 : (y > 0.9 ? 0.9 : y);
+      rec.el.style.transform = 'translate(' + ((x * 0.5 + 0.5) * W).toFixed(1) + 'px,'
+        + ((0.5 - y * 0.5) * H).toFixed(1) + 'px) translate(-50%,-50%)';
+      rec.el.classList.toggle('is-edge', off);
+      rec.el.classList.toggle('is-towed', !!d.towedBy);
+      rec.el.classList.add('show');
+      setText(rec.name, d.name);
+      const dist = dist3(p, d.pos);
+      setText(rec.dist, dist >= 999 ? '999+ m' : (Math.max(0, Math.round(dist)) + ' m'));
+    }
+    for (const id of Array.from(dmRows.keys())) if (!seen.has(id)) dropMarker(id);
+    for (const id of Array.from(ui.downSeen)) if (!seen.has(id)) ui.downSeen.delete(id);
+    ui.downInit = true;
+    elDownedLayer.classList.toggle('show', dmRows.size > 0);
+  }
+
+  // ---- the hold-E channel ring ----
+  function onReviveChannel(d) {
+    if (!d || d === false || d.active === false || d.cancel === true) { hideReviveRing(); return; }
+    const t01 = clamp01(num(d.t01, num(d.t, num(d.progress, num(d.p, 0)))));
+    if (t01 <= 0.0001) { hideReviveRing(); return; }
+    ui.reviveOn = true;
+    ui.reviveChT = ui.now;
+    ui.reviveTarget = (d.targetId != null) ? String(d.targetId) : null;
+    if (ui.doom) return;
+    const name = (typeof d.name === 'string' && d.name) ? d.name : playerNameById(ui.reviveTarget);
+    setText(elRrTxt, 'Reviving ' + name + '…');
+    elRrFg.style.strokeDashoffset = (RR_LEN * (1 - t01)).toFixed(2);
+    elReviveRing.classList.add('show');
+    elReviveRing.classList.toggle('is-full', t01 > 0.985);
+  }
+  function hideReviveRing() {
+    ui.reviveOn = false;
+    ui.reviveChT = -99;
+    ui.reviveTarget = null;
+    elReviveRing.classList.remove('show', 'is-full');
+  }
+
+  // ---- towing a body up with the Rescue Claw ----
+  function setTowing(rec) {
+    ui.towing = rec || null;
+    if (!rec || ui.doom) { elTowHint.classList.remove('show'); return; }
+    setText(elTowName, rec.name || 'Crewmate');
+    elTowHint.classList.add('show');
+  }
+  function onBodyTowed(d) {
+    if (!d) return;
+    const id = (d.id != null) ? String(d.id) : '';
+    if (!id) return;
+    const by = (d.by != null && d.by !== false) ? String(d.by) : null;
+    const me = myId() ? String(myId()) : null;
+    if (by && me && by === me) {
+      if (!ui.towing || ui.towing.id !== id) setTowing({ id, name: playerNameById(id) });
+      refreshPrompt();
+      return;
+    }
+    if (ui.towing && ui.towing.id === id) { setTowing(null); refreshPrompt(); }
+  }
+
+  // ---- prompts ----
+  // Mirrors player.js's updateRevive() exactly, so the prompt never promises
+  // something E will not do: the claw wins while you are in the water, salts
+  // only work on a body that is out of it, and the helm owns E while driving.
+  function inWater() {
+    if (state.underwater) return true;
+    const l = ctx.playerMod && ctx.playerMod.local;
+    return !!(l && (l.swimming || l.underwater));
+  }
+  function nearestBody(p, range, needAir) {
+    const list = downedList();
+    if (!list.length) return null;
+    const me = myId() ? String(myId()) : null;
+    let best = null;
+    for (let i = 0; i < list.length; i++) {
+      const d = list[i];
+      if (!d.pos || (me && d.id === me)) continue;
+      if (d.towedBy && (!me || d.towedBy !== me)) continue;   // someone else has them
+      if (needAir && bodyUnder(d)) continue;
+      const dist = dist3(p, d.pos);
+      if (dist > range) continue;
+      if (!best || dist < best.dist) best = { d, dist };
+    }
+    return best;
+  }
+  function revivePrompt(p) {
+    if (isDrivingBoat()) return null;                          // the wheel owns E
+    const rv = revivesMap();
+    const wet = inWater();
+
+    // 1. Rescue Claw — grab anything you can reach while you are in the water
+    if (rv.rescueclaw > 0 && wet) {
+      const grab = nearestBody(p, RV.clawRange, false);
+      if (grab) {
+        return { kind: 'revive', d: grab.dist, hot: true, act: null, label: 'E — Grab ' + grab.d.name + ' (Rescue Claw)' };
+      }
+    }
+    // 2. Sea Salts — only ever on a body that is out of the water
+    const dry = nearestBody(p, RV.saltsRange, RV.noSaltsUnder);
+    if (dry && rv.salts > 0) {
+      return { kind: 'revive', d: dry.dist, hot: true, act: null, label: 'Hold E — Revive ' + dry.d.name + ' (Sea Salts)' };
+    }
+    // 3. nothing you can do yet — say why
+    const any = nearestBody(p, Math.max(RV.clawRange, RV.saltsRange) + 1.5, false);
+    if (!any) return null;
+    const name = any.d.name;
+    if (bodyUnder(any.d)) {
+      return {
+        kind: 'revive', d: any.dist, locked: true, act: null,
+        label: rv.rescueclaw > 0
+          ? (name + ' is under — swim down and grab them')
+          : (name + ' is under — a Rescue Claw could reach them'),
+      };
+    }
+    if (!dry) return { kind: 'revive', d: any.dist, locked: true, act: null, label: name + ' is down — get closer' };
+    return { kind: 'revive', d: any.dist, locked: true, act: null, label: name + ' is down — Sea Salts would bring them back' };
+  }
+
+  // ---- the KO overlay you see from the floor ----
+  function refreshKO(ko) {
+    if (!ko) { elKO.classList.remove('has-kit'); return; }
+    const kits = revivesMap().revivalkit;
+    elKoKit.style.display = kits > 0 ? '' : 'none';
+    // player.js owns the R key and the USE_REVIVAL_KIT send — this is the prompt
+    setText(elKoKitTxt, 'Press R — ' + reviveShortName('revivalkit') + ' (' + kits + ' left)');
+    elKoHint.style.display = kits > 0 ? 'none' : '';
+    elKO.classList.toggle('has-kit', kits > 0);
+  }
+
+  function onRevived(d) {
+    if (!d) return;
+    const id = (d.id != null) ? String(d.id) : '';
+    if (!id) return;
+    if (!fresh('rev:' + id, 400)) return;
+    const me = myId() ? String(myId()) : null;
+    hideReviveRing();
+    if (ui.towing && ui.towing.id === id) setTowing(null);
+    dropMarker(id);
+    ui.downSeen.delete(id);
+    if (me && id === me) {
+      const raw = num(d.hp, RV.saltsHp);
+      state.hp = raw <= 1 ? Math.max(1, Math.round(raw * PLAYER_MAX_HP)) : Math.max(1, Math.round(raw));
+      ui.koShown = false;
+      elKO.classList.remove('show', 'has-kit');
+      root.dataset.ko = '';
+      refreshVitals();
+      const by = (d.by != null && d.by !== false) ? playerNameById(d.by) : null;
+      toast(by ? (by + ' hauled you back up') : 'You are back on your feet', 'good');
+    } else {
+      toast(playerNameById(id) + ' is back up', 'good');
+    }
+    refreshPrompt();
   }
 
   // =============================================================
@@ -2521,6 +3061,14 @@ export function initUI(ctx) {
     }
 
     const p = playerPos(TMP);
+
+    // A crewmate on the floor outranks the shop, the wheel and the ring.
+    if (ui.towing) {
+      return { kind: 'revive', d: 0, hot: true, act: null, label: 'E — Release ' + (ui.towing.name || 'them') };
+    }
+    const rev = revivePrompt(p);
+    if (rev) return rev;
+
     if (state.onBoat) return boatPrompt(p);
 
     const world = ctx.world;
@@ -2567,6 +3115,7 @@ export function initUI(ctx) {
 
   const elPromptKey = elPrompt.querySelector('kbd');
   function refreshPrompt() {
+    if (ui.doom) { ui.interact = null; elPrompt.classList.remove('show'); return; }
     const it = computeInteract();
     ui.interact = it;
     if (!it) { elPrompt.classList.remove('show'); return; }
@@ -2574,14 +3123,19 @@ export function initUI(ctx) {
     elPrompt.classList.toggle('is-locked', !!it.locked);
     elPrompt.classList.toggle('is-hot', !!it.hot);
     elPrompt.classList.toggle('is-loot', it.kind === 'loot');
+    elPrompt.classList.toggle('is-revive', it.kind === 'revive');
     setText(elPromptTxt, it.label);
     elPromptKey.style.display = it.locked ? 'none' : '';
   }
 
   function doInteract() {
+    if (ui.doom) return;
     const it = ui.interact || computeInteract();
     if (!it) return;
-    if (it.locked) { toast('The ring is not ready: ' + it.label, 'warn'); return; }
+    if (it.locked) {
+      toast(it.kind === 'portal' ? ('The ring is not ready: ' + it.label) : it.label, 'warn');
+      return;
+    }
     if (typeof it.act === 'function') it.act();
     // boat boarding/leaving is owned by player.js — the prompt is informational
   }
@@ -2637,13 +3191,14 @@ export function initUI(ctx) {
       elAirFill.classList.toggle('is-low', air < 0.3);
     }
 
-    const ko = hp <= 0 && effectivePhase() === 'playing';
+    const ko = hp <= 0 && effectivePhase() === 'playing' && !ui.doom;
     if (ko !== ui.koShown) {
       ui.koShown = ko;
       elKO.classList.toggle('show', ko);
       root.dataset.ko = ko ? '1' : '';
-      if (ko) { closeShop(); closeInventory(); }
+      if (ko) { closeShop(); closeInventory(); hideReviveRing(); }
     }
+    refreshKO(ko);
   }
 
   // =============================================================
@@ -2698,6 +3253,12 @@ export function initUI(ctx) {
   onBus('lootNear', (d) => onLootNear(d));
   onBus('lootResult', (d) => onLootResult(d));
   onBus('lootState', (d) => noteLootState(d));
+  // wave 5: fishing.js says the release landed in the band; player.js channels revives
+  onBus('perfectCast', () => showPerfect());
+  onBus('reviveChannel', (d) => onReviveChannel(d));
+  onBus('bodyTowed', (d) => onBodyTowed(d));
+  onBus('revived', (d) => onRevived(d));
+  onBus('tsunami', () => startDoomsday());
 
   function handleChatMsg(from, text) {
     const sys = !from || from === 'ISLAND' || from === 'system' || from === 'System';
@@ -2813,12 +3374,18 @@ export function initUI(ctx) {
   });
   onNet(MSG.QUOTA_DONE, (d) => { if (fresh('qd:' + (d && d.n), 500)) showQuotaBanner(d); });
   onNet(MSG.TSUNAMI_WARNING, (d) => handleTsunamiWarning(d));
+  // DOOMSDAY. The hud goes away entirely — events.js owns the screen from here.
   onNet(MSG.TSUNAMI, () => {
+    startDoomsday();
+    elTsunamiFlash.classList.remove('show'); void elTsunamiFlash.offsetWidth;
     elTsunamiFlash.classList.add('show');
     root.classList.add('shake-long');
-    toast('THE WAVE IS HERE', 'bad');
   });
-  onNet(MSG.GAME_OVER, (d) => { elTsunamiFlash.classList.remove('show'); root.classList.remove('shake-long'); showEnd('over', d || {}); });
+  onNet(MSG.GAME_OVER, (d) => {
+    elTsunamiFlash.classList.remove('show');
+    root.classList.remove('shake-long');
+    showEnd('over', d || {});
+  });
   onNet(MSG.GAME_WON, (d) => { showEnd('won', d || {}); });
   onNet(MSG.PORTAL_STATE, (d) => {
     if (!d) return;
@@ -2861,6 +3428,10 @@ export function initUI(ctx) {
   // ---- wave 4: underwater loot ----
   onNet(MSG.LOOT_STATE, (d) => noteLootState(d));
   onNet(MSG.LOOT_RESULT, (d) => onLootResult(d));
+
+  // ---- wave 5: reviving ----
+  onNet(MSG.REVIVED, (d) => onRevived(d));
+  onNet(MSG.BODY_TOWED, (d) => onBodyTowed(d));
   onNet(MSG.LIGHTNING, (d) => {
     if (!d) return;
     const me = myId();
@@ -2934,6 +3505,12 @@ export function initUI(ctx) {
   function tick10() {
     applyPhase();
 
+    // Doomsday: the hud is gone and stays gone. Nothing below may repaint it.
+    if (ui.doom) {
+      if (ui.phase === 'playing') { refreshSky(); }
+      return;
+    }
+
     if (ui.shopOpen || ui.invOpen || ui.chatOpen || isTyping()) {
       try { if (ctx.input && ctx.input.keys && ctx.input.keys.size) ctx.input.keys.clear(); } catch (e) { /* ignore */ }
       if (ctx.input && (ui.shopOpen || ui.invOpen)) ctx.input.mouseDown = false;
@@ -2979,10 +3556,15 @@ export function initUI(ctx) {
     ui.now = num(t, ui.now + num(dt, 0.016));
     ui.acc += num(dt, 0.016);
     if (ui.acc >= 0.1) { ui.acc = 0; tick10(); }
+    if (ui.doom) return;
     if (floppers.size) tickFloppers();
+    // world-anchored downed markers follow the camera, so they run every frame
+    updateDownedMarkers();
     // stale-timeout for the transient widgets
     if (elCastPower.classList.contains('show') && ui.now - ui.castPowerT > 0.35) hideCastPower();
     if (ui.reelOn && ui.now - ui.reelT > 45) hideReel();
+    if (ui.reviveOn && ui.now - ui.reviveChT > 0.35) hideReviveRing();
+    if (ui.perfectT > -90 && ui.now - ui.perfectT > 0.85) hidePerfect();
   }
 
   // =============================================================
@@ -2997,8 +3579,11 @@ export function initUI(ctx) {
     elUnique.classList.remove('show');
     hideReel();
     hideCastPower();
+    hidePerfect();
+    hideReviveRing();
   }
 
+  setCastBand(PERFECT_BAND);
   applyPhase(true);
   refreshHotbar();
   refreshVitals();

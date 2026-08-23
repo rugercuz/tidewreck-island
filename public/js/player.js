@@ -14,6 +14,8 @@ import {
   SHOP,
   AREAS,
   BASE_AIR_SECONDS,
+  PLAYER_MAX_HP,
+  REVIVE,
 } from '/shared/constants.js';
 
 // ------------------------------------------------------------
@@ -49,6 +51,17 @@ const HEAD_SWIM = 1.30;          // head height above "feet" anchor, swimming
 const MOVE_HZ = 12;
 const REMOTE_LERP = 0.12;        // seconds of interpolation buffer
 const MOUSE_SENS = 0.0022;
+
+// Reviving (see REVIVE in constants). Downed crew stay where they fell; the
+// Rescue Claw drags a sunken body along ~TOW_DIST behind its carrier.
+const TOW_DIST = 1.5;            // metres behind the carrier
+const TOW_DROP = 0.15;           // ...and slightly below them
+const TOW_LERP = 6;              // damping of the towed body
+const BODY_SUBMERGED = 0.9;      // water depth over a body that counts as "underwater"
+const REVIVE_SEND_CD = 1.6;      // debounce between REVIVE_TEAMMATE sends
+const TOW_SEND_CD = 0.4;         // debounce between TOW_BODY sends
+const KIT_SEND_CD = 1.5;         // debounce between USE_REVIVAL_KIT sends
+const REVIVE_INPLACE_WINDOW = 6; // seconds a REVIVED message keeps you off the campfire
 
 // Skeleton metrics (metres, feet at y = 0, ~1.72 m tall with hat)
 const HIP_Y = 0.76;
@@ -995,6 +1008,21 @@ export function initPlayer(ctx) {
   const remotes = new Map();
   const _deckA = { y: 0, localX: 0, localZ: 0 };
 
+  // ---------- reviving ----------
+  // downed: what ui.js draws its body markers from - id -> {id, pos, name}.
+  const downed = new Map();
+  const hpById = new Map();        // server-truth hp per player id (0 = down)
+  let reviveTargetId = null;       // body the salts channel is running on
+  let reviveT = 0;                 // seconds held
+  let reviveCd = 0;
+  let towingId = null;             // body OUR claw is dragging
+  let myTowedBy = null;            // whose claw is dragging US
+  let towCd = 0;
+  let kitCd = 0;
+  let kitUsedAt = -1e9;
+  let reviveInPlace = false;       // consumed by the wasKo -> up transition
+  let reviveInPlaceAt = -1e9;
+
   const cam = {
     dist: 5.5,
     distWant: 5.5,
@@ -1024,7 +1052,7 @@ export function initPlayer(ctx) {
   const keys = (ctx.input && ctx.input.keys) ? ctx.input.keys : new Set();
   if (ctx.input && !ctx.input.keys) ctx.input.keys = keys;
   const prevKeys = new Set();
-  const WATCH = ['KeyE', 'Space', 'KeyC', 'ShiftLeft', 'ShiftRight'];
+  const WATCH = ['KeyE', 'KeyR', 'Space', 'KeyC', 'ShiftLeft', 'ShiftRight'];
 
   const isDown = (c) => keys.has(c);
   const justDown = (c) => keys.has(c) && !prevKeys.has(c);
@@ -1130,6 +1158,194 @@ export function initPlayer(ctx) {
       return _eul.y;
     }
     return 0;
+  }
+
+  // ---------- revive gear / downed bookkeeping ----------
+  // The revive stock lives in the gear payload as gear.revives. Every shape is
+  // read defensively - {salts:2, rescueclaw:true}, ['rescueclaw'], or plain
+  // top-level counts - and the world player list is the fallback for when
+  // main.js has not mirrored the field into ctx.state.gear.
+  const _gearScan = [];
+  function myGearObjects() {
+    _gearScan.length = 0;
+    const st = ctx.state;
+    if (st && st.gear && typeof st.gear === 'object') _gearScan.push(st.gear);
+    const w = st && st.world;
+    if (w && Array.isArray(w.players) && st.myId) {
+      for (const pl of w.players) {
+        if (!pl || pl.id !== st.myId) continue;
+        if (pl.gear && typeof pl.gear === 'object' && pl.gear !== _gearScan[0]) _gearScan.push(pl.gear);
+        break;
+      }
+    }
+    return _gearScan;
+  }
+  function reviveCount(itemId) {
+    let n = 0;
+    const bump = (v) => {
+      if (typeof v === 'number') { if (Number.isFinite(v) && v > n) n = v; }
+      else if (v === true && n < 1) n = 1;
+    };
+    const gs = myGearObjects();
+    for (let i = 0; i < gs.length; i++) {
+      const g = gs[i];
+      const r = g.revives;
+      if (Array.isArray(r)) {
+        let c = 0;
+        for (let k = 0; k < r.length; k++) if (r[k] === itemId) c++;
+        bump(c);
+      } else if (r && typeof r === 'object') {
+        bump(r[itemId]);
+      }
+      bump(g[itemId]);
+      if (Array.isArray(g.tools) && g.tools.indexOf(itemId) >= 0) bump(1);
+      if (Array.isArray(g.items) && g.items.indexOf(itemId) >= 0) bump(1);
+      if (Array.isArray(g.revivals) && g.revivals.indexOf(itemId) >= 0) bump(1);
+    }
+    return n;
+  }
+  const hasSalts = () => reviveCount('salts') > 0;
+  const hasKit = () => reviveCount('revivalkit') > 0;
+  const hasClaw = () => reviveCount('rescueclaw') > 0;
+
+  function noteHp(id, hp, alive) {
+    if (!id) return;
+    let v = Number.isFinite(hp) ? hp : null;
+    if (alive === false) v = 0;
+    else if (v === null && alive === true) v = hpById.has(id) ? Math.max(1, hpById.get(id)) : PLAYER_MAX_HP;
+    if (v === null) return;
+    hpById.set(id, v);
+  }
+  function isDownId(id) {
+    const hp = hpById.get(id);
+    return Number.isFinite(hp) && hp <= 0;
+  }
+  // REVIVED carries hp either as an absolute value or as a 0..1 fraction.
+  function reviveHp(v) {
+    if (!Number.isFinite(v) || v <= 0) return 0;
+    return v <= 1 ? v * PLAYER_MAX_HP : v;
+  }
+  function bodyUnderwater(pos, t) {
+    if (!pos) return false;
+    return waterH(pos.x, pos.z, t) - pos.y > BODY_SUBMERGED;
+  }
+
+  // Rebuilt every frame from the remotes we track + the server's alive flags.
+  function refreshDowned(t) {
+    for (const r of remotes.values()) {
+      const down = !!r.seen && isDownId(r.id);
+      r.downed = down;
+      if (!down) { downed.delete(r.id); continue; }
+      let rec = downed.get(r.id);
+      if (!rec) {
+        rec = { id: r.id, pos: new THREE.Vector3(), name: r.name, towedBy: null, underwater: false };
+        downed.set(r.id, rec);
+      }
+      rec.pos.copy(r.pos);
+      rec.name = r.name;
+      rec.towedBy = r.towedBy || null;
+      rec.underwater = bodyUnderwater(rec.pos, t);
+    }
+    if (downed.size) {
+      for (const id of Array.from(downed.keys())) if (!remotes.has(id)) downed.delete(id);
+    }
+  }
+
+  // Nearest downed body within range. needAir = Sea Salts rules (the body has
+  // to be out of the water; that is what the Rescue Claw is for).
+  function nearestBody(range, needAir, t) {
+    let best = null;
+    let bd = range * range;
+    for (const rec of downed.values()) {
+      if (!rec || !rec.pos) continue;
+      if (rec.towedBy && rec.towedBy !== ctx.state.myId) continue;   // someone else has them
+      const dx = rec.pos.x - local.pos.x, dy = rec.pos.y - local.pos.y, dz = rec.pos.z - local.pos.z;
+      const d2 = dx * dx + dy * dy + dz * dz;
+      if (d2 > bd) continue;
+      if (needAir && (rec.underwater != null ? rec.underwater : bodyUnderwater(rec.pos, t))) continue;
+      bd = d2;
+      best = rec;
+    }
+    return best;
+  }
+
+  function endChannel() {
+    if (reviveTargetId === null) { reviveT = 0; return; }
+    reviveTargetId = null;
+    reviveT = 0;
+    if (ctx.bus) ctx.bus.emit('reviveChannel', null);
+  }
+
+  // Returns true when a downed teammate owns the E key this frame, so the
+  // boarding / interact flow below stands down (revive is top priority).
+  function updateRevive(dt, t, ko, hasInput) {
+    if (reviveCd > 0) reviveCd -= dt;
+    if (towCd > 0) towCd -= dt;
+    if (kitCd > 0) kitCd -= dt;
+
+    // ---- you are the one on the floor: Revival Kit on R ----
+    if (ko) {
+      endChannel();
+      if (towingId) { towingId = null; send(MSG.TOW_BODY, { targetId: null }); }
+      if (justDown('KeyR') && kitCd <= 0 && hasKit()) {
+        kitCd = KIT_SEND_CD;
+        kitUsedAt = netTime;
+        send(MSG.USE_REVIVAL_KIT, {});
+      }
+      return false;
+    }
+
+    // At the wheel E belongs to the helm - you cannot reach a body from there.
+    if (local.seat === 0) { endChannel(); return false; }
+
+    // ---- Rescue Claw: grab a sunken body, E again lets go ----
+    if (towingId) {
+      if (!downed.has(towingId)) {
+        towingId = null;
+      } else {
+        if (justDown('KeyE') && towCd <= 0) {
+          towCd = TOW_SEND_CD;
+          towingId = null;
+          send(MSG.TOW_BODY, { targetId: null });
+        }
+        endChannel();
+        return true;
+      }
+    }
+    if (hasClaw() && (local.swimming || local.underwater)) {
+      const grab = nearestBody(REVIVE.CLAW_RANGE, false, t);
+      if (grab) {
+        if (justDown('KeyE') && towCd <= 0) {
+          towCd = TOW_SEND_CD;
+          towingId = grab.id;
+          send(MSG.TOW_BODY, { targetId: grab.id });
+          sfxSafe('vault', { volume: 0.4 });
+        }
+        endChannel();
+        return true;
+      }
+    }
+
+    // ---- Sea Salts: hold E over a body that is out of the water ----
+    if (!hasSalts()) { endChannel(); return false; }
+    const body = nearestBody(REVIVE.SALTS_RANGE, !!REVIVE.NO_SALTS_UNDERWATER, t);
+    if (!body) { endChannel(); return false; }
+    if (reviveCd > 0) { endChannel(); return true; }
+
+    if (!isDown('KeyE') || hasInput || local.speed > 1.2) { endChannel(); return true; }
+    if (reviveTargetId !== body.id) { reviveTargetId = body.id; reviveT = 0; }
+    reviveT += dt;
+    const hold = Math.max(0.2, Number.isFinite(REVIVE.SALTS_HOLD_SECONDS) ? REVIVE.SALTS_HOLD_SECONDS : 3);
+    if (ctx.bus) {
+      ctx.bus.emit('reviveChannel', { targetId: body.id, t01: clamp(reviveT / hold, 0, 1), name: body.name });
+    }
+    if (reviveT >= hold) {
+      send(MSG.REVIVE_TEAMMATE, { targetId: body.id });
+      sfxSafe('revive', { volume: 0.8 });
+      reviveCd = REVIVE_SEND_CD;
+      endChannel();
+    }
+    return true;
   }
 
   // ---------- boat: boarding, the wheel, stepping off ----------
@@ -1407,6 +1623,9 @@ export function initPlayer(ctx) {
         yaw: 0, yawFrom: 0, yawTo: 0,
         lerpStart: 0, lerpDur: REMOTE_LERP,
         anim: 'idle', swimming: false, onBoat: false, seat: -1, speed: 0,
+        seen: false,          // a PLAYERS_MOVE has placed them at least once
+        downed: false,        // hp <= 0 per the server
+        towedBy: null,        // carrier id while a Rescue Claw drags them
       };
       remotes.set(id, r);
     } else if (r.colorIndex !== color || r.name !== name || r.hat !== look.hat || r.skin !== look.skin) {
@@ -1460,14 +1679,26 @@ export function initPlayer(ctx) {
       r.anim = e.anim || 'idle';
       r.swimming = !!e.swimming;
       r.onBoat = !!e.onBoat;
+      r.seen = true;
       if (Number.isFinite(e.seat)) r.seat = e.seat;
-      r.char.setAnim(r.anim);
+      r.char.setAnim(r.downed ? 'ko' : r.anim);
     }
   }
   function onWorldState(msg) {
     if (!msg || msg === lastWorldMsg) return;
     lastWorldMsg = msg;
     if (!Array.isArray(msg.players)) return;
+    // server-truth hp / alive flags feed the downed-body markers
+    for (const pl of msg.players) {
+      if (pl && pl.id) noteHp(pl.id, pl.hp, pl.alive);
+    }
+    if (hpById.size) {
+      for (const id of Array.from(hpById.keys())) {
+        let found = false;
+        for (const pl of msg.players) { if (pl && pl.id === id) { found = true; break; } }
+        if (!found) { hpById.delete(id); downed.delete(id); }
+      }
+    }
     // refresh looks + prune players who left
     for (const r of remotes.values()) {
       let found = false;
@@ -1530,14 +1761,72 @@ export function initPlayer(ctx) {
       cam.shake = Math.max(cam.shake, clamp(dmg / 45, 0.1, 0.55));
     });
   }
+  // A body is back on its feet: drop the marker, the tow and the ko pose.
+  function onRevived(m) {
+    if (!m || !m.id) return;
+    const hp = reviveHp(m.hp);
+    hpById.set(m.id, hp > 0 ? hp : PLAYER_MAX_HP * 0.5);
+    downed.delete(m.id);
+    if (reviveTargetId === m.id) endChannel();
+    if (towingId === m.id) towingId = null;
+    const r = remotes.get(m.id);
+    if (r) {
+      r.towedBy = null;
+      r.downed = false;
+      r.char.clearAction();
+      r.char.setAnim('idle');
+      r.anim = 'idle';
+    }
+    if (m.id === ctx.state.myId) {
+      myTowedBy = null;
+      // Back on your feet now — the next WORLD_STATE corrects the exact number.
+      const cur = Number.isFinite(ctx.state.hp) ? ctx.state.hp : 0;
+      const back = hp > 0
+        ? hp
+        : Math.max(1, Math.round(PLAYER_MAX_HP * (Number.isFinite(REVIVE.SALTS_HP) ? REVIVE.SALTS_HP : 0.5)));
+      if (cur <= 0 || back > cur) ctx.state.hp = back;
+      // Salts / claw / kit revives put you back up WHERE YOU FELL. A sunrise
+      // (or event-end) mercy revive keeps the old campfire respawn.
+      const reason = String((m.reason || m.cause || '')).toLowerCase();
+      const mercy = reason === 'sunrise' || reason === 'dawn' || reason === 'event' || reason === 'eventend';
+      const byMate = !!m.by && m.by !== ctx.state.myId;
+      reviveInPlace = !mercy && (byMate || (netTime - kitUsedAt) < REVIVE_INPLACE_WINDOW);
+      reviveInPlaceAt = netTime;
+    }
+  }
+  // The Rescue Claw picked a body up (or let it go).
+  function onBodyTowed(m) {
+    if (!m || !m.id) return;
+    const by = m.by || null;
+    const r = remotes.get(m.id);
+    if (r) r.towedBy = by;
+    const rec = downed.get(m.id);
+    if (rec) rec.towedBy = by;
+    if (m.id === ctx.state.myId) myTowedBy = by;
+    if (by === ctx.state.myId) towingId = m.id;
+    else if (towingId === m.id) towingId = null;
+  }
+
   if (ctx.net && typeof ctx.net.on === 'function') {
     ctx.net.on(MSG.PLAYERS_MOVE, onPlayersMove);
     ctx.net.on(MSG.WORLD_STATE, onWorldState);
     ctx.net.on(MSG.BOAT_STATE, onBoatState);
     ctx.net.on(MSG.PLAYER_DAMAGED, (m) => {
-      if (m && m.id === ctx.state.myId && Number.isFinite(m.hp)) ctx.state.hp = m.hp;
+      if (!m || !m.id) return;
+      noteHp(m.id, m.hp, m.revived === true ? true : undefined);
+      if (m.id === ctx.state.myId && Number.isFinite(m.hp)) ctx.state.hp = m.hp;
     });
-    ctx.net.on(MSG.GAME_START, () => { local.spawned = false; });
+    ctx.net.on(MSG.REVIVED, onRevived);
+    ctx.net.on(MSG.BODY_TOWED, onBodyTowed);
+    ctx.net.on(MSG.GAME_START, () => {
+      local.spawned = false;
+      hpById.clear();
+      downed.clear();
+      towingId = null;
+      myTowedBy = null;
+      reviveInPlace = false;
+      endChannel();
+    });
   }
 
   // ---------- DOM input (mouse look / zoom / keys) ----------
@@ -1709,17 +1998,57 @@ export function initPlayer(ctx) {
       send(MSG.LEAVE_BOAT, {});
       if (ctx.bus) ctx.bus.emit('leaveBoat', {});
     }
-    if (!ko && wasKo) respawn();      // revived by the server -> back at camp
+    if (!ko && wasKo) {
+      // Salts / kit / claw revives stand you up exactly where you fell; only
+      // the sunrise (or event-end) mercy revive sends you back to the campfire.
+      const inPlace = reviveInPlace && (netTime - reviveInPlaceAt) < REVIVE_INPLACE_WINDOW;
+      reviveInPlace = false;
+      myTowedBy = null;
+      if (inPlace) {
+        local.vel.set(0, 0, 0);
+        local.grounded = false;
+        drownAccum = 0;
+        st.air = Math.max(Number.isFinite(st.air) ? st.air : 1, 0.35);
+        if (local.char) local.char.clearAction();
+      } else {
+        respawn();                    // revived by the server -> back at camp
+      }
+    }
     wasKo = ko;
     local.ko = ko;
+    if (!ko && myTowedBy) myTowedBy = null;
 
     const fwd = (isDown('KeyW') || isDown('ArrowUp') ? 1 : 0) - (isDown('KeyS') || isDown('ArrowDown') ? 1 : 0);
     const str = (isDown('KeyD') || isDown('ArrowRight') ? 1 : 0) - (isDown('KeyA') || isDown('ArrowLeft') ? 1 : 0);
     const running = isDown('ShiftLeft') || isDown('ShiftRight');
     const hasInput = !ko && (fwd !== 0 || str !== 0);
 
+    // ---------------- reviving (owns E whenever a body is in reach) ----------------
+    const reviveHoldsE = updateRevive(dt, t, ko, hasInput);
+
+    // ---------------- our body is being towed by someone's Rescue Claw ----------------
+    if (ko && myTowedBy) {
+      const carrier = remotes.get(myTowedBy);
+      if (carrier) {
+        _v4.set(carrier.pos.x - Math.sin(carrier.yaw) * TOW_DIST,
+          carrier.pos.y - TOW_DROP,
+          carrier.pos.z - Math.cos(carrier.yaw) * TOW_DIST);
+        local.pos.lerp(_v4, 1 - Math.exp(-TOW_LERP * dt));
+        local.vel.set(0, 0, 0);
+        local.swimming = false;
+        local.grounded = false;
+        local.speed = 0;
+        local.anim = 'ko';
+        setUnderwater(local.pos.y + HEAD_STAND < waterH(local.pos.x, local.pos.z, t) - 0.05);
+        if (char) { char.setLean(0); char.setAirborne(false); }
+        updateArea(local.pos.x, local.pos.z);
+        return;
+      }
+      myTowedBy = null;
+    }
+
     // ---------------- boarding / the wheel / dismount ----------------
-    if (!ko && justDown('KeyE') && boardCooldown <= 0) {
+    if (!ko && !reviveHoldsE && justDown('KeyE') && boardCooldown <= 0) {
       if (local.seat === 0) {
         releaseWheel();                       // E again lets go of the wheel
       } else if (local.onDeck) {
@@ -2084,6 +2413,28 @@ export function initPlayer(ctx) {
       const a2 = a;
       r.yaw = r.yawFrom + angDelta(r.yawFrom, r.yawTo) * a2;
 
+      // A body on the Rescue Claw follows its carrier instead of resting at
+      // its own last-known position.
+      if (r.towedBy) {
+        let cp = null, cy = 0;
+        if (r.towedBy === ctx.state.myId) { cp = local.pos; cy = local.faceYaw; }
+        else {
+          const c = remotes.get(r.towedBy);
+          if (c) { cp = c.pos; cy = c.yaw; }
+        }
+        if (cp) {
+          _v3.set(cp.x - Math.sin(cy) * TOW_DIST, cp.y - TOW_DROP, cp.z - Math.cos(cy) * TOW_DIST);
+          r.pos.lerp(_v3, 1 - Math.exp(-TOW_LERP * dt));
+          r.yaw = angDamp(r.yaw, cy, TOW_LERP, dt);
+          r.speed = 0;
+        }
+      }
+      // Downed crew lie slumped where they fell.
+      if (r.downed) {
+        r.speed = 0;
+        r.char.setAnim('ko');
+      }
+
       const g = r.char.group;
       g.position.copy(r.pos);
       g.rotation.y = r.yaw;
@@ -2131,11 +2482,20 @@ export function initPlayer(ctx) {
       ctx.state.air = 1;
       ctx.state.onDeck = false;
       drownAccum = 0;
+      towingId = null;
+      myTowedBy = null;
+      reviveInPlace = false;
+      endChannel();
     } else {
       setUnderwater(false);
       ctx.state.currentArea = null;
+      endChannel();
+      towingId = null;
+      myTowedBy = null;
       if (phase === 'menu' || phase === 'lobby') {
         for (const id of Array.from(remotes.keys())) removeRemote(id);
+        hpById.clear();
+        downed.clear();
         boatSeats = null;
         local.onBoat = false;
         local.onDeck = false;
@@ -2158,6 +2518,7 @@ export function initPlayer(ctx) {
     }
 
     if (lastPhase === 'playing') {
+      refreshDowned(t);         // ui reads ctx.playerMod.downed for its markers
       updateLocal(dt, t);
 
       const char = local.char;
@@ -2211,6 +2572,16 @@ export function initPlayer(ctx) {
     createCharacter,
     local,
     remotes,
+    // Wave 5: downed bodies for ui's markers - id -> {id, pos:Vector3, name, towedBy}
+    downed,
+    isDowned: (id) => isDownId(id),
+    // live revive state (ui may read it; nothing else depends on these)
+    reviveState: () => ({
+      targetId: reviveTargetId,
+      t01: reviveTargetId ? clamp(reviveT / Math.max(0.2, Number.isFinite(REVIVE.SALTS_HOLD_SECONDS) ? REVIVE.SALTS_HOLD_SECONDS : 3), 0, 1) : 0,
+      towing: towingId,
+      towedBy: myTowedBy,
+    }),
   };
   ctx.playerMod = handle;
   return handle;

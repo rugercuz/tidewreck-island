@@ -21,6 +21,7 @@ import {
   FLOPPER,
   LOOT_RULES,
   UNIQUE_CHARMS,
+  REVIVE,
   PLAYER_MAX_HP,
   BASE_AIR_SECONDS,
   shopById,
@@ -35,6 +36,7 @@ import {
   biteStrength,
   baitDef,
   uniqueEffects,
+  isPerfectCast,
   lootTableFor,
   rollLootDrop,
   rollFoundBait,
@@ -94,6 +96,13 @@ const LOOT_PICKUP_SLACK = 1.5;    // latency margin on LOOT_RULES.PICKUP_RANGE
 const LOOT_DIVE_Y = -3;           // server proxy for "you are down at the bottom"
 const LOOT_SPREAD = 0.85;         // nodes sit inside this fraction of the area radius
 
+// --- reviving / bodies ------------------------------------------------
+const REVIVE_RANGE_SLACK = 1.2;   // latency margin on SALTS_RANGE / CLAW_RANGE
+const BODY_UNDERWATER_Y = -1.2;   // at or below this a body counts as underwater
+const BODY_AIR_Y = -0.8;          // above this it has reached air — the claw lets go
+const TOW_DISTANCE = 1.5;         // metres the towed body trails behind the carrier
+const TOW_BODY_DROP = 0.4;        // ...and how far under them it hangs
+
 // --- ambush / drift predators ----------------------------------------
 const AMBUSH_NODE_RADIUS = 8;     // ambushers coil this close to the node they guard
 const AMBUSH_BURST_MULT = 1.6;    // lunge speed multiplier
@@ -119,6 +128,9 @@ const SOCKET_FALLBACKS = [
   [MSG.BONK_FISH, 'onBonkFish'],
   [MSG.PICKUP_FLOPPER, 'onPickupFlopper'],
   [MSG.PICKUP_LOOT, 'onPickupLoot'],
+  [MSG.REVIVE_TEAMMATE, 'onReviveTeammate'],
+  [MSG.USE_REVIVAL_KIT, 'onUseRevivalKit'],
+  [MSG.TOW_BODY, 'onTowBody'],
 ];
 
 // ---------------- Small helpers ----------------
@@ -155,6 +167,19 @@ function boatLocal(v) {
     clamp(v[1], -BOAT_LOCAL_LIMIT, BOAT_LOCAL_LIMIT),
     clamp(v[2], -BOAT_LOCAL_LIMIT, BOAT_LOCAL_LIMIT),
   ];
+}
+
+/**
+ * A fresh revive inventory (SHOP kind 'revive'): consumables carry a count,
+ * the Rescue Claw is a one-time permanent tool. Rides in the gear payload.
+ */
+function newRevives() {
+  return { salts: 0, revivalkit: 0, rescueclaw: false };
+}
+
+/** True for a SHOP 'revive' item that stacks (salts / kit), false for the claw. */
+function isReviveConsumable(item) {
+  return !!item && num(item.pack, 0) > 0;
 }
 
 /** Own-property lookup so wire strings like 'constructor' can never match. */
@@ -258,6 +283,8 @@ export class Game {
     this.started = false;
     this.eventActive = null;
     this.tsunamiAt = 0;
+    this.tsunamiReason = 'quota';   // 'quota' (missed deadline) | 'wipe' (whole crew down)
+    this.wiped = false;             // the island took everyone — no revive ever again
     this.lastWarnDay = 0;
     this.lastEnemyListSize = -1;
     this.moveDirty = new Set();
@@ -322,6 +349,7 @@ export class Game {
       skin: styleIndex(member.skin, SKIN_COUNT),
       gear: { rod: 1, weapons: [], charms: [], diving: 1 },
       baits: { worms: 5 },
+      revives: newRevives(),  // {salts, revivalkit, rescueclaw} — see REVIVE
       uniques: [],           // claimed UNIQUE_CHARMS ids — server applies the effects
       inventory: [],
       hp: PLAYER_MAX_HP,
@@ -338,6 +366,11 @@ export class Game {
       entered: false,
       lastSelfHit: 0,
       lastBonkAt: 0,
+      // --- downed bodies (see REVIVE) ---
+      downedAt: 0,
+      bodySettled: true,     // false = still owe this body one settling MOVE
+      towedBy: null,         // carrier id while the Rescue Claw has this body
+      towing: null,          // the body id this player is dragging along
       stats: { fish: 0, earned: 0 },
     };
     this.players.set(player.id, player);
@@ -394,6 +427,9 @@ export class Game {
     const p = this.players.get(id);
     if (!p) return;
     this.clearFloppers(p, false);
+    // Whatever they were dragging is dropped, and nobody keeps dragging them.
+    this.releaseTowByCarrier(p, 'carrierLeft');
+    this.releaseTow(p, 'bodyLeft');
     this.unbindPlayerSocket(id);
     this.players.delete(id);
     this.moveDirty.delete(id);
@@ -420,8 +456,28 @@ export class Game {
       diving: p.gear.diving,
       air: this.airSecondsFor(p),
       uniques: Array.isArray(p.uniques) ? p.uniques.slice() : [],
+      revives: this.revivesPayload(p),
     };
   }
+
+  /** {salts, revivalkit, rescueclaw} — always whole, always finite. */
+  revivesPayload(p) {
+    const r = p && p.revives ? p.revives : null;
+    return {
+      salts: this.reviveCount(p, 'salts'),
+      revivalkit: this.reviveCount(p, 'revivalkit'),
+      rescueclaw: !!(r && r.rescueclaw),
+    };
+  }
+
+  /** How many of a stacking revive consumable this player carries. */
+  reviveCount(p, key) {
+    const r = p && p.revives ? p.revives : null;
+    if (!r || !Object.prototype.hasOwnProperty.call(r, key)) return 0;
+    return Math.max(0, Math.floor(num(r[key], 0)));
+  }
+
+  hasRescueClaw(p) { return !!(p && p.revives && p.revives.rescueclaw); }
 
   /** Composed effects of every unique charm this player has claimed. */
   uniqueFx(p) {
@@ -476,6 +532,9 @@ export class Game {
         alive: p.alive,
         seat: p.seat,
         entered: p.entered,
+        // downed bodies: where they lie and who (if anyone) is dragging them
+        towedBy: p.towedBy || null,
+        body: p.alive ? null : [r2(p.pos[0]), r2(p.pos[1]), r2(p.pos[2])],
       });
     }
     return {
@@ -686,6 +745,7 @@ export class Game {
     this.updateClock(dt);
     this.updateWeather(now);
     this.updateCasts(now);
+    this.updateTows();
     this.updateFloppers(now);
     this.updateEvent(now);
     this.updateLoot(now);
@@ -754,19 +814,17 @@ export class Game {
     if (this.over) return;
     if (this.tsunamiAt > 0) {
       if (now - this.tsunamiAt >= ECON.QUOTA_FAIL_GRACE_SECONDS) {
-        this.broadcast(MSG.GAME_OVER, { reason: 'tsunami', stats: this.buildStats() });
+        this.broadcast(MSG.GAME_OVER, {
+          reason: this.tsunamiReason === 'wipe' ? 'wipe' : 'tsunami',
+          stats: this.buildStats(),
+        });
         this.stop('gameover');
       }
       return;
     }
     if (this.dayNumber > this.quota.deadlineDay && this.quota.progress < this.quota.target) {
-      // A tsunami trumps whatever is circling the boat, but the event still has
-      // to close properly (EVENT_END) or clients keep the night snap and the
-      // cut music forever. Do it before tsunamiAt so endEvent() runs normally.
-      if (this.eventActive) this.endEvent();
-      this.tsunamiAt = now;
       this.chat('ISLAND', 'The water pulls away from the beach. All of it.');
-      this.broadcast(MSG.TSUNAMI, {});
+      this.triggerTsunami('quota');
     }
   }
 
@@ -777,6 +835,13 @@ export class Game {
   onMove(id, d) {
     const p = this.players.get(id);
     if (!p) return;
+    // Bodies do not crawl. A downed player gets exactly ONE more update — the
+    // spot they settled at as they fell/sank — and is frozen there afterwards;
+    // from then on the server owns the body position (see updateTows).
+    if (!p.alive) {
+      if (p.bodySettled) return;
+      p.bodySettled = true;
+    }
     if (Array.isArray(d.p) && d.p.length >= 3) {
       p.pos[0] = coord(d.p[0], p.pos[0]);
       p.pos[1] = coord(d.p[1], p.pos[1]);
@@ -789,6 +854,8 @@ export class Game {
     // Walking the deck: the client anchors itself in the boat's frame and the
     // server relays that anchor untouched. Absent/garbage => plain world pos.
     p.bl = boatLocal(d.bl);
+    // A body is off the deck for good — it stays in the world where it fell.
+    if (!p.alive) { p.onBoat = false; p.seat = -1; p.bl = null; }
     this.moveDirty.add(id);
   }
 
@@ -931,11 +998,17 @@ export class Game {
       }
     }
 
+    // PERFECT THROW: the client owns the power meter and reports the release
+    // landing inside CAST_PERFECT.BAND. The reward is fixed server-side — see
+    // rollBiteDelay/rollFish — so a lying client gains exactly the same amount.
+    const perfect = isPerfectCast(d.perfect);
+
     p.casting = {
       areaId: area.id,
       baitId,
+      perfect,
       state: 'waiting',
-      biteAt: nowSeconds() + rollBiteDelay(p.gear, baitId, this.weather, p.uniques),
+      biteAt: nowSeconds() + rollBiteDelay(p.gear, baitId, this.weather, p.uniques, perfect),
       failAt: 0,
       roll: null,
     };
@@ -963,6 +1036,7 @@ export class Game {
           eventsSurvived: this.eventsSurvived,
           difficulty: this.difficulty,
           weather: this.weather,
+          perfect: c.perfect === true,
         }) : null;
 
         if (!roll) {
@@ -1561,6 +1635,13 @@ export class Game {
       if (p.gear.weapons.indexOf(item.id) !== -1) { this.shopFail(id, itemId, 'You already carry one of those.'); return; }
     } else if (item.kind === 'charm') {
       if (p.gear.charms.indexOf(item.id) !== -1) { this.shopFail(id, itemId, 'That charm is already on your belt.'); return; }
+    } else if (item.kind === 'revive') {
+      if (!p.revives) p.revives = newRevives();
+      // Consumables stack; the Rescue Claw is a permanent tool — no duplicates.
+      if (!isReviveConsumable(item) && p.revives[item.id] === true) {
+        this.shopFail(id, itemId, 'That is already clipped to your belt.');
+        return;
+      }
     }
 
     if (this.wallet < price) {
@@ -1607,6 +1688,20 @@ export class Game {
         this.sendInventory(p);
         break;
       }
+      case 'revive': {
+        if (!p.revives) p.revives = newRevives();
+        if (isReviveConsumable(item)) {
+          const pack = Math.max(1, Math.floor(num(item.pack, 1)));
+          const held = Math.max(0, Math.floor(num(p.revives[item.id], 0))) + pack;
+          p.revives[item.id] = held;
+          message = `${item.name} packed away (${held} on you).`;
+        } else {
+          p.revives[item.id] = true;
+          message = `${item.name} clipped to your belt.`;
+          this.chat('ISLAND', `${p.name} bought the ${item.name}. Nobody stays sunk now.`);
+        }
+        break;
+      }
       case 'ward': {
         this.wards++;
         this.quota.deadlineDay += WARD_DAYS;
@@ -1635,7 +1730,8 @@ export class Game {
     if (!(amount > 0)) return;
     p.hp = clamp(p.hp - amount, 0, PLAYER_MAX_HP);
 
-    if (p.hp <= 0) {
+    const wentDown = p.hp <= 0;
+    if (wentDown) {
       p.alive = false;
       p.hp = 0;
       p.casting = null;
@@ -1644,11 +1740,57 @@ export class Game {
       p.seat = -1;
       p.onBoat = false;
       p.bl = null;                   // no longer anchored to the deck
+      // The body stays exactly where it fell (pos is NEVER cleared) and owes us
+      // one last MOVE to settle; anything it was dragging slips out of its grip.
+      p.downedAt = nowSeconds();
+      p.bodySettled = false;
+      this.releaseTowByCarrier(p, 'carrierDown');
       this.broadcastBoatState();
-      this.chat('ISLAND', `${p.name} went under. They will wake at the campfire.`);
+      this.chat('ISLAND', `${p.name} went under. Sea Salts, a Revival Kit, or sunrise will bring them back.`);
     }
 
     this.broadcast(MSG.PLAYER_DAMAGED, { id: p.id, hp: p.hp, cause: cause || 'unknown', dmg: amount });
+
+    // ANY transition to not-alive routes through the one wipe check.
+    if (wentDown) this.checkTeamWipe();
+  }
+
+  /**
+   * TEAM WIPE = DOOMSDAY. The single place that asks "is anybody still up?".
+   * Called after every transition to not-alive (damage, drowning, lightning,
+   * horror events). Zero alive players = the island takes its due: instant
+   * tsunami, GAME_OVER after the cinematic, and no revive ever again.
+   */
+  checkTeamWipe() {
+    if (this.over || this.wiped || this.tsunamiAt > 0) return false;
+    if (this.players.size === 0) return false;
+    for (const p of this.players.values()) if (p.alive) return false;
+
+    this.wiped = true;
+    this.chat('ISLAND', 'The whole crew is down. The water pulls away from the beach. All of it.');
+    this.triggerTsunami('wipe');
+    return true;
+  }
+
+  /**
+   * The one tsunami path, shared by the missed quota ('quota') and the team
+   * wipe ('wipe'). TSUNAMI carries the reason; GAME_OVER follows after
+   * ECON.QUOTA_FAIL_GRACE_SECONDS in updateTsunami().
+   */
+  triggerTsunami(reason) {
+    if (this.over || this.tsunamiAt > 0) return;
+    const why = reason === 'wipe' ? 'wipe' : 'quota';
+    this.tsunamiReason = why;
+    if (why === 'wipe') this.wiped = true;
+    // Claim the slot BEFORE anything that can re-enter (endEvent -> wipe check).
+    this.tsunamiAt = nowSeconds();
+
+    // A tsunami trumps whatever is circling the boat, but the event still has
+    // to close properly (EVENT_END) or clients keep the night snap and the
+    // cut music forever.
+    if (this.eventActive) this.endEvent();
+
+    this.broadcast(MSG.TSUNAMI, { reason: why });
   }
 
   onPlayerHit(id, d) {
@@ -1677,17 +1819,216 @@ export class Game {
     this.damagePlayer(p, dmg, cause);
   }
 
+  /**
+   * The mercy backstop (sunrise) and the event-end mass revive. Once the crew
+   * has been wiped NOTHING resurrects anybody — the run is already over.
+   */
   reviveAll(cause) {
+    if (this.over || this.wiped) return 0;
     let count = 0;
     for (const p of this.players.values()) {
       if (p.alive && p.hp >= PLAYER_MAX_HP) continue;
       const wasDown = !p.alive;
       p.alive = true;
       p.hp = PLAYER_MAX_HP;
-      if (wasDown) count++;
+      if (wasDown) {
+        count++;
+        p.bodySettled = true;
+        this.releaseTow(p, 'revived');
+        this.broadcast(MSG.REVIVED, { id: p.id, by: null, hp: p.hp, cause: cause || 'revive' });
+      }
       this.broadcast(MSG.PLAYER_DAMAGED, { id: p.id, hp: p.hp, cause: cause || 'revive', dmg: 0, revived: wasDown });
     }
     return count;
+  }
+
+  // =========================================================
+  // Reviving (see REVIVE): salts, kit, rescue claw
+  // =========================================================
+
+  /** True when this body counts as underwater for the Sea Salts rule. */
+  bodyUnderwater(p) { return !!p && p.pos[1] <= BODY_UNDERWATER_Y; }
+
+  /** Straight-line distance between two players, metres. */
+  distanceBetween(a, b) {
+    const dx = a.pos[0] - b.pos[0];
+    const dy = a.pos[1] - b.pos[1];
+    const dz = a.pos[2] - b.pos[2];
+    return Math.sqrt(dx * dx + dy * dy + dz * dz);
+  }
+
+  /**
+   * Put a downed player back on their feet at `frac` of max hp. `by` is the
+   * reviver (null = self / sunrise / event end). Broadcasts MSG.REVIVED plus
+   * the usual PLAYER_DAMAGED so older HUD code keeps up.
+   */
+  revivePlayer(t, by, frac, cause) {
+    if (!t || t.alive || this.over || this.wiped) return false;
+    const hp = clamp(Math.round(PLAYER_MAX_HP * clamp(num(frac, 0.5), 0.05, 1)), 1, PLAYER_MAX_HP);
+    t.alive = true;
+    t.hp = hp;
+    t.bodySettled = true;      // they move under their own power again
+    t.downedAt = 0;
+    this.releaseTow(t, 'revived');
+
+    this.broadcast(MSG.REVIVED, { id: t.id, by: by ? by.id : null, hp, cause: cause || 'revive' });
+    this.broadcast(MSG.PLAYER_DAMAGED, { id: t.id, hp, cause: cause || 'revive', dmg: 0, revived: true });
+    this.moveDirty.add(t.id);
+    this.broadcastWorldState();
+    return true;
+  }
+
+  /** Gear changed off the shop counter (a consumable was spent) — resync it. */
+  sendGear(p, itemId, message) {
+    this.send(p.id, MSG.SHOP_RESULT, {
+      ok: true,
+      itemId: itemId || '',
+      used: true,
+      message: message || '',
+      gear: this.gearPayload(p),
+    });
+  }
+
+  /**
+   * Sea Salts: the client channels REVIVE.SALTS_HOLD_SECONDS of hold-E and then
+   * sends this. Validated here: reviver up, salts in the pack, target actually
+   * down, in range of the BODY (not of wherever the client thinks it is) and —
+   * per REVIVE.NO_SALTS_UNDERWATER — the body has to be out of the water.
+   */
+  onReviveTeammate(id, d) {
+    const p = this.players.get(id);
+    if (!p || this.over) return;
+    if (this.wiped) { this.error(id, 'It is far too late for that.'); return; }
+    if (!p.alive) { this.error(id, 'You are down yourself.'); return; }
+
+    const targetId = d && typeof d.targetId === 'string' ? d.targetId : '';
+    const t = targetId ? this.players.get(targetId) : null;
+    if (!t || t === p) { this.error(id, 'Nobody there to bring back.'); return; }
+    if (t.alive) { this.error(id, `${t.name} is already on their feet.`); return; }
+
+    const salts = this.reviveCount(p, 'salts');
+    if (salts <= 0) { this.error(id, 'You have no Sea Salts left.'); return; }
+
+    if (REVIVE.NO_SALTS_UNDERWATER && this.bodyUnderwater(t)) {
+      this.error(id, `${t.name} is under the water. Tow them up first.`);
+      return;
+    }
+
+    const range = Math.max(0.5, num(REVIVE.SALTS_RANGE, 3)) + REVIVE_RANGE_SLACK;
+    if (this.distanceBetween(p, t) > range) {
+      this.error(id, 'Too far — get right over them.');
+      return;
+    }
+
+    p.revives.salts = salts - 1;
+    if (!this.revivePlayer(t, p, num(REVIVE.SALTS_HP, 0.5), 'salts')) {
+      p.revives.salts = salts;   // nothing happened — keep the salts
+      return;
+    }
+    this.sendGear(p, 'salts', `Sea Salts spent on ${t.name}. ${p.revives.salts} left.`);
+    this.chat('ISLAND', `${p.name} dragged ${t.name} back from the dark.`);
+  }
+
+  /** Revival Kit: your own way back up, once. */
+  onUseRevivalKit(id) {
+    const p = this.players.get(id);
+    if (!p || this.over) return;
+    if (this.wiped) { this.error(id, 'It is far too late for that.'); return; }
+    if (p.alive) { this.error(id, 'You are still on your feet.'); return; }
+
+    const kits = this.reviveCount(p, 'revivalkit');
+    if (kits <= 0) { this.error(id, 'No Revival Kit in your pack.'); return; }
+
+    p.revives.revivalkit = kits - 1;
+    if (!this.revivePlayer(p, null, num(REVIVE.KIT_HP, 0.4), 'revivalkit')) {
+      p.revives.revivalkit = kits;
+      return;
+    }
+    this.sendGear(p, 'revivalkit', 'Revival Kit burned. On your feet.');
+    this.chat('ISLAND', `${p.name} clawed back up on their own.`);
+  }
+
+  /**
+   * Rescue Claw: {targetId} grabs a downed body, {targetId:null} (or the same
+   * id again) lets go. While held the server owns the body position — see
+   * updateTows — and drags it TOW_DISTANCE behind the carrier.
+   */
+  onTowBody(id, d) {
+    const p = this.players.get(id);
+    if (!p || this.over) return;
+
+    const raw = d ? d.targetId : null;
+    const targetId = typeof raw === 'string' && raw ? raw : null;
+
+    // Release: an explicit null, or the same body again (toggle).
+    if (!targetId) { this.releaseTowByCarrier(p, 'released'); return; }
+    const t = this.players.get(targetId);
+    if (!t || t === p) return;
+    if (t.towedBy === p.id) { this.releaseTow(t, 'released'); return; }
+
+    if (!p.alive) { this.error(id, 'You are down yourself.'); return; }
+    if (!this.hasRescueClaw(p)) { this.error(id, 'You need the Rescue Claw for that.'); return; }
+    if (t.alive) { this.error(id, `${t.name} does not need carrying.`); return; }
+    if (t.towedBy) { this.error(id, 'Someone else already has them.'); return; }
+
+    const range = Math.max(0.5, num(REVIVE.CLAW_RANGE, 3.5)) + REVIVE_RANGE_SLACK;
+    if (this.distanceBetween(p, t) > range) { this.error(id, 'Too far — swim closer.'); return; }
+
+    this.releaseTowByCarrier(p, 'swapped');   // one body at a time
+    t.towedBy = p.id;
+    p.towing = t.id;
+    this.broadcast(MSG.BODY_TOWED, { id: t.id, by: p.id });
+    this.chat('ISLAND', `${p.name} hooked ${t.name} with the Rescue Claw.`);
+  }
+
+  /** Let go of a body, whoever was holding it. Broadcasts BODY_TOWED once. */
+  releaseTow(body, reason) {
+    if (!body) return false;
+    const carrierId = body.towedBy;
+    body.towedBy = null;
+    for (const q of this.players.values()) if (q.towing === body.id) q.towing = null;
+    if (!carrierId) return false;
+    this.broadcast(MSG.BODY_TOWED, { id: body.id, by: null, reason: reason || 'released' });
+    return true;
+  }
+
+  /** Let go of whatever this carrier is dragging. */
+  releaseTowByCarrier(carrier, reason) {
+    if (!carrier || !carrier.towing) return false;
+    const body = this.players.get(carrier.towing);
+    carrier.towing = null;
+    if (!body) return false;
+    return this.releaseTow(body, reason);
+  }
+
+  /**
+   * Server-owned body movement: every tick a towed body is placed
+   * TOW_DISTANCE behind (and a little under) its carrier. It lets go by
+   * itself when the body reaches air, when the carrier goes down or
+   * disconnects, or when the body is revived.
+   */
+  updateTows() {
+    if (this.over) return;
+    for (const carrier of this.players.values()) {
+      if (!carrier.towing) continue;
+      const body = this.players.get(carrier.towing);
+      if (!body || body.towedBy !== carrier.id) { carrier.towing = null; continue; }
+      if (!carrier.alive) { this.releaseTow(body, 'carrierDown'); continue; }
+      if (body.alive) { this.releaseTow(body, 'revived'); continue; }
+
+      const fx = Math.sin(carrier.rot);
+      const fz = Math.cos(carrier.rot);
+      body.pos[0] = coord(carrier.pos[0] - fx * TOW_DISTANCE, body.pos[0]);
+      body.pos[1] = coord(carrier.pos[1] - TOW_BODY_DROP, body.pos[1]);
+      body.pos[2] = coord(carrier.pos[2] - fz * TOW_DISTANCE, body.pos[2]);
+      body.rot = carrier.rot;
+      body.bl = null;
+      body.bodySettled = true;   // the claw, not the client, moves it now
+      this.moveDirty.add(body.id);
+
+      // Broke the surface: the claw has done its job, salts can finish it.
+      if (body.pos[1] > BODY_AIR_Y) this.releaseTow(body, 'surfaced');
+    }
   }
 
   // =========================================================
@@ -2176,9 +2517,14 @@ export class Game {
     this.broadcast(MSG.EVENT_END, { type: ev.type, survived, unlocked, name: ev.def.name });
     this.chat('ISLAND', survived
       ? `${ev.def.name} sank back into the dark. Its young can be hooked in The Abyss now.`
-      : `${ev.def.name} took the whole crew. It will come back.`);
+      : `${ev.def.name} took the whole crew.`);
 
-    // Everyone comes back either way — the island is not done with you.
+    // An event that left NOBODY standing is not a retry — it is doomsday.
+    // Check before the mass revive, or there would be nothing left to check.
+    if (!survived) this.checkTeamWipe();
+
+    // Everyone comes back either way — unless the island already took them all
+    // (reviveAll is a no-op once the wipe has fired).
     this.reviveAll('eventEnd');
     this.broadcastWorldState();
   }

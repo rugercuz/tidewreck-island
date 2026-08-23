@@ -10,6 +10,7 @@ import {
   MUTATIONS,
   ECON,
   WEATHER,
+  CAST_PERFECT,
   LOOT_TYPES,
   LOOT_TABLES,
   FOUND_BAITS,
@@ -60,6 +61,26 @@ function num(v, dflt) {
 function roundTo(v, places) {
   const m = Math.pow(10, places);
   return Math.round(v * m) / m;
+}
+
+// ---------------- Perfect cast ----------------
+
+/**
+ * The client owns the power meter, so it reports whether the release landed in
+ * CAST_PERFECT.BAND. The reward is fixed here: exactly LUCK_BONUS extra luck
+ * and exactly a BITE_SPEED_MULT-times shorter wait, no matter what the wire
+ * claims. Anything that is not a literal `true` is an ordinary cast.
+ */
+const PERFECT_LUCK_BONUS = Math.max(0, num(CAST_PERFECT && CAST_PERFECT.LUCK_BONUS, 0.45));
+const PERFECT_BITE_MULT = Math.max(1, num(CAST_PERFECT && CAST_PERFECT.BITE_SPEED_MULT, 1.35));
+const PERFECT_MIN_DELAY = 0.3;
+
+/** Sanitize a wire `perfect` flag: only a real boolean true counts. */
+export function isPerfectCast(v) { return v === true; }
+
+/** The exact, capped perfect-cast reward — exported for tuning/tests. */
+export function perfectCastBonus() {
+  return { luck: PERFECT_LUCK_BONUS, biteMult: PERFECT_BITE_MULT };
 }
 
 // ---------------- Weather ----------------
@@ -286,8 +307,11 @@ export function rollUniqueCharm(areaId, claimed) {
  * from the design doc; better rods and greedier baits pull it tighter, and
  * the weather's biteSpeed divides the whole window (storms bite fast).
  * A unique charm's biteSpeed multiplies the weather's on top of that.
+ * A PERFECT throw divides the finished delay by exactly
+ * CAST_PERFECT.BITE_SPEED_MULT — outside the weather/charm clamp so the
+ * bonus is always the advertised one, never more.
  */
-export function rollBiteDelay(gear, bait, weather, uniques) {
+export function rollBiteDelay(gear, bait, weather, uniques, perfect) {
   const rod = clamp(Math.floor(num(gear && gear.rod, 1)), 1, 5);
   const b = resolveBait(bait);
   const bias = b ? num(b.tierBias, 0) : 0;
@@ -301,7 +325,9 @@ export function rollBiteDelay(gear, bait, weather, uniques) {
   const weatherSpeed = wdef ? num(wdef.biteSpeed, 1) : 1;
   const speed = clamp(weatherSpeed * uniqueEffects(uniques).biteSpeed, 0.25, 6);
 
-  return roundTo(Math.max(0.5, (lo + Math.random() * (hi - lo)) / speed), 2);
+  let delay = Math.max(0.5, (lo + Math.random() * (hi - lo)) / speed);
+  if (isPerfectCast(perfect)) delay = Math.max(PERFECT_MIN_DELAY, delay / PERFECT_BITE_MULT);
+  return roundTo(delay, 2);
 }
 
 /**
@@ -382,6 +408,7 @@ export function rollMutation(luck, bait) {
  * @param {string[]} [opts.eventsSurvived]
  * @param {string} [opts.difficulty]    'chill' | 'normal' | 'hard'
  * @param {string} [opts.weather]       active WEATHER key ('clear' when absent)
+ * @param {boolean} [opts.perfect]      the throw landed in CAST_PERFECT.BAND
  * @returns {{fish:object, tier:number, mutation:string|null, weightKg:number, value:number}|null}
  */
 export function rollFish(opts) {
@@ -395,9 +422,13 @@ export function rollFish(opts) {
   const weather = weatherKey(o.weather);
   const wdef = weather ? WEATHER[weather] : null;
 
-  // Weather stacks ADDITIVELY on top of gear/bait luck and bait tier bias.
+  // Weather stacks ADDITIVELY on top of gear/bait luck and bait tier bias,
+  // and a PERFECT throw adds exactly CAST_PERFECT.LUCK_BONUS for this cast.
+  const perfect = isPerfectCast(o.perfect);
   const baseLuck = Number.isFinite(o.luck) ? o.luck : computeLuck(gear, bait);
-  const luck = Math.max(0, baseLuck + (wdef ? num(wdef.luck, 0) : 0));
+  const luck = Math.max(0, baseLuck
+    + (wdef ? num(wdef.luck, 0) : 0)
+    + (perfect ? PERFECT_LUCK_BONUS : 0));
 
   const tiers = candidateTiers(area, eventsSurvived, weather);
   if (!tiers.length) return null;

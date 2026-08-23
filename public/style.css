@@ -875,7 +875,7 @@ kbd.wide { min-width: 54px; }
 }
 .cast-fill.is-max { animation: castmax 180ms steps(2) infinite; }
 @keyframes castmax { 0% { filter: brightness(1); } 100% { filter: brightness(1.7); } }
-.cast-notch { position: absolute; left: 92%; top: 0; bottom: 0; width: 2px; background: rgba(255, 255, 255, 0.6); }
+/* the old max notch is gone — the perfect band below marks the spot now */
 
 /* ---- reel minigame ---- */
 .reel-widget {
@@ -1151,27 +1151,39 @@ kbd.wide { min-width: 54px; }
   animation: shimmer 4s linear infinite;
 }
 
-/* ---- tsunami flash ---- */
+/* ---- tsunami flash ----
+   Wave 5: events.js renders the real doomsday wall now, so this stopped being
+   a curtain. It is a title card plus a darkness that climbs out of the sea over
+   the whole grace period — by the time the run ends the screen has gone under. */
 .tsunami-flash {
   position: absolute; inset: 0; display: grid; place-items: center;
-  background: linear-gradient(180deg, rgba(10, 0, 0, 0.5), rgba(2, 10, 22, 0.86));
-  opacity: 0; visibility: hidden; transition: opacity 500ms ease, visibility 500ms;
+  background: radial-gradient(120% 95% at 50% 112%, rgba(4, 24, 18, 0.5), rgba(2, 6, 10, 0) 60%);
+  opacity: 0; visibility: hidden; transition: opacity 400ms ease, visibility 400ms;
   overflow: hidden;
 }
 .tsunami-flash.show { opacity: 1; visibility: visible; }
 .tf-txt {
   font-size: clamp(56px, 11vw, 170px); font-weight: 900; letter-spacing: 0.16em;
   color: #ff3b30; text-shadow: 0 0 60px rgba(255, 40, 30, 0.7), 0 8px 0 rgba(0, 0, 0, 0.8);
-  animation: urgentpulse 700ms ease-in-out infinite;
   z-index: 1;
+  animation: tfTitle 5s cubic-bezier(.2, .8, .3, 1) forwards;
+}
+@keyframes tfTitle {
+  0% { opacity: 0; transform: scale(1.32); filter: blur(16px); }
+  8% { opacity: 1; transform: scale(1); filter: blur(0); }
+  16% { transform: scale(1.03); }
+  24% { transform: scale(1); }
+  64% { opacity: 1; }
+  100% { opacity: 0; transform: scale(1.16); filter: blur(6px); }
 }
 .tf-wave {
   position: absolute; left: -20%; right: -20%; bottom: -60%; height: 120%;
-  background: radial-gradient(60% 60% at 50% 0%, rgba(20, 90, 140, 0.9), rgba(2, 20, 40, 0.95) 70%);
+  background: radial-gradient(60% 60% at 50% 0%, rgba(10, 46, 40, 0.55), rgba(1, 9, 13, 0.92) 70%);
   border-radius: 50% 50% 0 0 / 40% 40% 0 0;
-  animation: waverise 5s cubic-bezier(.4, 0, .6, 1) forwards;
+  opacity: 0.62;
+  animation: waverise 16s cubic-bezier(.5, 0, .75, 1) forwards;
 }
-@keyframes waverise { from { transform: translateY(60%); } to { transform: translateY(-6%); } }
+@keyframes waverise { from { transform: translateY(72%); } to { transform: translateY(-8%); } }
 
 /* =================================================================
    MODALS — shop + inventory
@@ -1915,6 +1927,237 @@ kbd.wide { min-width: 54px; }
 .bait-chip.is-found .bc-name { color: #ffe9b4; }
 
 /* =================================================================
+   WAVE 5 — DOOMSDAY, PERFECT CAST, REVIVING
+   ================================================================= */
+
+/* ---- DOOMSDAY: one class, and the entire hud is gone ----
+   Every hud widget is a direct child of .screen-hud, so a single rule takes
+   the lot: chips, quota, wallet, hotbar, vitals, prompts, chat, banners,
+   cards, the flopper strip, the KO overlay, the downed markers. Toasts and
+   modals live outside .screen-hud, so they are named explicitly. The only
+   survivor is the tsunami cinematic; the end screen is a different screen
+   entirely and is never touched. */
+#ui.doomsday .screen-hud > * { display: none !important; }
+#ui.doomsday .screen-hud > .tsunami-flash { display: grid !important; }
+#ui.doomsday .toast-layer,
+#ui.doomsday .modal-layer { display: none !important; }
+#ui.doomsday .screen-hud { pointer-events: none; }
+
+/* ---- perfect cast: the sweet band on the power meter ---- */
+.cast-band {
+  position: absolute; top: -1px; bottom: -1px; left: 78%; width: 14%;
+  pointer-events: none;
+  background: linear-gradient(180deg, rgba(255, 236, 170, 0.22), rgba(255, 202, 74, 0.30));
+  box-shadow: 0 0 12px rgba(255, 202, 74, 0.45) inset;
+}
+/* the two lines — bright, hard-edged, unmistakable */
+.cast-band::before, .cast-band::after {
+  content: ""; position: absolute; top: -2px; bottom: -2px; width: 2.5px;
+  background: linear-gradient(180deg, #fffbe8, var(--gold));
+  box-shadow: 0 0 8px rgba(255, 232, 150, 0.95), 0 0 18px rgba(255, 202, 74, 0.7);
+}
+.cast-band::before { left: -1px; }
+.cast-band::after { right: -1px; }
+.cast-band-hint {
+  font-size: 8.5px; font-weight: 900; letter-spacing: 0.26em; text-transform: uppercase;
+  color: rgba(255, 232, 150, 0.62); text-shadow: 0 2px 6px rgba(0, 0, 0, 0.85);
+}
+.cast-power.in-band .cast-band {
+  background: linear-gradient(180deg, rgba(255, 244, 200, 0.42), rgba(255, 202, 74, 0.55));
+  box-shadow: 0 0 20px rgba(255, 216, 110, 0.8) inset;
+}
+.cast-power.in-band .cast-label { color: var(--gold); text-shadow: 0 0 14px rgba(255, 202, 74, 0.8); }
+.cast-power.in-band .cast-band-hint { color: #fff1c2; }
+.cast-power.in-band .cast-track { border-color: var(--gold); box-shadow: 0 0 22px rgba(255, 202, 74, 0.45), inset 0 2px 7px rgba(0, 0, 0, 0.65); }
+
+/* ---- PERFECT! — a short golden burst where the bar was ---- */
+.perfect-burst {
+  position: absolute; left: 50%; bottom: 236px; transform: translateX(-50%);
+  text-align: center; white-space: nowrap;
+  pointer-events: none; opacity: 0; visibility: hidden;
+}
+.perfect-burst.show { visibility: visible; animation: pbCard 800ms cubic-bezier(.16, .9, .3, 1) forwards; }
+@keyframes pbCard {
+  0% { opacity: 0; transform: translateX(-50%) scale(0.55); }
+  22% { opacity: 1; transform: translateX(-50%) scale(1.12); }
+  40% { transform: translateX(-50%) scale(1); }
+  74% { opacity: 1; }
+  100% { opacity: 0; transform: translateX(-50%) translateY(-16px) scale(1.04); }
+}
+.pb-rays {
+  position: absolute; left: 50%; top: 50%;
+  width: 260px; height: 260px; margin: -130px 0 0 -130px; border-radius: 50%;
+  background: conic-gradient(from 0deg,
+    rgba(255, 226, 130, 0.55) 0deg, rgba(255, 202, 74, 0) 12deg,
+    rgba(255, 226, 130, 0.45) 46deg, rgba(255, 202, 74, 0) 62deg,
+    rgba(255, 226, 130, 0.55) 108deg, rgba(255, 202, 74, 0) 126deg,
+    rgba(255, 226, 130, 0.45) 186deg, rgba(255, 202, 74, 0) 206deg,
+    rgba(255, 226, 130, 0.55) 268deg, rgba(255, 202, 74, 0) 288deg,
+    rgba(255, 226, 130, 0.45) 328deg, rgba(255, 202, 74, 0) 352deg);
+  animation: pbRays 800ms ease-out forwards;
+}
+@keyframes pbRays {
+  0% { opacity: 0; transform: scale(0.2) rotate(0deg); }
+  25% { opacity: 0.9; }
+  100% { opacity: 0; transform: scale(1.25) rotate(46deg); }
+}
+.pb-txt {
+  position: relative;
+  font-size: clamp(30px, 4.4vw, 56px); font-weight: 900; letter-spacing: 0.16em;
+  background: linear-gradient(100deg, #fff8e0 0%, var(--gold) 38%, #fff8e0 58%, #ffb44a 100%);
+  background-size: 220% 100%;
+  -webkit-background-clip: text; background-clip: text; color: transparent;
+  filter: drop-shadow(0 3px 0 rgba(94, 52, 0, 0.75)) drop-shadow(0 0 26px rgba(255, 202, 74, 0.85));
+  animation: shimmer 1.2s linear infinite;
+}
+
+/* ---- downed crewmates: world-anchored markers, clamped to the edge ---- */
+.downed-layer { position: absolute; inset: 0; pointer-events: none; overflow: hidden; }
+.downed-marker {
+  position: absolute; left: 0; top: 0;
+  display: flex; align-items: center; gap: 8px;
+  padding: 6px 12px 6px 8px; border-radius: 999px;
+  background: rgba(28, 6, 10, 0.72);
+  border: 1.5px solid rgba(255, 90, 82, 0.55);
+  box-shadow: 0 0 22px rgba(255, 60, 50, 0.35), var(--shadow-sm);
+  -webkit-backdrop-filter: blur(6px); backdrop-filter: blur(6px);
+  white-space: nowrap; opacity: 0;
+  transition: opacity 220ms ease;
+}
+.downed-marker.show { opacity: 1; animation: dmPulse 1.5s ease-in-out infinite; }
+@keyframes dmPulse {
+  0%, 100% { box-shadow: 0 0 14px rgba(255, 60, 50, 0.28), var(--shadow-sm); }
+  50% { box-shadow: 0 0 30px rgba(255, 60, 50, 0.62), var(--shadow-sm); }
+}
+.dm-glyph { width: 22px; height: 22px; flex: none; color: #ff7a6a; display: block; }
+.dm-glyph svg { width: 100%; height: 100%; display: block; }
+.dm-body { display: flex; flex-direction: column; line-height: 1.1; }
+.dm-name { font-size: 12.5px; font-weight: 900; letter-spacing: 0.04em; color: #ffd9d4; }
+.dm-dist {
+  font-style: normal; font-size: 10px; font-weight: 800; letter-spacing: 0.14em;
+  color: #ff9a8e; font-variant-numeric: tabular-nums;
+}
+/* pinned to the screen edge: drop the name, keep the skull and the range */
+.downed-marker.is-edge { padding: 5px 10px 5px 6px; opacity: 0.94; }
+.downed-marker.is-edge .dm-name { display: none; }
+.downed-marker.is-edge .dm-dist { font-size: 11px; }
+.downed-marker.is-towed {
+  border-color: rgba(142, 230, 242, 0.6);
+  box-shadow: 0 0 22px rgba(142, 230, 242, 0.35), var(--shadow-sm);
+  animation: none;
+}
+.downed-marker.is-towed .dm-glyph { color: var(--foam); }
+
+/* ---- the hold-E revive channel ---- */
+.revive-ring {
+  position: absolute; left: 50%; bottom: 192px; transform: translateX(-50%) scale(0.92);
+  display: flex; flex-direction: column; align-items: center; gap: 6px;
+  padding: 12px 20px 10px; border-radius: var(--r-lg);
+  background: var(--panel); border: 1.5px solid rgba(111, 224, 138, 0.45);
+  -webkit-backdrop-filter: var(--blur); backdrop-filter: var(--blur);
+  box-shadow: var(--shadow-lg), 0 0 30px rgba(111, 224, 138, 0.22);
+  opacity: 0; visibility: hidden;
+  transition: opacity 140ms ease, transform 140ms ease, visibility 140ms, border-color 200ms ease;
+}
+.revive-ring.show { opacity: 1; visibility: visible; transform: translateX(-50%) scale(1); }
+.revive-ring.is-full { border-color: var(--lime); box-shadow: var(--shadow-lg), 0 0 44px rgba(111, 224, 138, 0.55); }
+.rr-ring { position: relative; width: 74px; height: 74px; display: grid; place-items: center; }
+.rr-ring svg { position: absolute; inset: 0; width: 100%; height: 100%; transform: rotate(-90deg); }
+.rr-bg { fill: none; stroke: rgba(255, 255, 255, 0.1); stroke-width: 7; }
+.rr-fg {
+  fill: none; stroke: var(--lime); stroke-width: 7; stroke-linecap: round;
+  transition: stroke-dashoffset 90ms linear;
+  filter: drop-shadow(0 0 7px rgba(111, 224, 138, 0.8));
+}
+.rr-ico { width: 26px; height: 26px; color: #ff6a7a; display: block; }
+.rr-ico svg { width: 100%; height: 100%; display: block; }
+.revive-ring.is-full .rr-ico { color: var(--lime); animation: kobreath 700ms ease-in-out infinite; }
+.rr-txt { font-size: 13px; font-weight: 900; letter-spacing: 0.08em; color: #d8ffe4; }
+.rr-hint {
+  font-size: 9.5px; letter-spacing: 0.16em; text-transform: uppercase;
+  color: var(--text-faint); font-weight: 800;
+  display: flex; align-items: center; gap: 6px;
+}
+.rr-hint kbd { min-width: 22px; height: 20px; font-size: 10px; }
+
+/* ---- towing a body up with the claw ---- */
+.tow-hint {
+  position: absolute; left: 50%; bottom: 172px; transform: translateX(-50%) translateY(6px);
+  display: flex; align-items: center; gap: 10px;
+  padding: 8px 16px 8px 10px; border-radius: 999px;
+  background: var(--panel); border: 1.5px solid rgba(142, 230, 242, 0.5);
+  -webkit-backdrop-filter: var(--blur); backdrop-filter: var(--blur);
+  box-shadow: var(--shadow-md), 0 0 26px rgba(142, 230, 242, 0.24);
+  opacity: 0; visibility: hidden;
+  transition: opacity 180ms ease, transform 180ms ease, visibility 180ms;
+  white-space: nowrap;
+}
+.tow-hint.show { opacity: 1; visibility: visible; transform: translateX(-50%) translateY(0); }
+.th-ico { width: 26px; height: 26px; flex: none; display: block; }
+.th-ico svg { width: 100%; height: 100%; display: block; }
+.th-txt { display: flex; flex-direction: column; line-height: 1.12; }
+.th-txt b { font-size: 13px; font-weight: 900; letter-spacing: 0.04em; color: var(--foam); }
+.th-txt i {
+  font-style: normal; font-size: 10px; font-weight: 800; letter-spacing: 0.14em;
+  text-transform: uppercase; color: var(--text-dim);
+}
+
+/* ---- revive prompt colouring ---- */
+.hud-prompt.is-revive {
+  border-color: rgba(111, 224, 138, 0.65);
+  background: linear-gradient(180deg, rgba(111, 224, 138, 0.14), var(--panel));
+  box-shadow: 0 0 0 2px rgba(111, 224, 138, 0.18), 0 0 28px rgba(111, 224, 138, 0.32), var(--shadow-md);
+}
+.hud-prompt.is-revive span { color: #ddffe7; }
+.hud-prompt.is-revive.is-locked {
+  border-color: rgba(255, 90, 82, 0.4);
+  background: var(--panel);
+  box-shadow: var(--shadow-md);
+}
+.hud-prompt.is-revive.is-locked span { color: #ffb3ad; }
+
+/* ---- KO overlay: your way out, or the bad news ----
+   The kit line is a PROMPT, not a button — player.js owns the R key. */
+.ko-kit {
+  display: none; margin: 18px auto 0;
+  align-items: center; gap: 10px;
+  padding: 10px 20px 10px 14px; border-radius: 999px;
+  background: linear-gradient(180deg, rgba(224, 85, 74, 0.28), rgba(60, 10, 10, 0.7));
+  border: 2px solid #ff6a5c;
+  color: #ffe3df;
+  font-size: 15px; font-weight: 900; letter-spacing: 0.1em; text-transform: uppercase;
+  box-shadow: 0 0 30px rgba(255, 70, 60, 0.45);
+  pointer-events: none;
+  animation: urgentpulse 1.5s ease-in-out infinite;
+}
+.ko-overlay.has-kit .ko-kit { display: inline-flex; }
+.ko-kit kbd { min-width: 30px; height: 26px; font-size: 13px; }
+.ko-hint {
+  margin-top: 16px;
+  font-size: 13px; font-weight: 700; letter-spacing: 0.14em;
+  color: #8fa6b2;
+}
+.ko-overlay.has-kit .ko-hint { display: none; }
+
+/* ---- rescue shelf in the shop ---- */
+.shop-note.revive-note b { color: var(--lime); }
+
+/* ---- team wipe: its own ending ----
+   No quota failed here. The whole crew went down at once and the island
+   stopped waiting, so the wipe gets its own headline line. */
+.end-note {
+  margin: 0; font-size: clamp(13px, 1.4vw, 16px); line-height: 1.55;
+  max-width: 52ch; color: var(--text-dim); font-style: italic;
+}
+.screen-end.is-wipe .end-reason {
+  font-size: clamp(17px, 2.1vw, 26px); font-weight: 800; letter-spacing: 0.03em;
+  color: #ffcac4;
+  text-shadow: 0 0 28px rgba(255, 60, 50, 0.4), 0 2px 0 rgba(0, 0, 0, 0.6);
+}
+.screen-end.is-wipe .end-title { color: #ffd9d4; text-shadow: 0 0 46px rgba(255, 40, 30, 0.45), 0 6px 0 rgba(0, 0, 0, 0.75); }
+.screen-end.is-wipe .end-kicker { color: rgba(255, 150, 140, 0.75); }
+
+/* =================================================================
    RESPONSIVE — comfortable down to 1280x720, usable below
    ================================================================= */
 @media (max-width: 1440px) {
@@ -1954,6 +2197,12 @@ kbd.wide { min-width: 54px; }
   .uq-gem { width: 74px; height: 74px; }
   .uq-name { font-size: 20px; }
   .charm-chip .ch-body i { max-height: 22px; opacity: 1; margin-top: 2px; }
+  .downed-marker { padding: 4px 9px 4px 6px; gap: 6px; }
+  .dm-glyph { width: 18px; height: 18px; }
+  .dm-name { font-size: 11px; }
+  .pb-rays { width: 190px; height: 190px; margin: -95px 0 0 -95px; }
+  .rr-ring { width: 62px; height: 62px; }
+  .cast-band-hint { display: none; }
 }
 @media (max-height: 720px) {
   .title-block { margin-top: 0; }
@@ -1971,6 +2220,12 @@ kbd.wide { min-width: 54px; }
   .flopper-strip { bottom: 172px; }
   .unique-card { padding: 18px 18px 14px; }
   .uq-gem { width: 72px; height: 72px; margin: 8px auto 4px; }
+  .perfect-burst { bottom: 214px; }
+  .revive-ring { bottom: 174px; padding: 9px 16px 8px; }
+  .rr-ring { width: 64px; height: 64px; }
+  .tow-hint { bottom: 154px; }
+  .ko-kit { margin-top: 12px; }
+  .ko-hint { margin-top: 10px; }
 }
 
 /* reduce motion */
