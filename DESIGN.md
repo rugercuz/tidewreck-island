@@ -231,3 +231,56 @@ permanently die; (5) verify audible coverage of every game action.
 
 **Also:** area-name floating signs must distance-fade (invisible inside ~25 m of the area
 center's label and clamped in screen size) — they currently fill the screen when close.
+
+## Wave 4 addendum — diving loot, flopper pickup/placement, water exit, new predators
+
+See constants: LOOT_TYPES / LOOT_TABLES / LOOT_RULES / FOUND_BAITS / UNIQUE_CHARMS, new
+ENEMIES behaviors ('drift' / 'ambush'), MSG.LOOT_STATE / PICKUP_LOOT / LOOT_RESULT /
+PICKUP_FLOPPER, and FLOPPER's new 'dead'(=pickupable) -> 'stowed' flow.
+
+**Flopper placement + pickup (the mid-air / under-the-dock bug):** a flopper spawns AT THE
+CATCHER'S FEET and grounds on the same surface the catcher stands on: boat deck via
+`ctx.boat.deckInfo` (anchor it boat-locally so it rides the moving deck, like players do),
+dock/structures via `ctx.world.surfaceHeight(x, z, playerFeetY)`, else terrain/water. It must
+never end up under the dock or floating in air. Alive floppers get a subtle pulsing rim glow +
+a small marker so they read at night (they currently render as black silhouettes). On the
+killing bonk the server now sends FLOPPER {state:'dead'} and KEEPS the fish as a pickup: the
+client turns it into a golden-glowing, gently bobbing pickup (emissive pulse + sparkle + tiny
+point light). Walking within 1.6 m (or E) sends MSG.PICKUP_FLOPPER -> server banks the fish
+(INVENTORY + FLOPPER {state:'stowed'}). Server auto-banks after 20 s so a killed fish is never
+lost; the escape timer only applies while it is still alive.
+
+**Water-exit vault:** while swimming at the surface, Space near a climbable edge vaults you
+out: probe ~0.9 m ahead in the facing direction; if surfaceHeight (with yRef) or boat deckInfo
+there is 0.2..1.6 m above the water, launch up-and-forward so you land on it (shore, dock,
+boat hull). With no edge nearby, Space still gives the existing paddle-up. Small cooldown,
+splash + sfx.
+
+**Loot (server-authoritative):** per area keep LOOT_RULES.NODES_PER_AREA live nodes rolled
+from LOOT_TABLES at random XZ inside the area circle (server tracks XZ only; clients snap the
+mesh to their seabed). Broadcast LOOT_STATE for an area to players in/near it (piggyback the
+ENEMY_STATE proximity logic). PICKUP_LOOT validates: node live, player within PICKUP_RANGE
+horizontally, player underwater and near the bottom (server proxy: player y < -3). Award:
+money value (team wallet + WALLET) — chests additionally roll CHEST_BAIT_CHANCE for a
+FOUND_BAITS stack (personal baits) and CHEST_UNIQUE_CHANCE for an unclaimed UNIQUE_CHARMS
+entry whose `areas` includes this area (one of each per run, first-come; announce via
+CHAT_MSG from 'ISLAND'). Reply LOOT_RESULT; respawn the node elsewhere after RESPAWN_SECONDS.
+Unique charm effects apply server-side for that player: airMult (gear air), biteSpeed
+(divide bite delay), meleeMult (bonk + melee DAMAGE_ENEMY clamp), luckAdd (fishing luck),
+sellMult (sold value, rounded). Include per-player `uniques: [ids]` in WORLD_STATE players.
+'ambush' enemies spawn NEAR a live loot node (within ~8 m) and re-position when it is taken.
+'drift' enemies float mid-water, drifting slowly, stinging on contact.
+
+**Client:** new module `public/js/loot.js` -> `export function initLoot(ctx)` -> handle
+`{ update(dt,t) }` stored as ctx.loot (main.js wiring is handled by the integrator, not you):
+renders nodes per LOOT_STATE snapped to seabed (distinct silhouettes per LOOT_TYPES.model:
+clam with pearl-glow seam, coin pile glint, bottle, strapped chest, carved relic, purple-lit
+geode), soft glow + rising motes so divers can spot them, E prompt via the ui proximity flow
+(bus 'lootNear' {lootId, name} / null), PICKUP_LOOT send, open/collect FX, LOOT_RESULT ->
+bus 'lootResult' for ui toasts/cards. enemies.js renders the two new behaviors: daggerjelly
+(translucent pulsing bell, trailing stingers, slow drift, venom-green sting flash) and
+moray/depthmaw ambushers (coiled at the seabed, near-invisible until aggro: telegraph flare
+then lunge). ui.js: loot pickup toasts, a special card for unique charms (name, effect,
+'ONE OF A KIND'), charm list somewhere visible (inventory panel), 'E — <loot name>' prompt,
+found-bait toasts. audio.js: chestOpen, pearlPop, coinScoop, relicHum, geodeChime,
+uniqueFanfare, jellySting, morayLunge, vault splash, pickup pop.

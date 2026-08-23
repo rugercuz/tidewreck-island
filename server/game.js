@@ -19,6 +19,8 @@ import {
   WEATHER,
   WEATHER_RULES,
   FLOPPER,
+  LOOT_RULES,
+  UNIQUE_CHARMS,
   PLAYER_MAX_HP,
   BASE_AIR_SECONDS,
   shopById,
@@ -31,6 +33,12 @@ import {
   rollFish,
   computeLuck,
   biteStrength,
+  baitDef,
+  uniqueEffects,
+  lootTableFor,
+  rollLootDrop,
+  rollFoundBait,
+  rollUniqueCharm,
 } from './fishing.js';
 
 // ---------------- Tuning ----------------
@@ -76,6 +84,23 @@ const LIGHTNING_MISS_MAX_R = 95;  // ...out to here
 // --- landed catches (floppers) ---------------------------------------
 const BONK_COOLDOWN_S = 0.28;     // ~3 whacks a second, whatever the client claims
 const MELEE_HIT_RANGE = 6;        // melee/'both'-in-close reach check on DAMAGE_ENEMY
+const FLOPPER_PICKUP_S = 20;      // a killed catch auto-banks after this — never lost
+
+// --- underwater loot -------------------------------------------------
+const TICKS_PER_LOOT_STATE = 10;  // ~1 Hz is plenty for treasure that never moves
+const LOOT_STATE_TICK_PHASE = 5;  // ...offset half a second from WORLD_STATE
+const LOOT_REFRESH_S = 6;         // resend an unchanged snapshot at least this often
+const LOOT_PICKUP_SLACK = 1.5;    // latency margin on LOOT_RULES.PICKUP_RANGE
+const LOOT_DIVE_Y = -3;           // server proxy for "you are down at the bottom"
+const LOOT_SPREAD = 0.85;         // nodes sit inside this fraction of the area radius
+
+// --- ambush / drift predators ----------------------------------------
+const AMBUSH_NODE_RADIUS = 8;     // ambushers coil this close to the node they guard
+const AMBUSH_BURST_MULT = 1.6;    // lunge speed multiplier
+const AMBUSH_BURST_S = 6;         // ...for at most this long
+const AMBUSH_REST_S = 5;          // then back to the coil, no re-lunge until this passes
+const DRIFT_SPEED_MULT = 0.5;
+const DRIFT_MIN_Y = -2;           // jellies hang between here and half the area depth
 
 const ARTIFACT_IDS = Object.keys(ARTIFACTS);
 const AREA_BY_ID = new Map(AREAS.map(a => [a.id, a]));
@@ -84,6 +109,17 @@ const MAX_ENEMY_DMG = Object.keys(ENEMIES)
 const EVENT_HIT_MAX_DMG = 15;
 /** Horror events ordered by the day they first become possible. */
 const EVENT_ORDER = Object.keys(EVENTS).sort((a, b) => EVENTS[a].firstDay - EVENTS[b].firstDay);
+
+/**
+ * Client messages the room router may not forward. Each one is bound straight
+ * onto the socket, but ONLY when nothing is listening for it already — see
+ * bindPlayerSocket(). [message, Game method].
+ */
+const SOCKET_FALLBACKS = [
+  [MSG.BONK_FISH, 'onBonkFish'],
+  [MSG.PICKUP_FLOPPER, 'onPickupFlopper'],
+  [MSG.PICKUP_LOOT, 'onPickupLoot'],
+];
 
 // ---------------- Small helpers ----------------
 
@@ -194,6 +230,11 @@ export class Game {
     this.badWeatherToday = false;
     this.nextLightningAt = 0;
 
+    // --- underwater loot ----------------------------------------------
+    this.loot = new Map();          // areaId -> {area, nodes[], respawns[], version, sentTo}
+    this.lootCounter = 0;
+    this.claimedUniques = new Set(); // one of each UNIQUE_CHARMS per run
+
     // --- players ------------------------------------------------------
     this.players = new Map();
     this.socketHooks = new Map();   // socket-level fallbacks, see bindPlayerSocket()
@@ -231,6 +272,8 @@ export class Game {
       biggestCatch: null,
     };
 
+    // Treasure first: 'ambush' predators anchor themselves to a live node.
+    this.spawnLoot();
     this.spawnEnemies();
   }
 
@@ -279,6 +322,7 @@ export class Game {
       skin: styleIndex(member.skin, SKIN_COUNT),
       gear: { rod: 1, weapons: [], charms: [], diving: 1 },
       baits: { worms: 5 },
+      uniques: [],           // claimed UNIQUE_CHARMS ids — server applies the effects
       inventory: [],
       hp: PLAYER_MAX_HP,
       alive: true,
@@ -301,36 +345,48 @@ export class Game {
     return player;
   }
 
+  /** The live socket for a player id, or null when the layer looks different. */
+  socketOf(id) {
+    const sockets = this.io && this.io.sockets ? this.io.sockets.sockets : null;
+    return sockets && typeof sockets.get === 'function' ? sockets.get(id) : null;
+  }
+
   /**
-   * Wave-2 messages that the room router does not forward yet are picked up
-   * straight off the socket. If rooms.js already wired BONK_FISH (its handlers
-   * are installed at connect time, long before a Game exists) this is a no-op,
-   * so the message can never be processed twice.
+   * Messages that the room router does not forward (BONK_FISH is routed there,
+   * PICKUP_FLOPPER / PICKUP_LOOT are not) are picked up straight off the
+   * socket. Anything rooms.js already wired — its handlers are installed at
+   * connect time, long before a Game exists — is skipped per message, so a
+   * message can never be processed twice.
    */
   bindPlayerSocket(id) {
     try {
-      const sockets = this.io && this.io.sockets ? this.io.sockets.sockets : null;
-      const socket = sockets && typeof sockets.get === 'function' ? sockets.get(id) : null;
+      const socket = this.socketOf(id);
       if (!socket || typeof socket.on !== 'function') return;
-      if (typeof socket.listeners === 'function' && socket.listeners(MSG.BONK_FISH).length > 0) return;
       if (this.socketHooks.has(id)) return;
-      const handler = (d) => {
-        try { this.onBonkFish(id, d && typeof d === 'object' ? d : {}); }
-        catch (err) { console.error('[game bonk]', this.code, err); }
-      };
-      socket.on(MSG.BONK_FISH, handler);
-      this.socketHooks.set(id, handler);
+
+      const hooks = [];
+      for (const [msg, method] of SOCKET_FALLBACKS) {
+        if (typeof this[method] !== 'function') continue;
+        if (typeof socket.listeners === 'function' && socket.listeners(msg).length > 0) continue;
+        const handler = (d) => {
+          try { this[method](id, d && typeof d === 'object' ? d : {}); }
+          catch (err) { console.error('[game socket]', this.code, msg, err); }
+        };
+        socket.on(msg, handler);
+        hooks.push([msg, handler]);
+      }
+      if (hooks.length) this.socketHooks.set(id, hooks);
     } catch (err) { /* socket layer shape differs — the router handles it */ }
   }
 
   unbindPlayerSocket(id) {
-    const handler = this.socketHooks.get(id);
-    if (!handler) return;
+    const hooks = this.socketHooks.get(id);
+    if (!hooks) return;
     this.socketHooks.delete(id);
     try {
-      const sockets = this.io && this.io.sockets ? this.io.sockets.sockets : null;
-      const socket = sockets && typeof sockets.get === 'function' ? sockets.get(id) : null;
-      if (socket && typeof socket.off === 'function') socket.off(MSG.BONK_FISH, handler);
+      const socket = this.socketOf(id);
+      if (!socket || typeof socket.off !== 'function') return;
+      for (const [msg, handler] of hooks) socket.off(msg, handler);
     } catch (err) { /* already gone */ }
   }
 
@@ -341,6 +397,7 @@ export class Game {
     this.unbindPlayerSocket(id);
     this.players.delete(id);
     this.moveDirty.delete(id);
+    for (const state of this.loot.values()) state.sentTo.delete(id);
 
     let seatChanged = false;
     for (let i = 0; i < BOAT_SEATS; i++) {
@@ -362,7 +419,13 @@ export class Game {
       charms: p.gear.charms.slice(),
       diving: p.gear.diving,
       air: this.airSecondsFor(p),
+      uniques: Array.isArray(p.uniques) ? p.uniques.slice() : [],
     };
+  }
+
+  /** Composed effects of every unique charm this player has claimed. */
+  uniqueFx(p) {
+    return uniqueEffects(p && Array.isArray(p.uniques) ? p.uniques : null);
   }
 
   airSecondsFor(p) {
@@ -372,7 +435,8 @@ export class Game {
         air = item.air;
       }
     }
-    return air;
+    // Pearl of the Deep and friends stretch the lungs.
+    return Math.max(1, Math.round(air * this.uniqueFx(p).airMult));
   }
 
   // =========================================================
@@ -407,6 +471,7 @@ export class Game {
         hat: p.hat,
         skin: p.skin,
         gear: this.gearPayload(p),
+        uniques: Array.isArray(p.uniques) ? p.uniques.slice() : [],
         hp: p.hp,
         alive: p.alive,
         seat: p.seat,
@@ -623,6 +688,7 @@ export class Game {
     this.updateCasts(now);
     this.updateFloppers(now);
     this.updateEvent(now);
+    this.updateLoot(now);
     this.updateEnemies(dt, now);
     this.updateTsunami(now);
 
@@ -632,6 +698,8 @@ export class Game {
     if (this.tickCount % TICKS_PER_WORLD_STATE === 0) this.broadcastWorldState();
     // 8 Hz: send on 4 out of every 5 ticks
     if (this.tickCount % 5 !== 0) this.broadcastEnemyState();
+    // ~1 Hz, half a second out of phase with WORLD_STATE
+    if (this.tickCount % TICKS_PER_LOOT_STATE === LOOT_STATE_TICK_PHASE) this.broadcastLootState(now);
   }
 
   updateClock(dt) {
@@ -849,12 +917,13 @@ export class Game {
       return;
     }
 
-    // Consume one bait if the player actually owns some.
+    // Consume one bait if the player actually owns some. Found-only baits
+    // (chest loot) are never in SHOP, so resolve through baitDef().
     let baitId = null;
     const wanted = typeof d.baitId === 'string' ? d.baitId : null;
-    if (wanted && num(p.baits[wanted], 0) > 0) {
-      const def = shopById(wanted);
-      if (def && def.kind === 'bait') {
+    if (wanted && Object.prototype.hasOwnProperty.call(p.baits, wanted) && num(p.baits[wanted], 0) > 0) {
+      const def = baitDef(wanted);
+      if (def) {
         p.baits[wanted] = p.baits[wanted] - 1;
         if (p.baits[wanted] <= 0) delete p.baits[wanted];
         baitId = wanted;
@@ -866,7 +935,7 @@ export class Game {
       areaId: area.id,
       baitId,
       state: 'waiting',
-      biteAt: nowSeconds() + rollBiteDelay(p.gear, baitId, this.weather),
+      biteAt: nowSeconds() + rollBiteDelay(p.gear, baitId, this.weather, p.uniques),
       failAt: 0,
       roll: null,
     };
@@ -890,7 +959,7 @@ export class Game {
           area,
           gear: p.gear,
           baits: c.baitId,
-          luck: computeLuck(p.gear, c.baitId),
+          luck: computeLuck(p.gear, c.baitId, p.uniques),
           eventsSurvived: this.eventsSurvived,
           difficulty: this.difficulty,
           weather: this.weather,
@@ -934,9 +1003,9 @@ export class Game {
       value: roll.value,
     };
 
-    // The fish is on the deck, not in the bag: it lands ALIVE and flopping and
-    // has to be finished (MSG.BONK_FISH) before it counts. Inventory, stats and
-    // the artifact award all wait for killFlopper().
+    // The fish is on the deck, not in the bag: it lands ALIVE and flopping, has
+    // to be finished (MSG.BONK_FISH) and then picked up (MSG.PICKUP_FLOPPER).
+    // Inventory, stats and the artifact award all wait for bankFlopper().
     const prevBest = this.stats.biggestCatch;
     const newRecord = !prevBest || roll.value > prevBest.value;
     const flopper = this.spawnFlopper(p, item, roll);
@@ -971,7 +1040,8 @@ export class Game {
       else if (w.attack === 'both') d = num(w.meleeDmg, num(w.dmg, 0));
       if (d > best) best = d;
     }
-    return Math.max(1, Math.round(best));
+    // The Barnacle Idol swings for you.
+    return Math.max(1, Math.round(best * this.uniqueFx(p).meleeMult));
   }
 
   spawnFlopper(p, item, roll) {
@@ -984,6 +1054,7 @@ export class Game {
       fishDef: roll.fish,
       hp: maxHp,
       maxHp,
+      dead: false,   // killed catches stay put as a pickup until grabbed/auto-banked
       expiresAt: nowSeconds() + Math.max(1, num(FLOPPER.ESCAPE_SECONDS, 25)),
     };
     p.floppers.set(fl.flopperId, fl);
@@ -1004,7 +1075,7 @@ export class Game {
     if (!p || !p.alive || this.over) return;
     const flopperId = typeof d.flopperId === 'string' ? d.flopperId : '';
     const fl = p.floppers.get(flopperId);
-    if (!fl) return;
+    if (!fl || fl.dead) return;   // already finished — it is a pickup now
 
     const now = nowSeconds();
     if (now - p.lastBonkAt < BONK_COOLDOWN_S) return;   // ~3 whacks/second, no more
@@ -1027,9 +1098,39 @@ export class Game {
     });
   }
 
-  /** The catch stops flopping: NOW it is yours (inventory, stats, artifact). */
+  /**
+   * The catch stops flopping. It does NOT go in the bag yet — it lies there as
+   * a glowing pickup until MSG.PICKUP_FLOPPER (or the 20 s auto-bank).
+   */
   killFlopper(p, fl) {
-    p.floppers.delete(fl.flopperId);
+    fl.dead = true;
+    fl.hp = 0;
+    fl.expiresAt = nowSeconds() + FLOPPER_PICKUP_S;
+
+    this.send(p.id, MSG.FLOPPER, {
+      state: 'dead',
+      flopperId: fl.flopperId,
+      fish: fl.item,
+      hp: 0,
+      maxHp: fl.maxHp,
+      pickupSeconds: FLOPPER_PICKUP_S,
+      pickupRange: 1.6,
+    });
+  }
+
+  /** Grab your killed catch off the deck. */
+  onPickupFlopper(id, d) {
+    const p = this.players.get(id);
+    if (!p || this.over) return;
+    const flopperId = typeof d.flopperId === 'string' ? d.flopperId : '';
+    const fl = p.floppers.get(flopperId);
+    if (!fl || !fl.dead) return;   // not yours, or still very much alive
+    this.bankFlopper(p, fl, 'pickup');
+  }
+
+  /** NOW it is yours: inventory, stats, artifact. */
+  bankFlopper(p, fl, reason) {
+    if (!p.floppers.delete(fl.flopperId)) return;
 
     const item = fl.item;
     p.inventory.push(item);
@@ -1050,11 +1151,12 @@ export class Game {
     }
 
     this.send(p.id, MSG.FLOPPER, {
-      state: 'dead',
+      state: 'stowed',
       flopperId: fl.flopperId,
       fish: item,
       hp: 0,
       maxHp: fl.maxHp,
+      reason: reason || 'pickup',
     });
     this.sendInventory(p);
     this.awardArtifact(p, fl.fishDef);
@@ -1079,8 +1181,10 @@ export class Game {
   clearFloppers(p, notify) {
     if (!p || !p.floppers || !p.floppers.size) return;
     for (const fl of Array.from(p.floppers.values())) {
-      if (notify) this.escapeFlopper(p, fl, 'lost');
-      else p.floppers.delete(fl.flopperId);
+      if (!notify) { p.floppers.delete(fl.flopperId); continue; }
+      // A killed fish is never lost — it goes in the bag even if you go under.
+      if (fl.dead) this.bankFlopper(p, fl, 'auto');
+      else this.escapeFlopper(p, fl, 'lost');
     }
   }
 
@@ -1088,7 +1192,10 @@ export class Game {
     for (const p of this.players.values()) {
       if (!p.floppers.size) continue;
       for (const fl of Array.from(p.floppers.values())) {
-        if (now >= fl.expiresAt) this.escapeFlopper(p, fl, 'timeout');
+        if (now < fl.expiresAt) continue;
+        // Alive: it flips overboard. Dead: it was left lying there — bank it.
+        if (fl.dead) this.bankFlopper(p, fl, 'auto');
+        else this.escapeFlopper(p, fl, 'timeout');
       }
     }
   }
@@ -1112,6 +1219,241 @@ export class Game {
   }
 
   // =========================================================
+  // Underwater loot
+  // =========================================================
+
+  lootNodesPerArea() {
+    return Math.max(1, Math.floor(num(LOOT_RULES.NODES_PER_AREA, 5)));
+  }
+
+  /** One live node set per area that has a LOOT_TABLES entry. */
+  spawnLoot() {
+    this.loot = new Map();
+    const per = this.lootNodesPerArea();
+    for (const area of AREAS) {
+      if (!lootTableFor(area.id)) continue;
+      const state = {
+        area,
+        nodes: [],
+        respawns: [],      // absolute times at which a taken node regrows
+        version: 1,        // bumped on every change; drives the LOOT_STATE resend
+        sentTo: new Map(), // playerId -> {version, at}
+      };
+      this.loot.set(area.id, state);
+      for (let i = 0; i < per; i++) {
+        const node = this.makeLootNode(area);
+        if (node) state.nodes.push(node);
+      }
+    }
+  }
+
+  /** A fresh node at a random spot inside the area circle (server tracks XZ). */
+  makeLootNode(area) {
+    const drop = rollLootDrop(area.id);
+    if (!drop) return null;
+    const ang = Math.random() * Math.PI * 2;
+    const rad = Math.sqrt(Math.random()) * Math.max(4, num(area.radius, 60)) * LOOT_SPREAD;
+    return {
+      id: `lt${this.code}${++this.lootCounter}`,
+      areaId: area.id,
+      type: drop.type,
+      name: drop.name,
+      model: drop.model,
+      value: drop.value,
+      x: area.center[0] + Math.cos(ang) * rad,
+      z: area.center[1] + Math.sin(ang) * rad,
+    };
+  }
+
+  lootNodeById(areaId, lootId) {
+    const state = this.loot.get(areaId);
+    if (!state) return null;
+    for (const n of state.nodes) if (n.id === lootId) return n;
+    return null;
+  }
+
+  findLootNode(lootId) {
+    for (const state of this.loot.values()) {
+      for (let i = 0; i < state.nodes.length; i++) {
+        if (state.nodes[i].id === lootId) return { state, node: state.nodes[i], index: i };
+      }
+    }
+    return null;
+  }
+
+  lootPayload(state) {
+    return {
+      areaId: state.area.id,
+      list: state.nodes.map(n => ({
+        id: n.id,
+        type: n.type,
+        name: n.name,
+        p: [r2(n.x), r2(n.z)],
+      })),
+    };
+  }
+
+  /** Regrow taken nodes elsewhere in their area once RESPAWN_SECONDS is up. */
+  updateLoot(now) {
+    if (this.over || !this.loot.size) return;
+    const per = this.lootNodesPerArea();
+    for (const state of this.loot.values()) {
+      if (!state.respawns.length) continue;
+      let grew = false;
+      for (let i = state.respawns.length - 1; i >= 0; i--) {
+        if (now < state.respawns[i]) continue;
+        state.respawns.splice(i, 1);
+        if (state.nodes.length >= per) continue;
+        const node = this.makeLootNode(state.area);
+        if (node) { state.nodes.push(node); grew = true; }
+      }
+      if (grew) {
+        state.version++;
+        this.anchorAmbushers(state.area.id);
+      }
+    }
+  }
+
+  /**
+   * LOOT_STATE goes to players in or near an area — the same 400 m proximity
+   * gate ENEMY_STATE uses — on every change, and at least every few seconds so
+   * a late joiner or a reconnect always converges.
+   */
+  broadcastLootState(now) {
+    if (this.over || !this.loot.size || this.players.size === 0) return;
+    const at = num(now, nowSeconds());
+
+    for (const state of this.loot.values()) {
+      const targets = [];
+      for (const p of this.players.values()) {
+        const dx = p.pos[0] - state.area.center[0];
+        const dz = p.pos[2] - state.area.center[1];
+        if (dx * dx + dz * dz <= ENEMY_AREA_ACTIVE_RANGE_SQ) targets.push(p.id);
+      }
+
+      // Forget anyone who swam off (or left) so re-entering resends the set.
+      if (state.sentTo.size) {
+        const near = new Set(targets);
+        for (const id of Array.from(state.sentTo.keys())) {
+          if (!near.has(id)) state.sentTo.delete(id);
+        }
+      }
+      if (!targets.length) continue;
+
+      let payload = null;
+      for (const id of targets) {
+        const rec = state.sentTo.get(id);
+        if (rec && rec.version === state.version && at - rec.at < LOOT_REFRESH_S) continue;
+        if (!payload) payload = this.lootPayload(state);
+        this.send(id, MSG.LOOT_STATE, payload);
+        state.sentTo.set(id, { version: state.version, at });
+      }
+    }
+  }
+
+  lootFail(id, lootId, message, reason) {
+    this.send(id, MSG.LOOT_RESULT, {
+      ok: false,
+      lootId,
+      reason: reason || 'no',
+      message,
+    });
+  }
+
+  /**
+   * Grab a treasure node. Validated: the node is still live, the player is
+   * actually down there (server proxy: y < -3) and within PICKUP_RANGE
+   * horizontally. Always answers with LOOT_RESULT.
+   */
+  onPickupLoot(id, d) {
+    const p = this.players.get(id);
+    if (!p) return;
+    const lootId = typeof d.lootId === 'string' ? d.lootId : '';
+
+    if (this.over) { this.lootFail(id, lootId, 'Not now.', 'over'); return; }
+    if (!p.alive) { this.lootFail(id, lootId, 'You are down. Wait for sunrise.', 'down'); return; }
+
+    const found = lootId ? this.findLootNode(lootId) : null;
+    if (!found) { this.lootFail(id, lootId, 'Someone beat you to it.', 'gone'); return; }
+
+    if (p.pos[1] >= LOOT_DIVE_Y) {
+      this.lootFail(id, lootId, 'Dive down to it first.', 'surface');
+      return;
+    }
+    const node = found.node;
+    const range = Math.max(1, num(LOOT_RULES.PICKUP_RANGE, 4)) + LOOT_PICKUP_SLACK;
+    const dx = p.pos[0] - node.x;
+    const dz = p.pos[2] - node.z;
+    if (dx * dx + dz * dz > range * range) {
+      this.lootFail(id, lootId, 'Too far — swim right up to it.', 'range');
+      return;
+    }
+
+    // --- it is yours -------------------------------------------------
+    const state = found.state;
+    state.nodes.splice(found.index, 1);
+    state.respawns.push(nowSeconds() + Math.max(5, num(LOOT_RULES.RESPAWN_SECONDS, 150)));
+    state.version++;
+
+    const value = Math.max(0, Math.round(num(node.value, 0)));
+    if (value > 0) {
+      this.wallet += value;
+      this.stats.moneyEarned += value;
+      p.stats.earned += value;
+      this.broadcastWallet();
+    }
+
+    // --- chest bonus rolls -------------------------------------------
+    let itemId = null;
+    let uniqueId = null;
+    const extras = [];
+    if (node.type === 'chest') {
+      if (Math.random() < clamp(num(LOOT_RULES.CHEST_BAIT_CHANCE, 0.35), 0, 1)) {
+        const bait = rollFoundBait();
+        if (bait) {
+          p.baits[bait.id] = num(p.baits[bait.id], 0) + bait.pack;
+          itemId = bait.id;
+          extras.push(`${bait.pack}x ${bait.name}`);
+          this.sendInventory(p);
+        }
+      }
+      if (Math.random() < clamp(num(LOOT_RULES.CHEST_UNIQUE_CHANCE, 0.15), 0, 1)) {
+        const uid = rollUniqueCharm(state.area.id, this.claimedUniques);
+        const def = uid ? UNIQUE_CHARMS[uid] : null;
+        if (uid && def) {
+          this.claimedUniques.add(uid);
+          p.uniques.push(uid);
+          uniqueId = uid;
+          extras.push(def.name);
+          this.chat('ISLAND', `${p.name} found the ${def.name}!`);
+          if (def.desc) this.chat('ISLAND', def.desc);
+        }
+      }
+    }
+
+    this.send(id, MSG.LOOT_RESULT, {
+      ok: true,
+      lootId,
+      kind: node.type,
+      type: node.type,
+      name: node.name,
+      value,
+      itemId,
+      uniqueId,
+      areaId: state.area.id,
+      message: extras.length
+        ? `${node.name}: $${value} + ${extras.join(' + ')}`
+        : `${node.name}: $${value}`,
+    });
+
+    // The hole where it was is news to everyone nearby, and to whatever was
+    // coiled up guarding it.
+    this.broadcastLootState(nowSeconds());
+    this.anchorAmbushers(state.area.id);
+    if (uniqueId) this.broadcastWorldState();
+  }
+
+  // =========================================================
   // Selling & quota
   // =========================================================
 
@@ -1131,6 +1473,12 @@ export class Game {
     if (!count) { this.error(id, 'Those fish are already gone.'); return; }
     p.inventory = keep;
 
+    // The Tidal Bell talks the merchant up.
+    const sellMult = this.uniqueFx(p).sellMult;
+    const base = total;
+    total = Math.max(0, Math.round(total * sellMult));
+    const bonus = total - base;
+
     this.wallet += total;
     this.quota.progress += total;
     this.stats.moneyEarned += total;
@@ -1139,7 +1487,9 @@ export class Game {
 
     this.sendInventory(p);
     this.broadcastWallet();
-    this.chat('ISLAND', `${p.name} sold ${count} fish for $${total}.`);
+    this.chat('ISLAND', bonus > 0
+      ? `${p.name} sold ${count} fish for $${total} (+$${bonus} haggled).`
+      : `${p.name} sold ${count} fish for $${total}.`);
 
     this.checkQuota();
     this.broadcastWorldState();
@@ -1358,45 +1708,134 @@ export class Game {
   }
 
   makeEnemy(type, def, area) {
+    const behavior = typeof def.behavior === 'string' ? def.behavior : 'patrol';
     const e = {
       id: `e${++this.enemyCounter}`,
       type,
       def,
       area,
+      behavior,
       p: [0, -5, 0],
       wander: [0, -5, 0],
+      anchor: [0, -5, 0],   // 'ambush': the spot it coils on, beside a loot node
+      anchorLootId: null,
+      burstUntil: 0,        // 'ambush': lunging until this time
+      burstReadyAt: 0,      // ...and no new lunge before this one
       r: Math.random() * Math.PI * 2,
       hp: def.hp,
       maxHp: def.hp,
-      state: 'idle',
+      state: behavior === 'ambush' ? 'lurk' : (behavior === 'drift' ? 'drift' : 'idle'),
       alive: true,
       respawnAt: 0,
       lastHitAt: 0,
       repathAt: 0,
     };
-    this.randomPointInArea(area, e.p);
-    this.randomPointInArea(area, e.wander);
+    this.placeEnemy(e);
     return e;
+  }
+
+  /** Deepest y an enemy may sit at in this area (the abyss is not reachable). */
+  areaFloorDepth(area) {
+    return Math.max(6, Math.min(num(area.depth, 20), ENEMY_MAX_DEPTH));
   }
 
   randomPointInArea(area, out) {
     const ang = Math.random() * Math.PI * 2;
     const rad = Math.sqrt(Math.random()) * area.radius * 0.85;
-    const maxDepth = Math.max(6, Math.min(num(area.depth, 20), ENEMY_MAX_DEPTH));
+    const maxDepth = this.areaFloorDepth(area);
     out[0] = area.center[0] + Math.cos(ang) * rad;
     out[1] = -3 - Math.random() * (maxDepth - 3);
     out[2] = area.center[1] + Math.sin(ang) * rad;
     return out;
   }
 
-  respawnEnemy(e) {
+  /** Mid-water y for a drifter: between -2 and half the area depth. */
+  driftDepth(area) {
+    const half = this.areaFloorDepth(area) * 0.5;
+    return DRIFT_MIN_Y - Math.random() * Math.max(0.5, half + DRIFT_MIN_Y);
+  }
+
+  clampToArea(area, out, mult) {
+    const limit = Math.max(4, num(area.radius, 60) * (mult || 1));
+    const cx = out[0] - area.center[0];
+    const cz = out[2] - area.center[1];
+    const d2 = cx * cx + cz * cz;
+    if (d2 > limit * limit) {
+      const dist = Math.sqrt(d2) || 1;
+      out[0] = area.center[0] + (cx / dist) * limit;
+      out[2] = area.center[1] + (cz / dist) * limit;
+    }
+    return out;
+  }
+
+  /** Initial (or post-respawn) placement, by behavior. */
+  placeEnemy(e) {
+    if (e.behavior === 'ambush') { this.anchorAmbusher(e, true); return; }
     this.randomPointInArea(e.area, e.p);
     this.randomPointInArea(e.area, e.wander);
+    if (e.behavior === 'drift') {
+      e.p[1] = this.driftDepth(e.area);
+      e.wander[1] = this.driftDepth(e.area);
+    }
+  }
+
+  /**
+   * Seat an ambusher beside a live loot node in its area (within ~8 m) so the
+   * treasure is guarded. Falls back to a random seabed spot when the area has
+   * nothing left to guard. `snap` teleports it there (spawn/respawn); without
+   * it the predator swims back to the new coil on its own.
+   */
+  anchorAmbusher(e, snap) {
+    const state = this.loot ? this.loot.get(e.area.id) : null;
+    const nodes = state && state.nodes.length ? state.nodes : null;
+    const floor = -this.areaFloorDepth(e.area) + 1.5;
+
+    if (nodes) {
+      const node = nodes[Math.floor(Math.random() * nodes.length) % nodes.length];
+      const ang = Math.random() * Math.PI * 2;
+      const rad = Math.random() * AMBUSH_NODE_RADIUS;
+      e.anchorLootId = node.id;
+      e.anchor[0] = node.x + Math.cos(ang) * rad;
+      e.anchor[1] = floor;
+      e.anchor[2] = node.z + Math.sin(ang) * rad;
+    } else {
+      e.anchorLootId = null;
+      this.randomPointInArea(e.area, e.anchor);
+      e.anchor[1] = floor;
+    }
+    this.clampToArea(e.area, e.anchor, 1);
+
+    if (snap) {
+      e.p[0] = e.anchor[0];
+      e.p[1] = e.anchor[1];
+      e.p[2] = e.anchor[2];
+      e.wander[0] = e.anchor[0];
+      e.wander[1] = e.anchor[1];
+      e.wander[2] = e.anchor[2];
+      e.burstUntil = 0;
+      e.burstReadyAt = 0;
+    }
+  }
+
+  /** Every ambusher in an area whose guarded node is gone picks a new one. */
+  anchorAmbushers(areaId) {
+    for (let i = 0; i < this.enemies.length; i++) {
+      const e = this.enemies[i];
+      if (e.behavior !== 'ambush' || e.area.id !== areaId) continue;
+      if (e.anchorLootId && this.lootNodeById(areaId, e.anchorLootId)) continue;
+      this.anchorAmbusher(e, !e.alive);
+    }
+  }
+
+  respawnEnemy(e) {
+    this.placeEnemy(e);
     e.hp = e.maxHp;
     e.alive = true;
-    e.state = 'idle';
+    e.state = e.behavior === 'ambush' ? 'lurk' : (e.behavior === 'drift' ? 'drift' : 'idle');
     e.lastHitAt = 0;
     e.respawnAt = 0;
+    e.burstUntil = 0;
+    e.burstReadyAt = 0;
   }
 
   updateEnemies(dt, now) {
@@ -1416,26 +1855,17 @@ export class Game {
 
       const def = e.def;
       // --- pick a target -------------------------------------------
-      let target = null;
-      const aggro = def.aggroRange * aggroMult;
-      let bestD2 = aggro * aggro;
-      for (const p of this.players.values()) {
-        if (!p.alive) continue;
-        const dx = p.pos[0] - e.p[0];
-        const dy = p.pos[1] - e.p[1];
-        const dz = p.pos[2] - e.p[2];
-        const d2 = dx * dx + dy * dy + dz * dz;
-        if (d2 < bestD2) { bestD2 = d2; target = p; }
-      }
+      const near = this.nearestPlayer(e, def.aggroRange * aggroMult);
+      const target = near ? near.player : null;
+      const bestD2 = near ? near.d2 : Infinity;
 
-      if (target) {
+      if (e.behavior === 'drift') {
+        this.updateDrifter(e, def, dt, now);
+      } else if (e.behavior === 'ambush') {
+        this.updateAmbusher(e, def, target, dt, now);
+      } else if (target) {
         e.state = 'chase';
         this.moveEnemyToward(e, target.pos[0], target.pos[1], target.pos[2], def.speed, dt);
-        if (bestD2 <= ENEMY_CONTACT_RANGE_SQ && now - e.lastHitAt >= ENEMY_HIT_COOLDOWN_S) {
-          e.lastHitAt = now;
-          e.state = 'attack';
-          this.damagePlayer(target, def.dmg, def.name);
-        }
       } else {
         e.state = 'idle';
         const dx = e.wander[0] - e.p[0];
@@ -1448,20 +1878,90 @@ export class Game {
         this.moveEnemyToward(e, e.wander[0], e.wander[1], e.wander[2], def.speed * 0.3, dt);
       }
 
+      // --- contact damage: every behavior stings what it touches ----
+      if (target && bestD2 <= ENEMY_CONTACT_RANGE_SQ && now - e.lastHitAt >= ENEMY_HIT_COOLDOWN_S) {
+        e.lastHitAt = now;
+        e.state = 'attack';
+        this.damagePlayer(target, def.dmg, def.name);
+      }
+
       // --- keep them in their water --------------------------------
-      const maxDepth = Math.max(6, Math.min(num(e.area.depth, 20), ENEMY_MAX_DEPTH));
+      const maxDepth = this.areaFloorDepth(e.area);
       if (e.p[1] > -0.4) e.p[1] = -0.4;
       if (e.p[1] < -maxDepth - seaFloorPad) e.p[1] = -maxDepth - seaFloorPad;
+      this.clampToArea(e.area, e.p, 1.15);
+    }
+  }
 
-      const cx = e.p[0] - e.area.center[0];
-      const cz = e.p[2] - e.area.center[1];
-      const distSq = cx * cx + cz * cz;
-      const limit = e.area.radius * 1.15;
-      if (distSq > limit * limit) {
-        const dist = Math.sqrt(distSq) || 1;
-        e.p[0] = e.area.center[0] + (cx / dist) * limit;
-        e.p[2] = e.area.center[1] + (cz / dist) * limit;
+  /** Nearest living player within `range` metres, or null. */
+  nearestPlayer(e, range) {
+    let bestD2 = Math.max(0, num(range, 0));
+    bestD2 *= bestD2;
+    let found = null;
+    for (const p of this.players.values()) {
+      if (!p.alive) continue;
+      const dx = p.pos[0] - e.p[0];
+      const dy = p.pos[1] - e.p[1];
+      const dz = p.pos[2] - e.p[2];
+      const d2 = dx * dx + dy * dy + dz * dz;
+      if (d2 < bestD2) { bestD2 = d2; found = p; }
+    }
+    return found ? { player: found, d2: bestD2 } : null;
+  }
+
+  /**
+   * 'drift': a jelly. Never chases — it wanders slowly around mid-water and
+   * whatever swims into it gets stung (handled by the shared contact check).
+   */
+  updateDrifter(e, def, dt, now) {
+    const dx = e.wander[0] - e.p[0];
+    const dy = e.wander[1] - e.p[1];
+    const dz = e.wander[2] - e.p[2];
+    if (now >= e.repathAt || (dx * dx + dy * dy + dz * dz) < 1) {
+      const ang = Math.random() * Math.PI * 2;
+      const rad = 4 + Math.random() * 10;
+      e.wander[0] = e.p[0] + Math.cos(ang) * rad;
+      e.wander[1] = this.driftDepth(e.area);
+      e.wander[2] = e.p[2] + Math.sin(ang) * rad;
+      this.clampToArea(e.area, e.wander, 1);
+      e.repathAt = now + 5 + Math.random() * 7;
+    }
+    e.state = 'drift';
+    this.moveEnemyToward(e, e.wander[0], e.wander[1], e.wander[2],
+      Math.max(0.4, num(def.speed, 2) * DRIFT_SPEED_MULT), dt);
+  }
+
+  /**
+   * 'ambush': coiled motionless beside the treasure it guards ('lurk') until a
+   * diver strays inside aggroRange — then a 1.6x burst for up to 6 s ('aggro')
+   * before it slinks back to its anchor.
+   */
+  updateAmbusher(e, def, target, dt, now) {
+    // The node it was guarding got looted? Coil up beside another one.
+    if (e.anchorLootId && !this.lootNodeById(e.area.id, e.anchorLootId)) this.anchorAmbusher(e, false);
+
+    if (now >= e.burstUntil && target && now >= e.burstReadyAt) {
+      e.burstUntil = now + AMBUSH_BURST_S;
+      e.burstReadyAt = e.burstUntil + AMBUSH_REST_S;
+    }
+
+    if (now < e.burstUntil) {
+      if (target) {
+        e.state = 'aggro';
+        this.moveEnemyToward(e, target.pos[0], target.pos[1], target.pos[2],
+          num(def.speed, 6) * AMBUSH_BURST_MULT, dt);
+        return;
       }
+      e.burstUntil = 0;   // lost them mid-lunge — break off
+    }
+
+    e.state = 'lurk';
+    const dx = e.anchor[0] - e.p[0];
+    const dy = e.anchor[1] - e.p[1];
+    const dz = e.anchor[2] - e.p[2];
+    if (dx * dx + dy * dy + dz * dz > 1) {
+      this.moveEnemyToward(e, e.anchor[0], e.anchor[1], e.anchor[2],
+        Math.max(0.5, num(def.speed, 6) * 0.45), dt);
     }
   }
 
@@ -1506,6 +2006,7 @@ export class Game {
           r: r3(e.r),
           hp: e.hp,
           state: e.state,
+          behavior: e.behavior,
         });
       }
     }
@@ -1535,15 +2036,17 @@ export class Game {
     const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
 
     const attack = typeof weapon.attack === 'string' ? weapon.attack : 'ranged';
+    const meleeMult = this.uniqueFx(p).meleeMult;   // Barnacle Idol, swings only
     let maxDmg = num(weapon.dmg, 1);
     let maxRange;
     if (attack === 'melee') {
       // Swing reach only — a club cannot touch something 20 m away.
       maxRange = Math.max(MELEE_HIT_RANGE, num(weapon.range, 3) + 2.5);
+      maxDmg *= meleeMult;
     } else {
       maxRange = num(weapon.range, 25) + 12;
       // 'both': a jab in close does meleeDmg, anything further is the ranged shot.
-      if (attack === 'both' && dist <= MELEE_HIT_RANGE) maxDmg = num(weapon.meleeDmg, maxDmg);
+      if (attack === 'both' && dist <= MELEE_HIT_RANGE) maxDmg = num(weapon.meleeDmg, maxDmg) * meleeMult;
     }
     if (dist > maxRange) return;
 

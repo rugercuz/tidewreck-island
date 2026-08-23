@@ -10,6 +10,10 @@ import {
   MUTATIONS,
   ECON,
   WEATHER,
+  LOOT_TYPES,
+  LOOT_TABLES,
+  FOUND_BAITS,
+  UNIQUE_CHARMS,
   shopById,
   fishValue,
 } from '../shared/constants.js';
@@ -81,26 +85,46 @@ export function weatherDef(weather) {
 
 // ---------------- Bait / luck ----------------
 
+/** Found-only baits (chest loot) keyed by id — they are NOT in SHOP. */
+const FOUND_BAIT_BY_ID = new Map(
+  (Array.isArray(FOUND_BAITS) ? FOUND_BAITS : [])
+    .filter(b => b && typeof b.id === 'string')
+    .map(b => [b.id, b]),
+);
+
 /**
- * Normalize whatever the caller passes (bait id string, SHOP def, or null)
- * into a bait SHOP definition, or null when there is no bait on the hook.
+ * Definition for any bait id the player can actually own: the shop stock
+ * first, then the found-only baits that only ever drop out of chests.
+ * Returns null for anything else (including prototype keys off the wire).
+ */
+export function baitDef(id) {
+  if (typeof id !== 'string') return null;
+  const shop = shopById(id);
+  if (shop && shop.kind === 'bait') return shop;
+  return FOUND_BAIT_BY_ID.get(id) || null;
+}
+
+/**
+ * Normalize whatever the caller passes (bait id string, SHOP/FOUND_BAITS def,
+ * or null) into a bait definition, or null when there is no bait on the hook.
  */
 export function resolveBait(bait) {
   if (!bait) return null;
-  if (typeof bait === 'string') {
-    const def = shopById(bait);
-    return def && def.kind === 'bait' ? def : null;
+  if (typeof bait === 'string') return baitDef(bait);
+  if (typeof bait === 'object') {
+    if (bait.kind === 'bait') return bait;
+    if (typeof bait.id === 'string' && FOUND_BAIT_BY_ID.has(bait.id)) return bait;
   }
-  if (typeof bait === 'object' && bait.kind === 'bait') return bait;
   return null;
 }
 
 /**
  * Total luck for a cast. Charms and the active bait stack MULTIPLICATIVELY
  * (per the SHOP comment in shared/constants.js): total = PROD(1 + luck_i) - 1.
+ * A unique charm's `luckAdd` is added flat on top of that.
  * Returns 0 when the player owns nothing lucky.
  */
-export function computeLuck(gear, bait) {
+export function computeLuck(gear, bait, uniques) {
   let mult = 1;
   const charms = gear && Array.isArray(gear.charms) ? gear.charms : [];
   for (const id of charms) {
@@ -109,7 +133,7 @@ export function computeLuck(gear, bait) {
   }
   const b = resolveBait(bait);
   if (b && Number.isFinite(b.luck)) mult *= (1 + b.luck);
-  return Math.max(0, mult - 1);
+  return Math.max(0, mult - 1 + uniqueEffects(uniques).luckAdd);
 }
 
 /** True when this bait is the mutation-doubling Voidbait. */
@@ -118,14 +142,152 @@ export function isVoidbait(bait) {
   return !!b && b.id === 'voidbait';
 }
 
+// ---------------- Unique charms (one of each per run) ----------------
+
+/** Every unique-charm effect at its no-op value. */
+function neutralEffects() {
+  return { airMult: 1, biteSpeed: 1, meleeMult: 1, luckAdd: 0, sellMult: 1 };
+}
+
+/** UNIQUE_CHARMS entry for an id, own-property only (never a prototype key). */
+export function uniqueCharmDef(id) {
+  if (typeof id !== 'string') return null;
+  return Object.prototype.hasOwnProperty.call(UNIQUE_CHARMS, id) ? UNIQUE_CHARMS[id] : null;
+}
+
+/**
+ * Compose everything a player's claimed unique charms do into one bundle:
+ * { airMult, biteSpeed, meleeMult, luckAdd, sellMult }. Multipliers multiply,
+ * addends add. Accepts an id array, a single id, or an already-composed
+ * bundle (so callers can pass whichever they have to hand). Unknown ids and
+ * malformed values are ignored — the result is always finite and sane.
+ */
+export function uniqueEffects(uniques) {
+  const out = neutralEffects();
+  if (!uniques) return out;
+
+  if (typeof uniques === 'object' && !Array.isArray(uniques)) {
+    for (const key of Object.keys(out)) {
+      const v = uniques[key];
+      if (Number.isFinite(v)) out[key] = v;
+    }
+    return out;
+  }
+
+  const list = typeof uniques === 'string' ? [uniques] : uniques;
+  if (!Array.isArray(list)) return out;
+  for (const id of list) {
+    const def = uniqueCharmDef(id);
+    if (!def) continue;
+    const effect = typeof def.effect === 'string' ? def.effect : '';
+    if (effect === 'luckAdd') {
+      out.luckAdd += Math.max(0, num(def.add, 0));
+    } else if (Object.prototype.hasOwnProperty.call(out, effect)) {
+      out[effect] *= clamp(num(def.mult, 1), 0.1, 10);
+    }
+  }
+  return out;
+}
+
+// ---------------- Underwater loot ----------------
+
+/** The LOOT_TABLES spawn table for an area id, or null when it has none. */
+export function lootTableFor(areaId) {
+  if (typeof areaId !== 'string') return null;
+  if (!Object.prototype.hasOwnProperty.call(LOOT_TABLES, areaId)) return null;
+  const table = LOOT_TABLES[areaId];
+  return Array.isArray(table) && table.length ? table : null;
+}
+
+/** LOOT_TYPES entry for a node type id, own-property only. */
+export function lootTypeDef(id) {
+  if (typeof id !== 'string') return null;
+  return Object.prototype.hasOwnProperty.call(LOOT_TYPES, id) ? LOOT_TYPES[id] : null;
+}
+
+/**
+ * Roll one treasure node for an area: weighted pick over its LOOT_TABLES rows
+ * plus the money it is worth. Returns null for an area with no table.
+ */
+export function rollLootDrop(areaId) {
+  const table = lootTableFor(areaId);
+  if (!table) return null;
+
+  let total = 0;
+  for (const row of table) total += Math.max(0, num(row && row.weight, 0));
+
+  let entry = table[table.length - 1];
+  if (total > 0) {
+    let r = Math.random() * total;
+    for (const row of table) {
+      r -= Math.max(0, num(row && row.weight, 0));
+      if (r <= 0) { entry = row; break; }
+    }
+  }
+  if (!entry || typeof entry.id !== 'string') return null;
+
+  const def = lootTypeDef(entry.id);
+  const lo = num(entry.value && entry.value[0], 10);
+  const hi = Math.max(lo, num(entry.value && entry.value[1], lo));
+  return {
+    type: entry.id,
+    name: def ? def.name : entry.id,
+    model: def ? def.model : entry.id,
+    desc: def ? def.desc : '',
+    value: Math.max(1, Math.round(lo + Math.random() * (hi - lo))),
+  };
+}
+
+/** A found-only bait stack out of a chest: { id, name, pack, def }. */
+export function rollFoundBait() {
+  const list = Array.isArray(FOUND_BAITS)
+    ? FOUND_BAITS.filter(b => b && typeof b.id === 'string')
+    : [];
+  if (!list.length) return null;
+  const b = list[Math.floor(Math.random() * list.length) % list.length];
+  return {
+    id: b.id,
+    name: typeof b.name === 'string' ? b.name : b.id,
+    pack: Math.max(1, Math.floor(num(b.pack, 4))),
+    def: b,
+  };
+}
+
+/** Membership test that works for a Set, Map, array or plain object. */
+function isClaimed(claimed, id) {
+  if (!claimed) return false;
+  if (typeof claimed.has === 'function') return !!claimed.has(id);
+  if (Array.isArray(claimed)) return claimed.indexOf(id) !== -1;
+  if (typeof claimed === 'object') return !!Object.prototype.hasOwnProperty.call(claimed, id);
+  return false;
+}
+
+/** Unique charms this area can still hand out, given what is already claimed. */
+export function unclaimedUniquesFor(areaId, claimed) {
+  if (typeof areaId !== 'string') return [];
+  return Object.keys(UNIQUE_CHARMS).filter((id) => {
+    if (isClaimed(claimed, id)) return false;
+    const areas = UNIQUE_CHARMS[id].areas;
+    return Array.isArray(areas) && areas.indexOf(areaId) !== -1;
+  });
+}
+
+/** Pick one unclaimed unique charm for this area, or null when none is left. */
+export function rollUniqueCharm(areaId, claimed) {
+  const pool = unclaimedUniquesFor(areaId, claimed);
+  if (!pool.length) return null;
+  return pool[Math.floor(Math.random() * pool.length) % pool.length];
+}
+
 // ---------------- Bite timing ----------------
 
 /**
  * Seconds to wait between CAST_START and BITE. Baseline is the 2-6 s band
  * from the design doc; better rods and greedier baits pull it tighter, and
  * the weather's biteSpeed divides the whole window (storms bite fast).
+ * A unique charm's biteSpeed multiplies the weather's on top of that.
  */
-export function rollBiteDelay(gear, bait, weather) {
+export function rollBiteDelay(gear, bait, weather, uniques) {
   const rod = clamp(Math.floor(num(gear && gear.rod, 1)), 1, 5);
   const b = resolveBait(bait);
   const bias = b ? num(b.tierBias, 0) : 0;
@@ -136,7 +298,8 @@ export function rollBiteDelay(gear, bait, weather) {
   hi = Math.max(lo + 0.9, hi);
 
   const wdef = weatherDef(weather);
-  const speed = clamp(wdef ? num(wdef.biteSpeed, 1) : 1, 0.25, 4);
+  const weatherSpeed = wdef ? num(wdef.biteSpeed, 1) : 1;
+  const speed = clamp(weatherSpeed * uniqueEffects(uniques).biteSpeed, 0.25, 6);
 
   return roundTo(Math.max(0.5, (lo + Math.random() * (hi - lo)) / speed), 2);
 }

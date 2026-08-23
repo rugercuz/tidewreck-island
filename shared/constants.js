@@ -28,6 +28,8 @@ export const MSG = {
   ENTER_PORTAL: 'enterPortal',    // {}
   CHAT: 'chat',                   // {text}
   BONK_FISH: 'bonkFish',          // {flopperId, dmg} whack your landed catch to finish it
+  PICKUP_FLOPPER: 'pickupFlopper',// {flopperId} grab your killed catch off the deck
+  PICKUP_LOOT: 'pickupLoot',      // {lootId} grab an underwater treasure you are next to
 
   // server -> client
   ROOM_STATE: 'roomState',        // full lobby state {code, name, players:[], hostId, settings, started}
@@ -55,8 +57,54 @@ export const MSG = {
   PORTAL_STATE: 'portalState',    // {built, canBuild, missing:[artifactIds]}
   CHAT_MSG: 'chatMsg',            // {fromName, text}
   WEATHER: 'weather',             // {type, until} weather changed (also included in WORLD_STATE)
-  FLOPPER: 'flopper',             // {state:'spawn'|'hit'|'dead'|'escaped', flopperId, fish?, hp?, maxHp?}
+  FLOPPER: 'flopper',             // {state:'spawn'|'hit'|'dead'|'stowed'|'escaped', flopperId, fish?, hp?, maxHp?}
+                                  // 'dead' = killed, now a glowing pickup; 'stowed' = banked to inventory
   LIGHTNING: 'lightning',         // {p:[x,y,z], targetId|null} a strike lands (storm hazard)
+  LOOT_STATE: 'lootState',        // {areaId, list:[{id, type, p:[x,z]}]} live treasure nodes for your area
+  LOOT_RESULT: 'lootResult',      // {ok, lootId, name, kind, value?, itemId?, uniqueId?, message}
+};
+
+// ---------------- Underwater loot (dive to find it) ----------------
+// Nodes spawn on the seabed inside fishing areas. Swim down, get close, press E.
+// The client snaps node meshes to its seabed; the server tracks XZ + ownership.
+export const LOOT_TYPES = {
+  clam:    { name: 'Pearl Clam',          model: 'clam',   desc: 'Pry it open for the pearl.' },
+  coins:   { name: 'Coin Stash',          model: 'coins',  desc: 'Someone else\'s bad day.' },
+  bottle:  { name: 'Message in a Bottle', model: 'bottle', desc: 'Soggy treasure map? Cash it in.' },
+  chest:   { name: 'Sunken Chest',        model: 'chest',  desc: 'Latched but not locked. Could hold anything.' },
+  relic:   { name: 'Ancient Relic',       model: 'relic',  desc: 'Older than the island. Collectors pay well.' },
+  geode:   { name: 'Abyssal Geode',       model: 'geode',  desc: 'It glows from the inside.' },
+};
+// Per-area spawn tables: weight = relative spawn odds, value = [min,max] money.
+// Chests roll money AND can contain a found-only bait stack or a unique charm.
+export const LOOT_TABLES = {
+  shallows:  [ { id: 'clam', weight: 60, value: [40, 90] },    { id: 'bottle', weight: 30, value: [30, 80] },   { id: 'coins', weight: 10, value: [60, 120] } ],
+  reef:      [ { id: 'clam', weight: 45, value: [60, 140] },   { id: 'coins', weight: 30, value: [90, 180] },   { id: 'chest', weight: 15, value: [150, 300] }, { id: 'bottle', weight: 10, value: [50, 110] } ],
+  kelp:      [ { id: 'coins', weight: 40, value: [140, 260] }, { id: 'clam', weight: 25, value: [90, 190] },    { id: 'chest', weight: 20, value: [250, 450] }, { id: 'relic', weight: 15, value: [400, 700] } ],
+  openocean: [ { id: 'coins', weight: 35, value: [220, 420] }, { id: 'chest', weight: 30, value: [400, 750] },  { id: 'relic', weight: 25, value: [600, 1100] }, { id: 'clam', weight: 10, value: [150, 300] } ],
+  trench:    [ { id: 'chest', weight: 35, value: [800, 1500] },{ id: 'relic', weight: 30, value: [1100, 2000] },{ id: 'geode', weight: 20, value: [1600, 2800] }, { id: 'coins', weight: 15, value: [450, 800] } ],
+  abyss:     [ { id: 'geode', weight: 35, value: [3000, 5500] },{ id: 'chest', weight: 30, value: [1800, 3200] },{ id: 'relic', weight: 25, value: [2200, 4000] }, { id: 'coins', weight: 10, value: [900, 1500] } ],
+};
+export const LOOT_RULES = {
+  NODES_PER_AREA: 5,           // live nodes maintained per area
+  RESPAWN_SECONDS: 150,        // a taken node regrows elsewhere in the area after this
+  PICKUP_RANGE: 4,             // horizontal metres; must also be near the seabed
+  CHEST_BAIT_CHANCE: 0.35,     // chest bonus roll: found-only bait stack
+  CHEST_UNIQUE_CHANCE: 0.15,   // chest bonus roll: an unclaimed unique charm (deep areas only)
+};
+// Found-only baits (never sold in the shop) - come from chests.
+export const FOUND_BAITS = [
+  { id: 'glowgrub',   name: 'Glow Grub',   pack: 6, tierBias: 1.2, luck: 0.25, desc: 'Wriggles with its own light. Fish stare.' },
+  { id: 'abyssleech', name: 'Abyss Leech', pack: 4, tierBias: 2.5, luck: 0.4,  desc: 'It found YOU. Monsters cannot resist it.' },
+];
+// Unique charms: ONE of each exists per run - first crew member to open the
+// right chest claims it. Server applies the effect for that player.
+export const UNIQUE_CHARMS = {
+  pearlheart:   { name: 'Pearl of the Deep', effect: 'airMult',    mult: 1.6,  areas: ['openocean', 'trench', 'abyss'], desc: 'Your lungs forget to burn. +60% air.' },
+  sirenlocket:  { name: "Siren's Locket",    effect: 'biteSpeed',  mult: 1.35, areas: ['kelp', 'openocean', 'trench', 'abyss'], desc: 'Fish come when it hums. Bites 35% faster.' },
+  barnacleidol: { name: 'Barnacle Idol',     effect: 'meleeMult',  mult: 1.5,  areas: ['reef', 'kelp', 'openocean', 'trench'], desc: 'Your arms remember older tides. +50% melee damage.' },
+  drownedcrown: { name: 'Drowned Crown',     effect: 'luckAdd',    add: 0.75,  areas: ['trench', 'abyss'], desc: 'Royalty of the deep. +75% luck.' },
+  tidalbell:    { name: 'Tidal Bell',        effect: 'sellMult',   mult: 1.15, areas: ['openocean', 'trench', 'abyss'], desc: 'Merchants hear it and pay 15% more.' },
 };
 
 // ---------------- Weather ----------------
@@ -189,11 +237,11 @@ export const ARTIFACTS = {
 // unlock: gear requirements. tiers: [min,max] catchable there. depth: seabed depth (m).
 export const AREAS = [
   { id: 'shallows', name: 'Home Shallows',  center: [0, -140],    radius: 90,  tiers: [1, 2],  depth: 8,   unlock: {},                              enemies: [] },
-  { id: 'reef',     name: 'Coral Reef',     center: [220, -80],   radius: 80,  tiers: [2, 4],  depth: 14,  unlock: { rod: 2 },                      enemies: [] },
-  { id: 'kelp',     name: 'Kelp Forest',    center: [-240, -160], radius: 90,  tiers: [3, 5],  depth: 22,  unlock: { rod: 2, boat: 2 },             enemies: ['barracudaPack'] },
-  { id: 'openocean',name: 'Open Ocean',     center: [80, -420],   radius: 130, tiers: [4, 6],  depth: 45,  unlock: { rod: 3, boat: 2 },             enemies: ['reefshark'] },
-  { id: 'trench',   name: 'Midnight Trench',center: [-320, -480], radius: 110, tiers: [6, 8],  depth: 120, unlock: { rod: 4, boat: 3 },             enemies: ['reefshark', 'abyssstalker'] },
-  { id: 'abyss',    name: 'The Abyss',      center: [120, -780],  radius: 150, tiers: [8, 11], depth: 400, unlock: { rod: 5, boat: 4 },             enemies: ['abyssstalker'] },
+  { id: 'reef',     name: 'Coral Reef',     center: [220, -80],   radius: 80,  tiers: [2, 4],  depth: 14,  unlock: { rod: 2 },                      enemies: ['daggerjelly'] },
+  { id: 'kelp',     name: 'Kelp Forest',    center: [-240, -160], radius: 90,  tiers: [3, 5],  depth: 22,  unlock: { rod: 2, boat: 2 },             enemies: ['barracudaPack', 'daggerjelly'] },
+  { id: 'openocean',name: 'Open Ocean',     center: [80, -420],   radius: 130, tiers: [4, 6],  depth: 45,  unlock: { rod: 3, boat: 2 },             enemies: ['reefshark', 'moray'] },
+  { id: 'trench',   name: 'Midnight Trench',center: [-320, -480], radius: 110, tiers: [6, 8],  depth: 120, unlock: { rod: 4, boat: 3 },             enemies: ['reefshark', 'abyssstalker', 'moray'] },
+  { id: 'abyss',    name: 'The Abyss',      center: [120, -780],  radius: 150, tiers: [8, 11], depth: 400, unlock: { rod: 5, boat: 4 },             enemies: ['abyssstalker', 'depthmaw'] },
 ];
 
 // ---------------- Shop ----------------
@@ -264,10 +312,16 @@ export const EVENTS = {
 };
 
 // ---------------- Enemies ----------------
+// behavior: 'patrol' (default - wander then chase), 'drift' (slow float,
+// stings on contact, mid-water), 'ambush' (lurks motionless near seabed loot,
+// explosive lunge when a diver comes close - guards treasure).
 export const ENEMIES = {
-  barracudaPack: { name: 'Barracuda',      hp: 40,  dmg: 6,  speed: 7,  aggroRange: 18, size: 1.3, count: 3 },
-  reefshark:     { name: 'Reef Shark',     hp: 120, dmg: 14, speed: 9,  aggroRange: 25, size: 2.2, count: 1 },
-  abyssstalker:  { name: 'Abyss Stalker',  hp: 260, dmg: 25, speed: 11, aggroRange: 35, size: 3.0, count: 1 },
+  barracudaPack: { name: 'Barracuda',      hp: 40,  dmg: 6,  speed: 7,   aggroRange: 18, size: 1.3, count: 3, behavior: 'patrol' },
+  reefshark:     { name: 'Reef Shark',     hp: 120, dmg: 14, speed: 9,   aggroRange: 25, size: 2.2, count: 1, behavior: 'patrol' },
+  abyssstalker:  { name: 'Abyss Stalker',  hp: 260, dmg: 25, speed: 11,  aggroRange: 35, size: 3.0, count: 1, behavior: 'patrol' },
+  daggerjelly:   { name: 'Dagger Jelly',   hp: 30,  dmg: 9,  speed: 2.2, aggroRange: 9,  size: 0.9, count: 4, behavior: 'drift' },
+  moray:         { name: 'Moray Ambusher', hp: 180, dmg: 20, speed: 13,  aggroRange: 12, size: 2.4, count: 2, behavior: 'ambush' },
+  depthmaw:      { name: 'Depthmaw',       hp: 420, dmg: 34, speed: 11,  aggroRange: 16, size: 3.6, count: 1, behavior: 'ambush' },
 };
 
 export const PLAYER_MAX_HP = 100;
