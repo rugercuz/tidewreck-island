@@ -171,10 +171,6 @@ export class RoomManager {
       socket.emit(MSG.ERROR_MSG, { message: `No island found with code ${code}.` });
       return;
     }
-    if (room.started) {
-      socket.emit(MSG.ERROR_MSG, { message: 'That run is already underway.' });
-      return;
-    }
     if (room.members.size >= room.settings.maxPlayers) {
       socket.emit(MSG.ERROR_MSG, { message: 'That island is full.' });
       return;
@@ -182,7 +178,30 @@ export class RoomManager {
     if (this.socketRoom.has(socket.id)) this.leaveRoom(socket, true);
 
     const name = sanitizeName(data.playerName);
-    this.addMember(room, socket, name, sanitizeColor(data.color));
+    const member = this.addMember(room, socket, name, sanitizeColor(data.color));
+
+    // Late join / rejoin: drop straight into the run that is already underway.
+    // A player who refreshed or lost connection gets their gear back (matched by name).
+    if (room.started && room.game) {
+      const game = room.game;
+      const player = game.addPlayer({ id: member.id, name: member.name, color: member.color });
+      const restored = game.restoreDeparted(player);
+      const state = game.worldStatePayload();
+      socket.emit(MSG.GAME_START, {
+        world: { seed: room.seed, code: room.code, difficulty: room.settings.difficulty },
+        you: { id: member.id, name: member.name, color: member.color },
+        state,
+      });
+      game.syncNewcomer(player);
+      this.io.to(room.code).emit(MSG.CHAT_MSG, {
+        fromName: 'ISLAND',
+        text: restored ? `${name} is back on the island.` : `${name} washed ashore and joined the crew.`,
+      });
+      this.broadcastRoomState(room);
+      console.log(`[room] ${room.code} late join: ${name}${restored ? ' (restored)' : ''}`);
+      return;
+    }
+
     this.io.to(room.code).emit(MSG.CHAT_MSG, { fromName: 'ISLAND', text: `${name} joined.` });
     this.broadcastRoomState(room);
   }
@@ -198,9 +217,11 @@ export class RoomManager {
         if (!taken.has(cand)) { c = cand; break; }
       }
     }
-    room.members.set(socket.id, { id: socket.id, name, color: c, ready: false, lastChat: 0 });
+    const member = { id: socket.id, name, color: c, ready: false, lastChat: 0 };
+    room.members.set(socket.id, member);
     this.socketRoom.set(socket.id, room.code);
     socket.join(room.code);
+    return member;
   }
 
   setReady(socket, data) {

@@ -53,6 +53,7 @@ const QUOTA_BONUS_FRACTION = 0.1;
 const DIFFICULTY_MULT = { chill: 0.7, normal: 1, hard: 1.4 };
 const START_TIME_OF_DAY = 0.28;   // just after sunrise
 const DOCK_SPAWN = [0, 1.2, -126];
+const DEPARTED_TTL_S = 15 * 60;   // rejoin within 15 min keeps your gear
 
 const ARTIFACT_IDS = Object.keys(ARTIFACTS);
 const AREA_BY_ID = new Map(AREAS.map(a => [a.id, a]));
@@ -124,6 +125,8 @@ export class Game {
 
     // --- players ------------------------------------------------------
     this.players = new Map();
+    // name -> {gear, baits, inventory, stats, at} for players who dropped mid-run
+    this.departed = new Map();
     for (const m of members || []) this.addPlayer(m);
 
     // --- team boat ----------------------------------------------------
@@ -222,6 +225,9 @@ export class Game {
     if (!p) return;
     this.players.delete(id);
     this.moveDirty.delete(id);
+    this.departed.set(p.name, {
+      gear: p.gear, baits: p.baits, inventory: p.inventory, stats: p.stats, at: nowSeconds(),
+    });
 
     let seatChanged = false;
     for (let i = 0; i < BOAT_SEATS; i++) {
@@ -233,6 +239,26 @@ export class Game {
     this.broadcastWorldState();
 
     if (this.players.size === 0) this.stop('empty');
+  }
+
+  /** Give a rejoining player (matched by name, within DEPARTED_TTL_S) their stuff back. */
+  restoreDeparted(p) {
+    const d = this.departed.get(p.name);
+    if (!d) return false;
+    this.departed.delete(p.name);
+    if (nowSeconds() - d.at > DEPARTED_TTL_S) return false;
+    p.gear = d.gear;
+    p.baits = d.baits;
+    p.inventory = d.inventory;
+    p.stats = d.stats;
+    return true;
+  }
+
+  /** Everything a late joiner needs beyond GAME_START: bag, baits, gear, boat seats. */
+  syncNewcomer(p) {
+    this.sendInventory(p);
+    this.send(p.id, MSG.BOAT_STATE, this.boatStatePayload());
+    this.broadcastWorldState();   // carries everyone's gear, incl. the newcomer's restored kit
   }
 
   gearPayload(p) {
