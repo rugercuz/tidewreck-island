@@ -16,6 +16,7 @@ A co-op 3D multiplayer fishing party game for 2–8 friends. Built with Three.js
 - ⚔️ **Enemies & weapons**: barracuda packs, reef sharks, abyss stalkers — fight back with harpoon, speargun, or Storm Trident
 - 🎵 **Fully synthesized soundtrack & SFX** via WebAudio — zero audio files
 - 🏠 **Rooms**: create an island with a 4-letter code, set max players and difficulty, and share it with friends
+- 🔁 **Rejoin-safe**: refreshed the page or dropped connection? Join again with the same name and code — you land back in the run with your gear, baits, and catch bag (kept for 15 min)
 
 ## Run locally
 
