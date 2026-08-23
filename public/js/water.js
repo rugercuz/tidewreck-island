@@ -6,7 +6,7 @@
 // =============================================================
 
 import * as THREE from 'three';
-import { AREAS } from '/shared/constants.js';
+import { AREAS, MSG, WEATHER } from '/shared/constants.js';
 
 // -------------------------------------------------------------
 // Wave definitions — SINGLE source of truth. These exact numbers
@@ -79,6 +79,28 @@ const EVENT_TINT = {
   kraken: [0.92, 0.60, 1.22],
   bloop: [1.30, 0.48, 0.46],
 };
+
+// -------------------------------------------------------------
+// Weather surface treatment. The wave AMPLITUDE comes from
+// WEATHER[type].waveScale in shared/constants.js (single source of
+// truth, lerped over ~8 s and fed to the shader AND the CPU sampler).
+// These extras are pure look:
+//   tint  : multiplied into the body colours (storm darkens)
+//   pale  : mix toward flat milky grey (dead fog)
+//   foam  : crest foam multiplier
+//   spark : specular sparkle multiplier
+//   sky   : reflected sky/horizon brightness (matches world.js darkening)
+//   sun   : sun/moon glitter strength
+// -------------------------------------------------------------
+const WEATHER_WATER = {
+  clear:    { tint: [1.00, 1.00, 1.00], pale: 0.00, foam: 1.00, spark: 1.00, sky: 1.00, sun: 1.00 },
+  overcast: { tint: [0.90, 0.94, 0.99], pale: 0.12, foam: 1.15, spark: 0.78, sky: 0.74, sun: 0.62 },
+  fog:      { tint: [0.88, 0.93, 0.96], pale: 0.46, foam: 0.70, spark: 0.42, sky: 0.86, sun: 0.50 },
+  rain:     { tint: [0.80, 0.87, 0.95], pale: 0.08, foam: 1.40, spark: 0.62, sky: 0.52, sun: 0.42 },
+  storm:    { tint: [0.60, 0.68, 0.80], pale: 0.00, foam: 1.85, spark: 1.35, sky: 0.30, sun: 0.28 },
+};
+const WEATHER_PALE = [0.34, 0.375, 0.395]; // milky grey the fog mixes toward
+const WEATHER_LERP_SECONDS = 8;            // waveScale / look crossfade
 
 // -------------------------------------------------------------
 // small math helpers (JS mirrors of the GLSL builtins used)
@@ -322,6 +344,8 @@ uniform float uSunStrength;
 uniform float uMaxAmp;
 uniform float uUnderwater;
 uniform float uNight;
+uniform float uFoamBoost;
+uniform float uSparkBoost;
 
 varying vec3 vWorldPos;
 varying vec2 vGrid;
@@ -427,12 +451,12 @@ void main() {
   float band = 0.5 + 0.5 * sin(depth * 4.6 - uTime * 1.55 + vnoise(vGrid * 0.55) * 5.0);
   float shoreFoam = shoreT * shoreT * (0.28 + 0.72 * band);
 
-  float foam = clamp(crest * 0.85 + shoreFoam * 0.9, 0.0, 1.0);
+  float foam = clamp(crest * 0.85 * uFoamBoost + shoreFoam * 0.9, 0.0, 1.0);
 
   float sparkFade = 1.0 - smoothstep(24.0, 200.0, distCam);
   float sw = sin(vGrid.x * 2.71 + uTime * 1.7) * sin(vGrid.y * 3.13 - uTime * 1.31)
            * sin((vGrid.x + vGrid.y) * 1.91 + uTime * 2.27);
-  float sparkle = pow(max(sw, 0.0), 9.0) * sparkFade * (0.35 + 0.65 * sunUp);
+  float sparkle = pow(max(sw, 0.0), 9.0) * sparkFade * (0.35 + 0.65 * sunUp) * uSparkBoost;
 
   col = mix(col, skyCol, fres * 0.94);
   col += uSunColor * spec * uSunStrength;
@@ -522,9 +546,21 @@ export function initWater(ctx) {
   // CPU wave field (must mirror GLSL exactly)
   // ---------------------------------------------------------
   let camX = 0, camZ = 0;
-  let waveScale = 1.0;      // live, smoothed
+  let waveScale = 1.0;      // live, smoothed - used by shader AND CPU sampler
   let waveScaleBase = 1.0;  // authored multiplier (setWaveScale)
   let simTime = 0;
+
+  // ---- weather (see WEATHER / WEATHER_WATER) ----------------
+  let wxType = 'clear';
+  let wxWave = 1.0;         // smoothed WEATHER[type].waveScale
+  const wxTint = [1, 1, 1];
+  let wxPale = 0, wxFoam = 1, wxSpark = 1, wxSky = 1, wxSun = 1;
+
+  function setWeather(type) {
+    if (typeof type !== 'string') return;
+    if (!WEATHER[type] || !WEATHER_WATER[type]) return;
+    wxType = type;
+  }
 
   const areaData = AREAS.map((a) => ({
     x: a.center[0], z: a.center[1], r: Math.max(1, a.radius), d: a.depth,
@@ -708,6 +744,8 @@ export function initWater(ctx) {
       uSunStrength: { value: 1 },
       uUnderwater: { value: 0 },
       uNight: { value: 0 },
+      uFoamBoost: { value: 1 },
+      uSparkBoost: { value: 1 },
     },
   ]);
   // uniform arrays are attached after the merge so we keep live references
@@ -956,9 +994,18 @@ export function initWater(ctx) {
   }
   function onUnderwater(v) { busUnderwater = !!v; }
 
+  function onWeatherMsg(m) { if (m && m.type) setWeather(m.type); }
+  function onWorldState(w) { if (w && w.weather && w.weather.type) setWeather(w.weather.type); }
+  function onPhase(p) { if (p === 'menu' || p === 'lobby') setWeather('clear'); }
+
   if (ctx.bus && typeof ctx.bus.on === 'function') {
     ctx.bus.on('sunDir', onSunDir);
     ctx.bus.on('underwater', onUnderwater);
+    ctx.bus.on('worldState', onWorldState);
+    ctx.bus.on('phase', onPhase);
+  }
+  if (ctx.net && typeof ctx.net.on === 'function') {
+    ctx.net.on(MSG.WEATHER, onWeatherMsg);
   }
 
   // ---------------------------------------------------------
@@ -1008,6 +1055,24 @@ export function initWater(ctx) {
   // event tint, smoothed
   const evtMul = [1, 1, 1];
   const evtTarget = [1, 1, 1];
+
+  // weather grade applied on top of the palette. k scales how much of the
+  // weather look this particular colour takes (1 = full).
+  function wxGradeColor(col, k) {
+    col.setRGB(
+      col.r * lerp(1, wxTint[0], k),
+      col.g * lerp(1, wxTint[1], k),
+      col.b * lerp(1, wxTint[2], k)
+    );
+    const p = wxPale * k;
+    if (p > 0.0005) {
+      col.setRGB(
+        lerp(col.r, WEATHER_PALE[0], p),
+        lerp(col.g, WEATHER_PALE[1], p),
+        lerp(col.b, WEATHER_PALE[2], p)
+      );
+    }
+  }
 
   // ---------------------------------------------------------
   // splash(pos, size)
@@ -1124,7 +1189,29 @@ export function initWater(ctx) {
     evtMul[1] += (evtTarget[1] - evtMul[1]) * blend;
     evtMul[2] += (evtTarget[2] - evtMul[2]) * blend;
 
-    const targetScale = (evt ? 1.45 : 1.0) * waveScaleBase;
+    // --- weather ------------------------------------------------
+    // WORLD_STATE is the fallback source; MSG.WEATHER arrives sooner.
+    if (st.world && st.world.weather && st.world.weather.type) setWeather(st.world.weather.type);
+    const wxDef = WEATHER[wxType] || WEATHER.clear;
+    const wxLook = WEATHER_WATER[wxType] || WEATHER_WATER.clear;
+    const wxK = 1 - Math.pow(0.02, step / WEATHER_LERP_SECONDS);
+    const wantWave = (typeof wxDef.waveScale === 'number' && isFinite(wxDef.waveScale))
+      ? wxDef.waveScale : 1;
+    wxWave += (wantWave - wxWave) * wxK;
+    wxTint[0] += (wxLook.tint[0] - wxTint[0]) * wxK;
+    wxTint[1] += (wxLook.tint[1] - wxTint[1]) * wxK;
+    wxTint[2] += (wxLook.tint[2] - wxTint[2]) * wxK;
+    wxPale += (wxLook.pale - wxPale) * wxK;
+    wxFoam += (wxLook.foam - wxFoam) * wxK;
+    wxSpark += (wxLook.spark - wxSpark) * wxK;
+    wxSky += (wxLook.sky - wxSky) * wxK;
+    wxSun += (wxLook.sun - wxSun) * wxK;
+    uniforms.uFoamBoost.value = wxFoam;
+    uniforms.uSparkBoost.value = wxSpark;
+
+    // waveScale is the ONE number the vertex shader and ctx.getWaterHeight
+    // both read - they are assigned from it together, right here.
+    const targetScale = (evt ? 1.45 : 1.0) * waveScaleBase * wxWave;
     waveScale += (targetScale - waveScale) * (1 - Math.pow(0.25, step));
     uniforms.uWaveScale.value = waveScale;
     uniforms.uMaxAmp.value = maxAmp * waveScale;
@@ -1144,7 +1231,7 @@ export function initWater(ctx) {
     evalPalette(tod);
     const nightF = clamp01(1 - smoothstep(-0.08, 0.16, sunDir.y));
     uniforms.uNight.value = nightF;
-    uniforms.uSunStrength.value = sunStrength;
+    uniforms.uSunStrength.value = sunStrength * wxSun;
 
     uniforms.uDeepColor.value.setRGB(
       _cDeep.r * evtMul[0], _cDeep.g * evtMul[1], _cDeep.b * evtMul[2]);
@@ -1156,6 +1243,15 @@ export function initWater(ctx) {
     uniforms.uHorizonColor.value.copy(_cHor);
     uniforms.uSunColor.value.copy(_cSun);
     uniforms.uFoamColor.value.copy(_cFoam);
+
+    // weather grade: storm darkens the body, dead fog pales and flattens it
+    wxGradeColor(uniforms.uDeepColor.value, 1.0);
+    wxGradeColor(uniforms.uShallowColor.value, 0.85);
+    wxGradeColor(uniforms.uSssColor.value, 0.7);
+    wxGradeColor(uniforms.uHorizonColor.value, 0.45);
+    wxGradeColor(uniforms.uSkyColor.value, 0.55);
+    uniforms.uHorizonColor.value.multiplyScalar(wxSky);
+    uniforms.uSkyColor.value.multiplyScalar(wxSky);
 
     uniforms.uTime.value = simTime;
 
@@ -1362,6 +1458,11 @@ export function initWater(ctx) {
       if (ctx.bus && typeof ctx.bus.off === 'function') {
         ctx.bus.off('sunDir', onSunDir);
         ctx.bus.off('underwater', onUnderwater);
+        ctx.bus.off('worldState', onWorldState);
+        ctx.bus.off('phase', onPhase);
+      }
+      if (ctx.net && typeof ctx.net.off === 'function') {
+        ctx.net.off(MSG.WEATHER, onWeatherMsg);
       }
       scene.remove(waterMesh);
       scene.remove(overlay);

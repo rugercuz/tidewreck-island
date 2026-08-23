@@ -1415,6 +1415,268 @@ kbd.wide { min-width: 54px; }
 .screen-end .btn-big { margin-top: 10px; }
 
 /* =================================================================
+   WEATHER — top-bar chip, one look per sky
+   ================================================================= */
+.weather-chip {
+  --wx: var(--foam);
+  --wx-glow: rgba(142, 230, 242, 0.35);
+  display: flex; align-items: center; gap: 8px;
+  padding: 5px 13px 5px 8px;
+  border-radius: 999px;
+  color: var(--wx);
+  background: rgba(2, 16, 27, 0.55);
+  border: 1.5px solid var(--stroke);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.07);
+  transition: background 700ms ease, border-color 700ms ease, box-shadow 700ms ease, color 700ms ease;
+  white-space: nowrap;
+}
+.wx-ico { width: 27px; height: 27px; display: block; flex: none; filter: drop-shadow(0 0 8px var(--wx-glow)); }
+.wx-svg { width: 100%; height: 100%; display: block; }
+.wx-txt { display: flex; flex-direction: column; line-height: 1.05; }
+.wx-txt b { font-size: 12.5px; font-weight: 900; letter-spacing: 0.08em; color: var(--wx); }
+.wx-txt i {
+  font-style: normal; font-size: 9px; letter-spacing: 0.11em; text-transform: uppercase;
+  color: var(--text-faint); font-weight: 800; margin-top: 2px;
+}
+.weather-chip.wx-pop { animation: wxpop 620ms cubic-bezier(.2, .9, .3, 1.5); }
+@keyframes wxpop {
+  0% { transform: scale(0.9); filter: brightness(1.5); }
+  45% { transform: scale(1.07); }
+  100% { transform: scale(1); }
+}
+
+/* per-type palettes */
+.weather-chip[data-w="clear"] {
+  --wx: #ffd06a; --wx-glow: rgba(255, 200, 90, 0.5);
+  border-color: rgba(255, 202, 74, 0.38);
+  background: linear-gradient(180deg, rgba(255, 202, 74, 0.16), rgba(2, 16, 27, 0.55));
+}
+.weather-chip[data-w="clear"] .wx-rays { transform-origin: 16px 16px; animation: spin 30s linear infinite; }
+
+.weather-chip[data-w="overcast"] {
+  --wx: #a8bbc8; --wx-glow: rgba(168, 187, 200, 0.3);
+  border-color: rgba(168, 187, 200, 0.3);
+  background: linear-gradient(180deg, rgba(150, 170, 185, 0.14), rgba(6, 20, 30, 0.6));
+}
+.wx-drift { animation: wxdrift 9s ease-in-out infinite alternate; }
+@keyframes wxdrift { from { transform: translateX(-1.6px); } to { transform: translateX(2.2px); } }
+
+.weather-chip[data-w="fog"] {
+  --wx: #dce9ef; --wx-glow: rgba(220, 233, 239, 0.42);
+  border-color: rgba(220, 233, 239, 0.3);
+  background: linear-gradient(180deg, rgba(210, 228, 236, 0.17), rgba(16, 30, 38, 0.6));
+  box-shadow: 0 0 22px rgba(200, 222, 232, 0.14) inset;
+}
+.wx-bars { animation: wxbars 5.5s ease-in-out infinite; }
+@keyframes wxbars { 0%, 100% { transform: translateX(-1.8px); opacity: 0.55; } 50% { transform: translateX(1.8px); opacity: 0.95; } }
+
+.weather-chip[data-w="rain"] {
+  --wx: #6fbdf0; --wx-glow: rgba(111, 189, 240, 0.5);
+  border-color: rgba(111, 189, 240, 0.42);
+  background: linear-gradient(180deg, rgba(46, 118, 176, 0.3), rgba(3, 22, 38, 0.7));
+}
+.wx-drops path { animation: wxdrop 0.9s linear infinite; }
+.wx-drops path:nth-child(2) { animation-delay: 0.3s; }
+.wx-drops path:nth-child(3) { animation-delay: 0.6s; }
+@keyframes wxdrop {
+  0% { opacity: 0; transform: translateY(-3px); }
+  30% { opacity: 1; }
+  100% { opacity: 0; transform: translateY(3px); }
+}
+
+.weather-chip[data-w="storm"] {
+  --wx: #ffe14a; --wx-glow: rgba(255, 225, 74, 0.55);
+  border-color: rgba(255, 225, 74, 0.45);
+  background: linear-gradient(180deg, rgba(38, 20, 62, 0.85), rgba(4, 8, 18, 0.9));
+  box-shadow: 0 0 20px rgba(255, 225, 74, 0.16), inset 0 1px 0 rgba(255, 255, 255, 0.07);
+  animation: wxstorm 3.6s ease-in-out infinite;
+}
+.weather-chip[data-w="storm"] .wx-txt i { color: rgba(255, 225, 74, 0.62); }
+@keyframes wxstorm {
+  0%, 100% { box-shadow: 0 0 16px rgba(255, 225, 74, 0.12), inset 0 1px 0 rgba(255, 255, 255, 0.07); }
+  50% { box-shadow: 0 0 30px rgba(255, 225, 74, 0.4), inset 0 1px 0 rgba(255, 255, 255, 0.12); }
+}
+.wx-bolt { animation: wxbolt 4.2s steps(1) infinite; }
+@keyframes wxbolt {
+  0%, 86%, 100% { opacity: 1; }
+  88% { opacity: 0.25; }
+  90% { opacity: 1; }
+  92% { opacity: 0.35; }
+  94% { opacity: 1; }
+}
+
+/* the pop has to outrank the per-type idle animations (storm pulses) */
+.weather-chip[data-w].wx-pop { animation: wxpop 620ms cubic-bezier(.2, .9, .3, 1.5); }
+
+/* weather toast wraps — hazard lines are a full sentence */
+.toast-weather { border-color: var(--stroke-hot); }
+.toast-weather .toast-dot { background: var(--foam); }
+.toast-weather .toast-text { white-space: normal; line-height: 1.35; }
+
+/* =================================================================
+   LANDED CATCH — bonk prompt, hp pips, escape timer
+   ================================================================= */
+.flopper-strip {
+  position: absolute; left: 50%; bottom: 200px; transform: translateX(-50%);
+  display: none; flex-direction: column; align-items: center; gap: 7px;
+  width: min(430px, 46vw);
+  pointer-events: none;
+}
+.flopper-strip.show { display: flex; animation: fadeUp 220ms ease; }
+.flopper-rows { display: flex; flex-direction: column; gap: 7px; width: 100%; }
+
+.flopper {
+  position: relative;
+  display: flex; align-items: center; gap: 10px;
+  padding: 8px 12px 8px 8px;
+  border-radius: var(--r-md);
+  background: var(--panel);
+  border: 1.5px solid rgba(255, 202, 74, 0.4);
+  box-shadow: var(--shadow-md), 0 0 18px rgba(255, 202, 74, 0.14);
+  -webkit-backdrop-filter: var(--blur); backdrop-filter: var(--blur);
+  animation: flIn 260ms cubic-bezier(.2, .9, .3, 1.4);
+  overflow: hidden;
+}
+@keyframes flIn { from { opacity: 0; transform: translateY(10px) scale(0.95); } to { opacity: 1; transform: none; } }
+.fl-icon {
+  width: 40px; height: 40px; flex: none; object-fit: contain; display: block;
+  filter: drop-shadow(0 4px 6px rgba(0, 0, 0, 0.55));
+  animation: flflop 0.42s ease-in-out infinite alternate;
+}
+@keyframes flflop {
+  from { transform: rotate(-13deg) translateY(1px); }
+  to { transform: rotate(14deg) translateY(-3px); }
+}
+.fl-icon-blank {
+  border-radius: 50%;
+  background: radial-gradient(circle at 36% 32%, rgba(255, 255, 255, 0.35), rgba(0, 0, 0, 0) 55%), var(--sea-lite);
+  box-shadow: inset 0 -3px 8px rgba(0, 0, 0, 0.4);
+}
+.fl-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 5px; }
+.fl-top { display: flex; align-items: center; gap: 10px; }
+.fl-name {
+  min-width: 0; flex: 1;
+  font-size: 13px; font-weight: 900; letter-spacing: 0.03em;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.fl-pips { margin-left: auto; display: flex; gap: 3px; flex: none; }
+.fl-pip {
+  width: 9px; height: 9px; border-radius: 3px;
+  background: linear-gradient(180deg, #ff8f7d, var(--coral));
+  box-shadow: 0 0 7px rgba(232, 96, 79, 0.6);
+  transition: background 140ms ease, box-shadow 140ms ease, transform 140ms ease;
+}
+.fl-pip.is-out { background: rgba(255, 255, 255, 0.13); box-shadow: none; transform: scaleY(0.55); }
+
+.fl-timer {
+  position: relative; height: 9px; border-radius: 999px; overflow: hidden;
+  background: rgba(2, 12, 22, 0.78);
+  box-shadow: inset 0 2px 5px rgba(0, 0, 0, 0.6);
+}
+.fl-timer-fill {
+  position: absolute; left: 0; top: 0; bottom: 0; width: 100%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, #3fb7d8, var(--foam));
+  box-shadow: 0 0 10px rgba(142, 230, 242, 0.45);
+}
+.fl-timer-txt {
+  position: absolute; right: 5px; top: -1px;
+  font-size: 7.5px; font-weight: 900; letter-spacing: 0.08em;
+  color: rgba(255, 255, 255, 0.75); font-variant-numeric: tabular-nums;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.8);
+}
+.flopper.is-warn .fl-timer-fill { background: linear-gradient(90deg, var(--gold), #ffab3a); box-shadow: 0 0 10px rgba(255, 202, 74, 0.5); }
+.flopper.is-crit { border-color: var(--danger); animation: flpanic 340ms ease-in-out infinite alternate; }
+.flopper.is-crit .fl-timer-fill { background: linear-gradient(90deg, #ff7a5c, var(--danger)); box-shadow: 0 0 12px rgba(255, 74, 74, 0.6); }
+.flopper.is-crit .fl-icon { animation-duration: 0.22s; }
+@keyframes flpanic { from { transform: translateX(-2px); } to { transform: translateX(2px); } }
+.flopper.is-hurt .fl-icon { filter: drop-shadow(0 4px 6px rgba(0, 0, 0, 0.55)) brightness(0.82) saturate(0.7); }
+.flopper.is-hit { animation: flhit 200ms ease-out; }
+@keyframes flhit {
+  0% { transform: scale(1.045); filter: brightness(1.7); }
+  100% { transform: scale(1); filter: brightness(1); }
+}
+
+.fl-verdict {
+  position: absolute; inset: 0;
+  display: none; align-items: center; justify-content: center;
+  font-size: 17px; font-weight: 900; letter-spacing: 0.18em;
+}
+.flopper.is-stowed, .flopper.is-lost { animation: flout 900ms ease forwards; }
+.flopper.is-stowed { border-color: var(--lime); }
+.flopper.is-lost { border-color: var(--coral); }
+.flopper.is-stowed .fl-verdict, .flopper.is-lost .fl-verdict { display: flex; }
+.flopper.is-stowed .fl-verdict { color: #0a2416; background: linear-gradient(180deg, #9bf2b4, var(--lime)); }
+.flopper.is-lost .fl-verdict { color: #2a0a08; background: linear-gradient(180deg, #ff9a86, var(--coral)); }
+.flopper.is-stowed .fl-icon, .flopper.is-lost .fl-icon { animation: none; }
+@keyframes flout {
+  0% { opacity: 1; transform: scale(1); }
+  16% { transform: scale(1.04); }
+  72% { opacity: 1; }
+  100% { opacity: 0; transform: scale(0.96) translateY(6px); }
+}
+
+.fl-prompt {
+  display: none; align-items: center; gap: 8px;
+  padding: 7px 15px; border-radius: 999px;
+  background: var(--panel); border: 1.5px solid var(--gold);
+  box-shadow: 0 0 0 2px rgba(255, 202, 74, 0.16), var(--shadow-md);
+  -webkit-backdrop-filter: var(--blur); backdrop-filter: var(--blur);
+  animation: bonkpulse 900ms ease-in-out infinite;
+  white-space: nowrap;
+}
+.flopper-strip.has-live .fl-prompt { display: flex; }
+.fl-prompt b { font-size: 14px; font-weight: 900; letter-spacing: 0.14em; color: var(--gold); }
+.fl-prompt span { font-size: 12px; font-weight: 800; letter-spacing: 0.05em; color: var(--text); }
+.fl-prompt kbd { min-width: 40px; height: 22px; font-size: 11px; }
+.fl-prompt i { font-style: normal; font-size: 10px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--text-faint); font-weight: 800; }
+@keyframes bonkpulse {
+  0%, 100% { box-shadow: 0 0 0 2px rgba(255, 202, 74, 0.14), var(--shadow-md); }
+  50% { box-shadow: 0 0 0 3px rgba(255, 202, 74, 0.3), 0 0 26px rgba(255, 202, 74, 0.4), var(--shadow-md); }
+}
+
+/* three at once still has to read — shrink the stack */
+.flopper-strip.is-crowd .flopper { padding: 6px 10px 6px 6px; }
+.flopper-strip.is-crowd .fl-icon { width: 32px; height: 32px; }
+.flopper-strip.is-crowd .fl-name { font-size: 12px; }
+.flopper-strip.is-crowd .fl-pip { width: 7px; height: 8px; }
+.flopper-strip.is-crowd .flopper-rows { gap: 5px; }
+
+/* =================================================================
+   LIGHTNING STRIKE — you, specifically
+   ================================================================= */
+.lightning-flash {
+  position: absolute; inset: 0; pointer-events: none; opacity: 0;
+  background:
+    radial-gradient(70% 55% at 50% 22%, rgba(255, 255, 255, 1), rgba(226, 242, 255, 0.92) 52%, rgba(158, 204, 255, 0.66) 100%);
+}
+.lightning-flash.strike { animation: zapflash 620ms ease-out; }
+@keyframes zapflash {
+  0% { opacity: 0.98; }
+  8% { opacity: 0.35; }
+  14% { opacity: 0.92; }
+  26% { opacity: 0.18; }
+  34% { opacity: 0.62; }
+  100% { opacity: 0; }
+}
+
+/* attack-type badge on weapon cards */
+.si-att {
+  flex: none;
+  font-size: 9px; font-weight: 900; letter-spacing: 0.13em;
+  padding: 3px 8px; border-radius: 999px;
+  border: 1.5px solid currentColor;
+  line-height: 1;
+  align-self: center;
+}
+.si-att.att-melee { color: #ffb14a; background: rgba(255, 177, 74, 0.14); }
+.si-att.att-ranged { color: #6fd8f0; background: rgba(111, 216, 240, 0.14); }
+.si-att.att-both {
+  color: #ffe14a; background: linear-gradient(90deg, rgba(255, 177, 74, 0.2), rgba(111, 216, 240, 0.2));
+  box-shadow: 0 0 12px rgba(255, 225, 74, 0.25);
+}
+
+/* =================================================================
    RESPONSIVE — comfortable down to 1280x720, usable below
    ================================================================= */
 @media (max-width: 1440px) {
@@ -1430,6 +1692,11 @@ kbd.wide { min-width: 54px; }
 @media (max-width: 900px) {
   .menu-stack { width: 94vw; }
   .menu-actions { grid-template-columns: 1fr; }
+  .weather-chip { padding: 4px 10px 4px 6px; gap: 6px; }
+  .wx-ico { width: 22px; height: 22px; }
+  .wx-txt i { display: none; }
+  .flopper-strip { width: min(340px, 78vw); }
+  .fl-prompt i { display: none; }
   .hud-wallet { padding: 7px 12px; }
   .wallet-num { font-size: 19px; }
   .wallet-label { display: none; }
@@ -1453,6 +1720,7 @@ kbd.wide { min-width: 54px; }
   .hud-prompt { bottom: 118px; }
   .cast-power { bottom: 176px; }
   .reel-widget { bottom: 130px; }
+  .flopper-strip { bottom: 172px; }
 }
 
 /* reduce motion */

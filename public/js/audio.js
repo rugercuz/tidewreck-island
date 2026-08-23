@@ -100,6 +100,12 @@ export function initAudio(ctx) {
   let subGain = null;
   let nextGull = 6, nextCricket = 9;
 
+  // weather bed — rain patter / wind howl / distant rumble, built the first
+  // time the sky actually turns. Rides on ambBus so it survives cutMusic().
+  let wxBuilt = false, wxOut = null, wxRainGain = null, wxRainHP = null, wxRainLP = null;
+  let wxWindGain = null, wxWindFilt = null, wxRumbleGain = null;
+  let wxType = 'clear', wxApplied = '', nextFogTone = 12;
+
   // horror
   let horrorNodes = null;
   let cutAt = 0, horrorAt = 0, resumeAt = 0, eventEndAt = -99;
@@ -310,6 +316,105 @@ export function initAudio(ctx) {
     const sg = gainNode(0.5);
     sub1.connect(sg); sub2.connect(sg); sg.connect(subGain);
     sub1.start(); sub2.start();
+  }
+
+  // ---- weather bed: rain, wind, rumble (lazily built, then permanent) ----
+  // rain/wind/rumble are steady-state gains; the slow gust LFOs modulate a
+  // node *before* the level gain, so a target of 0 is true silence.
+  const WX_BED = {
+    clear:    { rain: 0,    wind: 0,    rumble: 0,    hp: 850, lp: 5200 },
+    overcast: { rain: 0,    wind: 0,    rumble: 0,    hp: 850, lp: 5200 },
+    fog:      { rain: 0,    wind: 0.03, rumble: 0,    hp: 520, lp: 2400 },
+    rain:     { rain: 0.30, wind: 0.05, rumble: 0,    hp: 780, lp: 5400 },
+    storm:    { rain: 0.46, wind: 0.30, rumble: 0.26, hp: 560, lp: 7200 },
+  };
+
+  function buildWeatherBed() {
+    if (wxBuilt || !ac || !built) return;
+    wxBuilt = true;
+    wxOut = gainNode(1);
+    wxOut.connect(ambBus);   // ambBus is ducked (not cut) by cutMusic — rain is diegetic
+
+    // rain: white noise squeezed into a band, with a breathing lowpass
+    const rs = ac.createBufferSource();
+    rs.buffer = whiteBuf; rs.loop = true; rs.playbackRate.value = 0.92;
+    wxRainHP = ac.createBiquadFilter();
+    wxRainHP.type = 'highpass'; wxRainHP.frequency.value = 850; wxRainHP.Q.value = 0.6;
+    wxRainLP = ac.createBiquadFilter();
+    wxRainLP.type = 'lowpass'; wxRainLP.frequency.value = 5200; wxRainLP.Q.value = 0.7;
+    wxRainGain = gainNode(0.0001);
+    rs.connect(wxRainHP); wxRainHP.connect(wxRainLP); wxRainLP.connect(wxRainGain);
+    wxRainGain.connect(wxOut); wxRainGain.connect(revS);
+    rs.start(0);
+    const rl = ac.createOscillator(); rl.type = 'sine'; rl.frequency.value = 0.127;
+    const rlg = gainNode(1500); rl.connect(rlg); rlg.connect(wxRainLP.frequency); rl.start();
+
+    // wind: brown noise through a slow resonant sweep + gust LFO
+    const ws = ac.createBufferSource();
+    ws.buffer = brownBuf; ws.loop = true; ws.playbackRate.value = 0.55;
+    wxWindFilt = ac.createBiquadFilter();
+    wxWindFilt.type = 'bandpass'; wxWindFilt.frequency.value = 380; wxWindFilt.Q.value = 3.4;
+    const wMod = gainNode(1);
+    wxWindGain = gainNode(0.0001);
+    ws.connect(wxWindFilt); wxWindFilt.connect(wMod); wMod.connect(wxWindGain);
+    wxWindGain.connect(wxOut); wxWindGain.connect(revM);
+    ws.start(0);
+    const wl = ac.createOscillator(); wl.type = 'sine'; wl.frequency.value = 0.041;
+    const wlg = gainNode(300); wl.connect(wlg); wlg.connect(wxWindFilt.frequency); wl.start();
+    const wl2 = ac.createOscillator(); wl2.type = 'sine'; wl2.frequency.value = 0.077;
+    const wl2g = gainNode(0.42); wl2.connect(wl2g); wl2g.connect(wMod.gain); wl2.start();
+
+    // distant rumble under a storm
+    const bs = ac.createBufferSource();
+    bs.buffer = brownBuf; bs.loop = true; bs.playbackRate.value = 0.32;
+    const bf = ac.createBiquadFilter(); bf.type = 'lowpass'; bf.frequency.value = 120; bf.Q.value = 1.2;
+    const bMod = gainNode(1);
+    wxRumbleGain = gainNode(0.0001);
+    bs.connect(bf); bf.connect(bMod); bMod.connect(wxRumbleGain); wxRumbleGain.connect(wxOut);
+    bs.start(0);
+    const bl = ac.createOscillator(); bl.type = 'sine'; bl.frequency.value = 0.029;
+    const blg = gainNode(0.55); bl.connect(blg); blg.connect(bMod.gain); bl.start();
+
+    wxApplied = '';
+  }
+
+  // ~3 s crossfade (setTargetAtTime settles in roughly 3 time constants).
+  // During horror silence the wind and rumble duck away entirely; the rain
+  // stays, quietly, because it is a thing happening in the world.
+  function applyWeatherBed(force) {
+    if (!ac) return;
+    const bed = WX_BED[wxType] || WX_BED.clear;
+    const hushed = (musicState === 'silence' || musicState === 'horror');
+    const key = wxType + (hushed ? '|h' : '|n') + (underwater ? '|u' : '|a');
+    if (!force && key === wxApplied) return;
+    if (!wxBuilt && bed.rain <= 0 && bed.wind <= 0 && bed.rumble <= 0) { wxApplied = key; return; }
+    buildWeatherBed();
+    if (!wxRainGain) return;
+    wxApplied = key;
+    const t = ac.currentTime;
+    const uw = underwater ? 0.4 : 1;    // heard from below, the surface is a rumour
+    wxRainGain.gain.setTargetAtTime(Math.max(0.0001, bed.rain * uw), t, 1.0);
+    wxWindGain.gain.setTargetAtTime(Math.max(0.0001, hushed ? 0 : bed.wind * uw), t, 1.0);
+    wxRumbleGain.gain.setTargetAtTime(Math.max(0.0001, hushed ? 0 : bed.rumble), t, 1.0);
+    wxRainHP.frequency.setTargetAtTime(bed.hp, t, 1.2);
+    wxRainLP.frequency.setTargetAtTime(bed.lp, t, 1.2);
+  }
+
+  function setWeatherType(type) {
+    const t = (typeof type === 'string' && WX_BED[type]) ? type : 'clear';
+    if (t === wxType) return;
+    wxType = t;
+    applyWeatherBed(true);
+  }
+
+  // fog: near-silence, and every so often something tones at you out of it
+  function fogTone(t) {
+    if (!ac || full()) return;
+    const f = mtof(55 + Math.floor(Math.random() * 5) * 2 + (Math.random() < 0.35 ? 12 : 0));
+    const pan = (Math.random() - 0.5) * 1.6;
+    tone('sine', f, t, 4.4, 0.05, ambBus, { atk: 1.5, hold: 1.6, rev: revL, pan });
+    tone('sine', f * 1.006, t + 0.35, 3.6, 0.032, ambBus, { atk: 1.7, hold: 1.1, rev: revL, pan: -pan });
+    noise(t + 0.2, 3.0, 0.018, ambBus, { type: 'bandpass', f0: f * 6, Q: 9, atk: 1.3, rev: revL, pan });
   }
 
   // ------------------------------------------------------------------
@@ -1277,6 +1382,76 @@ export function initAudio(ctx) {
       duckAmbience(0.2, 3.5);
     },
 
+    // ---------- weather + landed catch (world.js, fishing.js, ui.js) ----------
+    // dist in metres: far strikes arrive late, dull, and all roll, no crack
+    thunder(t, o) {
+      const dist = clamp(o && o.dist !== undefined ? o.dist : 90, 0, 1200);
+      const near = 1 - clamp(dist / 400, 0, 1);           // 1 = right on top of you
+      // o.late = the caller already waited out the travel time (world.js does)
+      const tt = t + ((o && o.late) ? 0 : clamp(dist / 340, 0, 2.8));
+      const lp = 300 + near * near * 7400;
+      const g = 0.3 + near * 0.55;
+      // the crack — only close strikes keep any bite
+      noise(tt, 0.08 + near * 0.12, g * (0.3 + near * 0.8), sfxBus, {
+        type: 'lowpass', f0: lp, f1: Math.max(110, lp * 0.22), sweep: 0.12, Q: 0.9, atk: 0.001, prio: true,
+      });
+      if (near > 0.3) {
+        noise(tt, 0.05, g * near * 0.55, sfxBus, { type: 'highpass', f0: 2200 + near * 3400, atk: 0.001 });
+      }
+      // the roll — longer and softer the further away it was
+      const roll = 2.0 + (1 - near) * 3.6;
+      noise(tt + 0.05, roll, g * 0.5, sfxBus, {
+        type: 'lowpass', f0: Math.min(1500, lp), f1: 85, sweep: roll * 0.85, Q: 1.2,
+        atk: 0.04 + (1 - near) * 0.7, brown: true, rev: revL, prio: true,
+      });
+      tone('sine', 52 + near * 26, tt, roll * 0.7, 0.16 + near * 0.16, sfxBus, {
+        f1: 26, glide: roll * 0.6, atk: 0.02 + (1 - near) * 0.4,
+      });
+      if (near > 0.55) duckAmbience(0.55, 1.4);
+    },
+    // being struck: a bright, personal crack
+    lightningZap(t, o) {
+      for (let i = 0; i < 8; i++) {
+        noise(t + i * 0.008, 0.045, 0.2, sfxBus, {
+          type: 'bandpass', f0: 1800 + Math.random() * 5200, Q: 15, atk: 0.0008, pan: (Math.random() - 0.5) * 1.4,
+        });
+      }
+      noise(t, 0.13, 0.34, sfxBus, { type: 'highpass', f0: 2800, atk: 0.0008, prio: true });
+      tone('sawtooth', 3400, t, 0.5, 0.15, sfxBus, {
+        f1: 210, glide: 0.42, filter: 'bandpass', ff0: 3200, ff1: 620, fsweep: 0.42, fq: 7,
+        atk: 0.001, shape: 'hard', rev: revM, prio: true,
+      });
+      tone('sine', 112, t, 0.8, 0.3, sfxBus, { f1: 38, glide: 0.6, atk: 0.002, prio: true });
+      // the body of it stays in your chest — the roll itself is 'thunder'
+      noise(t + 0.03, 1.3, 0.14, sfxBus, { type: 'lowpass', f0: 900, f1: 110, sweep: 1.1, Q: 1.2, atk: 0.02, brown: true, rev: revL });
+    },
+    // whacking your landed catch — comedic, wooden, never the same twice
+    bonk(t, o) {
+      const p = 0.82 + Math.random() * 0.44;
+      noise(t, 0.05, 0.24, sfxBus, { type: 'bandpass', f0: 1500 * p, Q: 1.5, atk: 0.001 });
+      tone('triangle', 430 * p, t, 0.15, 0.3, sfxBus, { f1: 98 * p, glide: 0.085, atk: 0.001, shape: 'soft' });
+      tone('sine', 152 * p, t, 0.24, 0.24, sfxBus, { f1: 56, glide: 0.17, atk: 0.002 });
+      // the daft little boing on the way out
+      tone('square', 250 * p, t + 0.035, 0.17, 0.045, sfxBus, {
+        f1: 640 * p, glide: 0.14, filter: 'lowpass', ff0: 1700, atk: 0.004,
+      });
+    },
+    // it's yours: zip it into the bag
+    stow(t, o) {
+      noise(t, 0.17, 0.13, sfxBus, { type: 'bandpass', f0: 680, f1: 3800, sweep: 0.15, Q: 4.5, atk: 0.004 });
+      tone('sine', 540, t + 0.1, 0.11, 0.22, sfxBus, { f1: 1220, glide: 0.055, atk: 0.002, rev: revS });
+      noise(t + 0.13, 0.05, 0.1, sfxBus, { type: 'highpass', f0: 4400, atk: 0.001 });
+      bell(t + 0.14, mtof(88), 0.09, 0.6, sfxBus, revM);
+    },
+    // it made the rail: two notes, both bad
+    flopperEscape(t, o) {
+      SFX.plop(t, EMPTY);
+      bell(t + 0.06, mtof(69), 0.15, 0.9, sfxBus, revM);
+      bell(t + 0.32, mtof(64), 0.15, 1.7, sfxBus, revL);
+      tone('triangle', mtof(57), t + 0.32, 1.3, 0.07, sfxBus, { f1: mtof(52), glide: 1.1, atk: 0.02, rev: revL });
+      noise(t + 0.1, 0.4, 0.1, sfxBus, { type: 'bandpass', f0: 1200, f1: 460, sweep: 0.35, Q: 1.1, atk: 0.01 });
+    },
+
     // ---------- shop / progression (boat.js, ui.js) ----------
     upgrade(t, o) {
       const lv = clamp(Math.round(o.level || 2), 1, 6);
@@ -1292,6 +1467,18 @@ export function initAudio(ctx) {
   SFX.sellFish = SFX.sell;
   SFX.buyItem = SFX.buy;
   SFX.tsunami = SFX.tsunamiRoar;
+
+  // Friendlier names other modules may reach for. These resolve to the
+  // canonical cue BEFORE dedup bookkeeping, so an alias and its target can
+  // never double-fire the same sound.
+  const SFX_ALIAS = {
+    thunderClap: 'thunder', thunderCrack: 'thunder', thunderRoll: 'thunder',
+    lightning: 'lightningZap', lightningStrike: 'lightningZap', zap: 'lightningZap',
+    bonkFish: 'bonk', whack: 'bonk', thwack: 'bonk',
+    stowFish: 'stow', fishStow: 'stow',
+    fishEscape: 'flopperEscape', flopperGone: 'flopperEscape', escapeSting: 'flopperEscape',
+  };
+  function resolveSfx(name) { return SFX_ALIAS[name] || name; }
 
   let tickCount = 0;
   function reelTick(t, vel) {
@@ -1392,6 +1579,7 @@ export function initAudio(ctx) {
   function sfx(name, opts) {
     if (!name) return;
     if (!ensureContext(gestureSeen || started)) return;
+    name = resolveSfx(name);
     const fn = SFX[name];
     if (!fn) return;
     if (ac.state === 'suspended') ac.resume().catch(() => { });
@@ -1407,6 +1595,7 @@ export function initAudio(ctx) {
   // both a module and the bus wiring triggering the same cue)
   function sfxDedup(name, opts, gap) {
     if (!ensureContext(gestureSeen || started)) return;
+    name = resolveSfx(name);
     const last = lastFired[name];
     if (last !== undefined && ac.currentTime - last < (gap || 0.3)) return;
     sfx(name, opts);
@@ -1474,6 +1663,9 @@ export function initAudio(ctx) {
     bus.on('leaveBoat', () => sfx('footstep', { surface: 'sand' }));
     bus.on('phase', (p) => onPhase(p));
     bus.on('quotaDone', () => sfxDedup('quotaDone', EMPTY, 1.0));
+    bus.on('flopper', (d) => onFlopper(d));
+    bus.on('weather', (d) => setWeatherType(d && d.type ? d.type : d));
+    bus.on('lightning', (d) => onLightning(d));
     bus.on('tsunami', () => { cutMusic(); sfxDedup('tsunamiRoar', EMPTY, 3); });
     bus.on('gameOver', () => { stopMusic(1.2); sfxDedup('gameOver', EMPTY, 3); });
     bus.on('gameWon', () => { stopMusic(1.0); sfxDedup('gameWon', EMPTY, 3); });
@@ -1486,6 +1678,67 @@ export function initAudio(ctx) {
     const tier = fish && fish.tier ? fish.tier : 1;
     sfxDedup('catchFanfare', { tier }, 0.5);
     if (fish && fish.mutation) sfxDedup('catchMutation', EMPTY, 0.5);
+  }
+
+  // --- wave 2: lightning + landed catches -------------------------------
+  function myNetId() {
+    const st = ctx && ctx.state;
+    if (st && st.myId) return st.myId;
+    try {
+      const net = ctx && ctx.net;
+      if (net && typeof net.id === 'function') return net.id();
+    } catch (e) { /* offline */ }
+    return null;
+  }
+
+  // world.js voices its own bolts, but only after the sound has flown to the
+  // listener (up to ~2.2 s). So a plain debounce cannot tell "already played"
+  // from "about to play": instead we queue our safety fire for the moment the
+  // roll is due and drop it if anything actually made the sound by then.
+  const pendingThunder = [];
+  let lastStrikeAt = -99;
+
+  function onLightning(d) {
+    if (!d) return;
+    if (!ensureContext(gestureSeen || started)) return;
+    // net + a possible bus relay deliver the same strike; they are seconds apart
+    if (ac.currentTime - lastStrikeAt < 0.5) return;
+    lastStrikeAt = ac.currentTime;
+    let dist = 140;
+    const p = d.p;
+    const cam = ctx && ctx.camera;
+    const e = cam && cam.matrixWorld ? cam.matrixWorld.elements : null;
+    if (p && p.length >= 3 && e) {
+      const dx = p[0] - e[12], dy = p[1] - e[13], dz = p[2] - e[14];
+      const dd = Math.sqrt(dx * dx + dy * dy + dz * dz);
+      if (isFinite(dd)) dist = dd;
+    }
+    const me = myNetId();
+    if (d.targetId && me && d.targetId === me) {
+      dist = Math.min(dist, 5);
+      sfxDedup('lightningZap', EMPTY, 0.25);
+    }
+    const mark = ac.currentTime;
+    if (pendingThunder.length > 6) pendingThunder.shift();
+    pendingThunder.push({ mark, at: mark + Math.min(2.4, dist / 340) + 0.12, dist });
+  }
+
+  function drainThunder(now) {
+    for (let i = pendingThunder.length - 1; i >= 0; i--) {
+      const q = pendingThunder[i];
+      if (now < q.at) continue;
+      pendingThunder.splice(i, 1);
+      const last = lastFired.thunder;
+      if (last === undefined || last < q.mark) sfx('thunder', { dist: q.dist, late: true });
+    }
+  }
+
+  function onFlopper(d) {
+    if (!d) return;
+    const st = d.state;
+    if (st === 'hit') sfxDedup('bonk', EMPTY, 0.2);
+    else if (st === 'dead') sfxDedup('stow', EMPTY, 0.35);
+    else if (st === 'escaped') sfxDedup('flopperEscape', EMPTY, 0.5);
   }
 
   function onPhase(p) {
@@ -1525,6 +1778,9 @@ export function initAudio(ctx) {
       net.on(MSG.EVENT_END, () => onEventEnd());
       net.on(MSG.ENEMY_HIT, () => sfxDedup('enemyHurt', EMPTY, 0.08));
       net.on(MSG.SHOP_RESULT, (d) => { if (d && d.ok) sfxDedup('buy', EMPTY, 0.2); else sfxDedup('error', EMPTY, 0.2); });
+      net.on(MSG.WEATHER, (d) => { if (d && typeof d.type === 'string') setWeatherType(d.type); });
+      net.on(MSG.LIGHTNING, (d) => onLightning(d));
+      net.on(MSG.FLOPPER, (d) => onFlopper(d));
     } catch (e) { warn(e); }
   }
 
@@ -1640,8 +1896,8 @@ export function initAudio(ctx) {
     nextGull -= step;
     if (nextGull <= 0) {
       nextGull = 7 + Math.random() * 13;
-      if (nightAmt < 0.4 && musicState !== 'horror' && musicState !== 'silence' && !underwater) {
-        gullCall(now + 0.05, (Math.random() - 0.5) * 1.7);
+      if (nightAmt < 0.4 && musicState !== 'horror' && musicState !== 'silence' && !underwater && wxType !== 'storm') {
+        gullCall(now + 0.05, (Math.random() - 0.5) * 1.7);   // nothing is flying in a storm
       }
     }
     nextCricket -= step;
@@ -1650,6 +1906,23 @@ export function initAudio(ctx) {
       if (nightAmt > 0.55 && musicState !== 'horror' && musicState !== 'silence' && !underwater) {
         cricketCall(now + 0.05, (Math.random() - 0.5) * 1.6);
       }
+    }
+
+    if (pendingThunder.length) drainThunder(now);
+
+    // --- weather bed (crossfades itself; only touches params when it must) ---
+    const wNow = (st && st.world && st.world.weather && typeof st.world.weather.type === 'string')
+      ? st.world.weather.type : null;
+    if (wNow && wNow !== wxType) setWeatherType(wNow);
+    else applyWeatherBed(false);
+    if (wxType === 'fog') {
+      nextFogTone -= step;
+      if (nextFogTone <= 0) {
+        nextFogTone = 11 + Math.random() * 14;
+        if (musicState !== 'horror' && !underwater) fogTone(now + 0.05);
+      }
+    } else if (nextFogTone < 6) {
+      nextFogTone = 6 + Math.random() * 6;
     }
   }
 

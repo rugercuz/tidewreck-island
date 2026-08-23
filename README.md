@@ -8,9 +8,11 @@ A co-op 3D multiplayer fishing party game for 2–8 friends. Built with Three.js
 
 - 🌊 **3D island + open ocean** with day/night cycle, god rays, and a wavy shader ocean you can dive under
 - 🚤 **Shared boat** with buoyancy physics — your whole crew rides together, one drives
-- 🐟 **38 fish across 11 tiers** — from the humble Sardine to the Megalodon, Sea Serpent, and Abyssal Leviathan
+- 🐟 **44 fish across 11 tiers** — from the humble Sardine to the Megalodon, Sea Serpent, and Abyssal Leviathan
 - ✨ **6 mutations**: Golden, Rainbow, Void, Spectral, Molten, Crystal — rare, gorgeous, and worth a fortune
-- 🏪 **Shop & progression**: 5 rods, 4 boats, 5 baits, 3 weapons, luck charms, diving gear, and the Tsunami Ward
+- ⛈️ **Weather with a pity system**: Clear, Overcast, Dead Fog, Rain Squall, Thunderstorm — real wave-height changes, fishing luck boosts, lightning hazards, weather-exclusive fish, and storms that make horror events 2.5× more likely. Stay dry too long and the pity system sends the storm to find you
+- 🔨 **Kill your catch**: fish land on deck *alive and flopping* — bonk them (bare hands or melee) before they flop back into the sea
+- 🏪 **Shop & progression**: 5 rods, 4 boats, 5 baits, 5 weapons (melee + ranged), luck charms, diving gear, and the Tsunami Ward
 - 📈 **Quota pressure**: the target grows ×1.55 every cycle; miss the deadline and the wave comes
 - 👹 **Horror events**: The Serpent, The Kraken, The Bloop. The soundtrack cuts to silence, day snaps to night, and something the size of a building surfaces. Survive to unlock their catchable offspring
 - ⚔️ **Enemies & weapons**: barracuda packs, reef sharks, abyss stalkers — fight back with harpoon, speargun, or Storm Trident

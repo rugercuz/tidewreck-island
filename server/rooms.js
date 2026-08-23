@@ -395,6 +395,7 @@ export class RoomManager {
     toGame(MSG.PLAYER_HIT, 'onPlayerHit');
     toGame(MSG.BUILD_PORTAL, 'onBuildPortal');
     toGame(MSG.ENTER_PORTAL, 'onEnterPortal');
+    toGame(MSG.BONK_FISH, 'onBonkFish');
 
     socket.on('disconnect', () => this.guard(socket, () => this.leaveRoom(socket, false)));
   }

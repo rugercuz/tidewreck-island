@@ -7,7 +7,7 @@
 
 import {
   MSG, MUTATIONS, FISH, ARTIFACTS, AREAS, SHOP, ECON, EVENTS,
-  PLAYER_COLORS, PLAYER_MAX_HP,
+  PLAYER_COLORS, PLAYER_MAX_HP, WEATHER, FLOPPER,
   fishById, shopById, quotaTarget, wardPrice,
 } from '/shared/constants.js';
 
@@ -65,6 +65,58 @@ const SVG_BAG = '<svg viewBox="0 0 24 24" class="ico"><path d="M4.5 8h15l-1.2 12
 const SVG_CROWN = '<svg viewBox="0 0 24 24" class="ico"><path d="M3 18h18l-1.4-9-4.4 3.4L12 6l-3.2 6.4L4.4 9z" fill="#ffca4a" stroke="#c98b18" stroke-width="1.1" stroke-linejoin="round"/></svg>';
 const SVG_CHECK = '<svg viewBox="0 0 24 24" class="ico"><path d="M5 12.6l4.6 4.6L19 7.4" fill="none" stroke="currentColor" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round"/></svg>';
 const SVG_WAVE = '<svg viewBox="0 0 120 24" class="ico wave-ico" preserveAspectRatio="none"><path d="M0 16 q15 -12 30 0 t30 0 t30 0 t30 0 V24 H0z" fill="currentColor" opacity=".55"/><path d="M0 20 q15 -10 30 0 t30 0 t30 0 t30 0 V24 H0z" fill="currentColor"/></svg>';
+
+// ---------------------------------------------------------------
+// Weather glyphs — pure inline SVG, coloured through currentColor so
+// the chip's per-type palette drives them (see .weather-chip in css).
+// ---------------------------------------------------------------
+const WX_CLOUD = '<g fill="currentColor"><circle cx="12.5" cy="13.5" r="4.6"/><circle cx="19" cy="12.6" r="5.6"/><rect x="8" y="13.4" width="15.6" height="6.6" rx="3.3"/></g>';
+const SVG_WX = {
+  clear:
+    '<svg viewBox="0 0 32 32" class="ico wx-svg">' +
+    '<g class="wx-rays" stroke="currentColor" stroke-width="2.3" stroke-linecap="round">' +
+    '<path d="M16 2.4v3.6"/><path d="M16 26v3.6"/><path d="M2.4 16H6"/><path d="M26 16h3.6"/>' +
+    '<path d="M6.4 6.4l2.5 2.5"/><path d="M23.1 23.1l2.5 2.5"/><path d="M25.6 6.4l-2.5 2.5"/><path d="M8.9 23.1l-2.5 2.5"/></g>' +
+    '<circle cx="16" cy="16" r="6.3" fill="currentColor"/>' +
+    '<circle cx="13.6" cy="13.8" r="2.2" fill="rgba(255,255,255,.45)"/></svg>',
+  overcast:
+    '<svg viewBox="0 0 32 32" class="ico wx-svg">' +
+    '<g opacity=".45" fill="currentColor" class="wx-drift"><circle cx="9" cy="9.6" r="3.6"/><circle cx="15" cy="8.8" r="4.4"/><rect x="5.4" y="9.4" width="12" height="5" rx="2.5"/></g>' +
+    WX_CLOUD + '</svg>',
+  fog:
+    '<svg viewBox="0 0 32 32" class="ico wx-svg">' +
+    '<g opacity=".8">' + WX_CLOUD + '</g>' +
+    '<g class="wx-bars" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" opacity=".8">' +
+    '<path d="M5.5 23.4h21"/><path d="M9 27.6h14"/></g></svg>',
+  rain:
+    '<svg viewBox="0 0 32 32" class="ico wx-svg">' + WX_CLOUD +
+    '<g class="wx-drops" stroke="currentColor" stroke-width="2.2" stroke-linecap="round">' +
+    '<path d="M11 22.5l-1.6 4.4"/><path d="M16.4 22.5l-1.6 4.4"/><path d="M21.8 22.5l-1.6 4.4"/></g></svg>',
+  storm:
+    '<svg viewBox="0 0 32 32" class="ico wx-svg">' +
+    '<g opacity=".9">' + WX_CLOUD + '</g>' +
+    '<g class="wx-drops" stroke="currentColor" stroke-width="2" stroke-linecap="round" opacity=".55">' +
+    '<path d="M10 22.4l-1.3 3.6"/><path d="M23 22.4l-1.3 3.6"/></g>' +
+    '<path class="wx-bolt" d="M17.6 20.4l-5.4 6.6h3.4l-1.2 4.6 5.6-7h-3.4z" fill="currentColor"/></svg>',
+};
+function wxIcon(type) { return SVG_WX[type] || SVG_WX.clear; }
+// short line under the chip name — rain/storm advertise the fishing buff
+function wxHint(type) {
+  if (type === 'storm') return 'bites faster · rarer fish';
+  if (type === 'rain') return 'bites faster · rarer fish';
+  if (type === 'fog') return 'blind water · bold hunters';
+  if (type === 'overcast') return 'grey · slightly luckier';
+  return 'calm water';
+}
+function wxHazard(type) {
+  const w = WEATHER[type];
+  if (w && w.hazard) {
+    if (type === 'rain' || type === 'storm') return w.hazard + ' The fish are stirred up.';
+    return w.hazard;
+  }
+  if (type === 'overcast') return 'Flat grey light. The fish are a little braver.';
+  return 'Flat calm and open sky. Easy water, picky fish.';
+}
 
 function rodIcon(level) {
   const cols = ['#a37b4c', '#a37b4c', '#5fb6d8', '#39424c', '#49dfb0', '#ffd979'];
@@ -717,6 +769,10 @@ export function initUI(ctx) {
         <div class="sky-icon" id="skyIcon">${SVG_SUN}</div>
         <div class="day-txt"><b id="dayNum">DAY 1</b><i id="dayPhase">morning</i></div>
       </div>
+      <div class="weather-chip" id="weatherChip" data-w="clear">
+        <span class="wx-ico" id="wxIco">${SVG_WX.clear}</span>
+        <span class="wx-txt"><b id="wxName">Clear Skies</b><i id="wxHint">calm water</i></span>
+      </div>
       <div class="quota-block">
         <div class="quota-head"><span id="quotaN">QUOTA 0/10</span><span class="quota-nums" id="quotaNums">0 / 400</span></div>
         <div class="quota-bar">
@@ -837,6 +893,13 @@ export function initUI(ctx) {
       <div class="cc-record" id="ccRecord">PERSONAL BEST</div>
     </div>
 
+    <div class="flopper-strip" id="flopperStrip">
+      <div class="flopper-rows" id="flopperRows"></div>
+      <div class="fl-prompt"><b>BONK IT</b><span>before it escapes!</span><kbd>LMB</kbd><i>up close</i></div>
+    </div>
+
+    <div class="lightning-flash" id="lightningFlash"></div>
+
     <div class="tsunami-flash" id="tsunamiFlash"><div class="tf-txt">TSUNAMI</div><div class="tf-wave"></div></div>`;
   root.appendChild(hud);
 
@@ -863,6 +926,8 @@ export function initUI(ctx) {
   const elWeaponIco = $('weaponIco'), elWeaponName = $('weaponName'), elWeaponSub = $('weaponSub');
   const elBaitIco = $('baitIco'), elBaitName = $('baitName'), elBaitSub = $('baitSub');
   const elSlotRod = $('slotRod'), elSlotWeapon = $('slotWeapon'), elInvSub = $('invSub');
+  const elWeatherChip = $('weatherChip'), elWxIco = $('wxIco'), elWxName = $('wxName'), elWxHint = $('wxHint');
+  const elFlopStrip = $('flopperStrip'), elFlopRows = $('flopperRows'), elLightning = $('lightningFlash');
 
   const RING_LEN = TAU * 26;
   elReelRing.style.strokeDasharray = RING_LEN.toFixed(2);
@@ -1057,7 +1122,7 @@ export function initUI(ctx) {
     if (!force && p === ui.phase) return;
     ui.phase = p;
     root.dataset.phase = p;
-    if (p !== 'playing') { closeShop(); closeInventory(); closeChat(false); }
+    if (p !== 'playing') { closeShop(); closeInventory(); closeChat(false); clearFloppers(); }
     if (p === 'lobby') renderLobby();
     if (p === 'playing') { refreshHUDFromState(); refreshHotbar(); }
   }
@@ -1125,6 +1190,9 @@ export function initUI(ctx) {
     const arts = Array.isArray(w.artifacts) ? w.artifacts : [];
     for (const s of elArtiTracker.children) s.classList.toggle('is-on', arts.indexOf(s.dataset.a) >= 0);
 
+    // weather rides along on WORLD_STATE (may be absent on older payloads)
+    if (w.weather && typeof w.weather.type === 'string') setWeather(w.weather.type);
+
     // gear may ride along on world.players
     if (Array.isArray(w.players)) {
       const me = myId();
@@ -1144,6 +1212,182 @@ export function initUI(ctx) {
     elArtifactBanner.classList.add('show');
     setTimeout(() => elArtifactBanner.classList.remove('show'), 4200);
     toast('New artifact: ' + (a ? a.name : id), 'good');
+  }
+
+  // =============================================================
+  // WEATHER CHIP
+  // =============================================================
+  let curWeather = null;
+  let wxPopTimer = 0;
+  function setWeather(type) {
+    const t = WEATHER[type] ? type : 'clear';
+    if (t === curWeather) return;
+    const first = curWeather === null;
+    curWeather = t;
+    const def = WEATHER[t];
+    setHTML(elWxIco, wxIcon(t));
+    setText(elWxName, def.name);
+    setText(elWxHint, wxHint(t));
+    elWeatherChip.dataset.w = t;
+    root.dataset.weather = t;
+    elWeatherChip.classList.remove('wx-pop'); void elWeatherChip.offsetWidth;
+    elWeatherChip.classList.add('wx-pop');
+    // the class has to come back off or it would shadow the storm's pulse
+    clearTimeout(wxPopTimer);
+    wxPopTimer = setTimeout(() => elWeatherChip.classList.remove('wx-pop'), 700);
+    if (first) return;                              // the opening weather is not "news"
+    if (effectivePhase() !== 'playing') return;
+    if (!fresh('wx:' + t, 1200)) return;
+    toast(def.name + ' — ' + wxHazard(t), 'weather');
+  }
+
+  // =============================================================
+  // FLOPPERS — your landed catch is alive and heading for the rail
+  // =============================================================
+  const floppers = new Map();   // flopperId -> row record
+
+  function flopperName(fish) {
+    if (!fish) return 'Your catch';
+    const def = fishById(fish.fishId || fish.id) || null;
+    const base = fish.name || (def ? def.name : 'Your catch');
+    return mutName(base, fish.mutation);
+  }
+  function pipCount(maxHp) {
+    return Math.max(2, Math.min(14, Math.round(num(maxHp, FLOPPER.BASE_HP) / 5)));
+  }
+
+  function addFlopper(id, d) {
+    if (floppers.has(id)) return floppers.get(id);
+    const fish = d && d.fish ? d.fish : null;
+    const maxHp = Math.max(1, num(d && d.maxHp, num(fish && fish.tier, 1) * FLOPPER.HP_PER_TIER + FLOPPER.BASE_HP));
+    const hp = Math.max(0, num(d && d.hp, maxHp));
+    const n = pipCount(maxHp);
+    const name = flopperName(fish);
+    const fid = fish ? (fish.fishId || fish.id || '') : '';
+
+    const row = el('div', 'flopper');
+    row.dataset.id = id;
+    row.innerHTML =
+      (fid
+        ? `<img class="fl-icon fish-icon" data-fkey="1" data-fid="${escapeHTML(fid)}" data-fmut="${escapeHTML((fish && fish.mutation) || '')}" src="${fishIcon(fid, fish && fish.mutation, 96)}" alt="">`
+        : '<span class="fl-icon fl-icon-blank"></span>') +
+      `<div class="fl-main">` +
+      `<div class="fl-top"><b class="fl-name${fish && fish.mutation ? ' mut-' + fish.mutation : ''}">${escapeHTML(name)}</b>` +
+      `<span class="fl-pips"></span></div>` +
+      `<div class="fl-timer"><div class="fl-timer-fill"></div><span class="fl-timer-txt"></span></div>` +
+      `</div>` +
+      `<div class="fl-verdict"></div>`;
+    const pips = row.querySelector('.fl-pips');
+    for (let i = 0; i < n; i++) pips.appendChild(el('span', 'fl-pip'));
+    elFlopRows.appendChild(row);
+
+    const rec = {
+      el: row, pips, n, hp, maxHp,
+      fill: row.querySelector('.fl-timer-fill'),
+      timeTxt: row.querySelector('.fl-timer-txt'),
+      verdict: row.querySelector('.fl-verdict'),
+      // the server may state its own window; fall back to the shared constant
+      escapeS: Math.max(3, num(d && d.escapeSeconds, ESCAPE_S)),
+      spawn: performance.now(), done: false, removeAt: 0,
+    };
+    floppers.set(id, rec);
+    paintPips(rec);
+    refreshFlopperStrip();
+    return rec;
+  }
+
+  function paintPips(rec) {
+    const frac = clamp01(rec.hp / Math.max(1, rec.maxHp));
+    const lit = rec.hp <= 0 ? 0 : Math.max(1, Math.ceil(frac * rec.n));
+    for (let i = 0; i < rec.pips.children.length; i++) {
+      rec.pips.children[i].classList.toggle('is-out', i >= lit);
+    }
+    rec.el.classList.toggle('is-hurt', frac <= 0.34);
+  }
+
+  function hitFlopper(id, d) {
+    const rec = floppers.get(id) || addFlopper(id, d);
+    if (!rec || rec.done) return;
+    if (typeof (d && d.maxHp) === 'number' && d.maxHp > 0) rec.maxHp = d.maxHp;
+    if (typeof (d && d.hp) === 'number') rec.hp = Math.max(0, d.hp);
+    paintPips(rec);
+    rec.el.classList.remove('is-hit'); void rec.el.offsetWidth;
+    rec.el.classList.add('is-hit');
+  }
+
+  function endFlopper(id, kept) {
+    const rec = floppers.get(id);
+    if (!rec || rec.done) return;
+    rec.done = true;
+    rec.hp = kept ? 0 : rec.hp;
+    if (kept) paintPips(rec);
+    rec.el.classList.add(kept ? 'is-stowed' : 'is-lost');
+    setText(rec.verdict, kept ? 'STOWED!' : 'IT GOT AWAY!');
+    rec.removeAt = performance.now() + (kept ? 950 : 1250);
+  }
+
+  function dropFlopper(id) {
+    const rec = floppers.get(id);
+    if (!rec) return;
+    if (rec.el.parentNode) rec.el.parentNode.removeChild(rec.el);
+    floppers.delete(id);
+    refreshFlopperStrip();
+  }
+
+  function refreshFlopperStrip() {
+    let live = 0;
+    for (const rec of floppers.values()) if (!rec.done) live++;
+    elFlopStrip.classList.toggle('show', floppers.size > 0);
+    elFlopStrip.classList.toggle('has-live', live > 0);
+    elFlopStrip.classList.toggle('is-crowd', floppers.size > 2);
+  }
+
+  function onFlopper(d) {
+    if (!d || typeof d !== 'object') return;
+    const id = (d.flopperId != null) ? String(d.flopperId) : '';
+    if (!id) return;
+    const st = String(d.state || 'spawn');
+    if (!fresh('flp:' + id + ':' + st + ':' + (d.hp != null ? d.hp : ''), 250)) return;
+    if (st === 'spawn') addFlopper(id, d);
+    else if (st === 'hit') hitFlopper(id, d);
+    else if (st === 'dead') endFlopper(id, true);
+    else if (st === 'escaped') endFlopper(id, false);
+  }
+
+  const ESCAPE_S = Math.max(3, num(FLOPPER.ESCAPE_SECONDS, 25));
+  function tickFloppers() {
+    if (!floppers.size) return;
+    const now = performance.now();
+    let dirty = false;
+    for (const [id, rec] of floppers) {
+      if (rec.done) {
+        if (now >= rec.removeAt) { dropFlopper(id); dirty = true; }
+        continue;
+      }
+      const span = rec.escapeS || ESCAPE_S;
+      const left = span - (now - rec.spawn) / 1000;
+      const f = clamp01(left / span);
+      rec.fill.style.width = (f * 100).toFixed(1) + '%';
+      setText(rec.timeTxt, Math.max(0, left).toFixed(1) + 's');
+      rec.el.classList.toggle('is-warn', f < 0.42 && f >= 0.18);
+      rec.el.classList.toggle('is-crit', f < 0.18);
+      // safety net: the server owns the escape, but never leave a ghost row up
+      if (left < -2.5) { endFlopper(id, false); dirty = true; }
+    }
+    if (dirty) refreshFlopperStrip();
+  }
+
+  function clearFloppers() {
+    for (const id of Array.from(floppers.keys())) dropFlopper(id);
+  }
+
+  // =============================================================
+  // LIGHTNING
+  // =============================================================
+  function lightningFlinch() {
+    elLightning.classList.remove('strike'); void elLightning.offsetWidth;
+    elLightning.classList.add('strike');
+    flashDamage();
   }
 
   // =============================================================
@@ -1178,7 +1422,7 @@ export function initUI(ctx) {
     if (aw) {
       setHTML(elWeaponIco, weaponIcon(aw.id));
       setText(elWeaponName, aw.name);
-      setText(elWeaponSub, aw.dmg + ' dmg' + (ws.length > 1 ? ' · ' + ws.length + ' owned' : ''));
+      setText(elWeaponSub, aw.dmg + ' dmg · ' + attackShort(aw));
       elSlotWeapon.classList.remove('is-empty');
     } else if (ws.length) {
       setHTML(elWeaponIco, weaponIcon(ws[0].id));
@@ -1368,8 +1612,10 @@ export function initUI(ctx) {
       bits.push(have > 0 ? ('you hold ×' + have) : 'none held');
     } else if (item.kind === 'weapon') {
       bits.push(item.dmg + ' dmg');
+      if (item.attack === 'both' && item.meleeDmg) bits.push(item.meleeDmg + ' on the jab');
       bits.push(item.rate + '/s');
       bits.push(item.range + ' m');
+      if (canBonk(item)) bits.push('bonks your catch');
     } else if (item.kind === 'charm') {
       bits.push('+' + Math.round(item.luck * 100) + '% luck');
     } else if (item.kind === 'diving') {
@@ -1386,6 +1632,26 @@ export function initUI(ctx) {
     return bits.join(' · ');
   }
 
+  // weapons carry attack: 'melee' | 'ranged' | 'both' — melee reach also
+  // finishes landed catches (see FLOPPER), ranged-only weapons cannot.
+  function attackKind(item) {
+    if (!item || item.kind !== 'weapon') return '';
+    const a = item.attack;
+    return (a === 'melee' || a === 'ranged' || a === 'both') ? a : '';
+  }
+  function canBonk(item) { const a = attackKind(item); return a === 'melee' || a === 'both'; }
+  function attackShort(item) {
+    const a = attackKind(item);
+    return a === 'both' ? 'melee+ranged' : (a || 'melee');
+  }
+  function attackBadge(item) {
+    const a = attackKind(item);
+    if (!a) return '';
+    const label = a === 'both' ? 'MELEE+RANGED' : a.toUpperCase();
+    const tip = canBonk(item) ? 'Can bonk your landed catch' : 'Cannot bonk a landed catch';
+    return `<span class="si-att att-${a}" title="${tip}">${label}</span>`;
+  }
+
   function shopItemCard(item) {
     const st = itemState(item);
     const price = itemPrice(item);
@@ -1393,7 +1659,7 @@ export function initUI(ctx) {
     card.innerHTML =
       `<div class="si-ico">${shopKindIcon(item.kind, item)}</div>` +
       `<div class="si-main">` +
-      `<div class="si-top"><span class="si-name">${escapeHTML(item.name)}</span>` +
+      `<div class="si-top"><span class="si-name">${escapeHTML(item.name)}</span>${attackBadge(item)}` +
       `<span class="si-price">${SVG_COIN}<b>${money(price)}</b></span></div>` +
       `<div class="si-desc">${escapeHTML(item.desc || '')}</div>` +
       `<div class="si-meta">${escapeHTML(itemMeta(item))}${st.note ? ' · <i>' + escapeHTML(st.note) + '</i>' : ''}</div>` +
@@ -1981,6 +2247,9 @@ export function initUI(ctx) {
   onBus('shopResult', (d) => handleShopResult(d));
   onBus('quotaDone', (d) => { if (fresh('qd:' + (d && d.n), 500)) showQuotaBanner(d); });
   onBus('tsunamiWarning', (d) => handleTsunamiWarning(d));
+  // fishing.js re-emits the server's flopper beats for us
+  onBus('flopper', (d) => onFlopper(d));
+  onBus('weather', (d) => { const t = (d && d.type) || d; if (typeof t === 'string') setWeather(t); });
 
   function handleChatMsg(from, text) {
     const sys = !from || from === 'ISLAND' || from === 'system' || from === 'System';
@@ -2134,6 +2403,21 @@ export function initUI(ctx) {
   });
   onNet(MSG.BITE, () => { hideCastPower(); });
 
+  // ---- wave 2: weather, landed-catch bonking, lightning ----
+  onNet(MSG.WEATHER, (d) => {
+    const t = (d && d.type) || d;
+    if (typeof t === 'string') setWeather(t);
+  });
+  onNet(MSG.FLOPPER, (d) => onFlopper(d));
+  onNet(MSG.LIGHTNING, (d) => {
+    if (!d) return;
+    const me = myId();
+    if (!d.targetId || !me || d.targetId !== me) return;
+    if (!fresh('zap:' + me, 250)) return;
+    lightningFlinch();
+    toast('LIGHTNING — get off the open water', 'bad');
+  });
+
   // =============================================================
   // KEYBOARD
   // =============================================================
@@ -2241,6 +2525,7 @@ export function initUI(ctx) {
     ui.now = num(t, ui.now + num(dt, 0.016));
     ui.acc += num(dt, 0.016);
     if (ui.acc >= 0.1) { ui.acc = 0; tick10(); }
+    if (floppers.size) tickFloppers();
     // stale-timeout for the transient widgets
     if (elCastPower.classList.contains('show') && ui.now - ui.castPowerT > 0.35) hideCastPower();
     if (ui.reelOn && ui.now - ui.reelT > 45) hideReel();

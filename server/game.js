@@ -16,6 +16,9 @@ import {
   ECON,
   SHOP,
   ARTIFACTS,
+  WEATHER,
+  WEATHER_RULES,
+  FLOPPER,
   PLAYER_MAX_HP,
   BASE_AIR_SECONDS,
   shopById,
@@ -54,6 +57,20 @@ const DIFFICULTY_MULT = { chill: 0.7, normal: 1, hard: 1.4 };
 const START_TIME_OF_DAY = 0.28;   // just after sunrise
 const DOCK_SPAWN = [0, 1.2, -126];
 
+// --- weather ---------------------------------------------------------
+const WEATHER_DAWN = 0.06;        // timeOfDay of the dawn reroll (dusk = ECON.NIGHT_START)
+const START_WEATHER = 'clear';
+const MAX_EVENT_CHANCE = 0.9;     // eventChanceMult must never make a night certain
+const ISLAND_SHELTER_RADIUS = 135;// inside this ring you are "on the island" — no bolts
+const ISLAND_SHELTER_RADIUS_SQ = ISLAND_SHELTER_RADIUS * ISLAND_SHELTER_RADIUS;
+const LIGHTNING_MIN_Y = -0.5;     // ducking under the surface keeps you safe
+const LIGHTNING_MISS_MIN_R = 25;  // stray bolts land this far from the boat...
+const LIGHTNING_MISS_MAX_R = 95;  // ...out to here
+
+// --- landed catches (floppers) ---------------------------------------
+const BONK_COOLDOWN_S = 0.28;     // ~3 whacks a second, whatever the client claims
+const MELEE_HIT_RANGE = 6;        // melee/'both'-in-close reach check on DAMAGE_ENEMY
+
 const ARTIFACT_IDS = Object.keys(ARTIFACTS);
 const AREA_BY_ID = new Map(AREAS.map(a => [a.id, a]));
 const MAX_ENEMY_DMG = Object.keys(ENEMIES)
@@ -84,6 +101,19 @@ function nowSeconds() { return Date.now() / 1000; }
 
 function cleanAnim(v) {
   return typeof v === 'string' && v.length && v.length <= 16 ? v : 'idle';
+}
+
+/**
+ * True when the day-clock stepped across `mark` (a 0..1 timeOfDay value)
+ * between two absolute day positions (dayNumber + timeOfDay, monotonic).
+ * Ticks are ~0.1 s against a 300 s day, so at most one crossing per call.
+ */
+function crossedMark(prevAbs, nowAbs, mark) {
+  if (!(nowAbs > prevAbs)) return false;
+  const a = Math.floor(prevAbs) + mark;
+  if (a > prevAbs && a <= nowAbs) return true;
+  const b = Math.floor(nowAbs) + mark;
+  return b > prevAbs && b <= nowAbs;
 }
 
 export class Game {
@@ -122,8 +152,16 @@ export class Game {
       deadlineDay: 1 + ECON.QUOTA_CYCLE_DAYS,
     };
 
+    // --- weather ------------------------------------------------------
+    this.weather = WEATHER[START_WEATHER] ? START_WEATHER : 'clear';
+    this.daysSinceBadWeather = 0;   // consecutive days with no rain/storm
+    this.badWeatherToday = false;
+    this.nextLightningAt = 0;
+
     // --- players ------------------------------------------------------
     this.players = new Map();
+    this.socketHooks = new Map();   // socket-level fallbacks, see bindPlayerSocket()
+    this.flopperCounter = 0;
     for (const m of members || []) this.addPlayer(m);
 
     // --- team boat ----------------------------------------------------
@@ -176,11 +214,15 @@ export class Game {
     }, MOVE_FLUSH_MS);
     if (this.tickTimer.unref) this.tickTimer.unref();
     if (this.moveTimer.unref) this.moveTimer.unref();
+    // Opening sky, for clients that only listen on MSG.WEATHER.
+    this.broadcast(MSG.WEATHER, this.weatherPayload());
   }
 
   stop(reason) {
     if (this.tickTimer) { clearInterval(this.tickTimer); this.tickTimer = null; }
     if (this.moveTimer) { clearInterval(this.moveTimer); this.moveTimer = null; }
+    for (const id of Array.from(this.socketHooks.keys())) this.unbindPlayerSocket(id);
+    for (const p of this.players.values()) this.clearFloppers(p, false);
     if (this.over) return;
     this.over = true;
     this.onEnd(reason || 'stopped');
@@ -209,17 +251,55 @@ export class Game {
       onBoat: false,
       seat: -1,
       casting: null,
+      floppers: new Map(),   // flopperId -> live landed catch, see FLOPPER
       entered: false,
       lastSelfHit: 0,
+      lastBonkAt: 0,
       stats: { fish: 0, earned: 0 },
     };
     this.players.set(player.id, player);
+    this.bindPlayerSocket(player.id);
     return player;
+  }
+
+  /**
+   * Wave-2 messages that the room router does not forward yet are picked up
+   * straight off the socket. If rooms.js already wired BONK_FISH (its handlers
+   * are installed at connect time, long before a Game exists) this is a no-op,
+   * so the message can never be processed twice.
+   */
+  bindPlayerSocket(id) {
+    try {
+      const sockets = this.io && this.io.sockets ? this.io.sockets.sockets : null;
+      const socket = sockets && typeof sockets.get === 'function' ? sockets.get(id) : null;
+      if (!socket || typeof socket.on !== 'function') return;
+      if (typeof socket.listeners === 'function' && socket.listeners(MSG.BONK_FISH).length > 0) return;
+      if (this.socketHooks.has(id)) return;
+      const handler = (d) => {
+        try { this.onBonkFish(id, d && typeof d === 'object' ? d : {}); }
+        catch (err) { console.error('[game bonk]', this.code, err); }
+      };
+      socket.on(MSG.BONK_FISH, handler);
+      this.socketHooks.set(id, handler);
+    } catch (err) { /* socket layer shape differs — the router handles it */ }
+  }
+
+  unbindPlayerSocket(id) {
+    const handler = this.socketHooks.get(id);
+    if (!handler) return;
+    this.socketHooks.delete(id);
+    try {
+      const sockets = this.io && this.io.sockets ? this.io.sockets.sockets : null;
+      const socket = sockets && typeof sockets.get === 'function' ? sockets.get(id) : null;
+      if (socket && typeof socket.off === 'function') socket.off(MSG.BONK_FISH, handler);
+    } catch (err) { /* already gone */ }
   }
 
   removePlayer(id) {
     const p = this.players.get(id);
     if (!p) return;
+    this.clearFloppers(p, false);
+    this.unbindPlayerSocket(id);
     this.players.delete(id);
     this.moveDirty.delete(id);
 
@@ -308,6 +388,7 @@ export class Game {
       portalBuilt: this.portalBuilt,
       players,
       enemiesEnabled: !this.over,
+      weather: this.weatherPayload(),
       // additive extras (safe for clients that ignore them)
       boatLevel: this.boatLevel,
       difficulty: this.difficulty,
@@ -318,6 +399,149 @@ export class Game {
   }
 
   broadcastWorldState() { this.broadcast(MSG.WORLD_STATE, this.worldStatePayload()); }
+
+  // =========================================================
+  // Weather
+  // =========================================================
+
+  weatherDef() { return WEATHER[this.weather] || WEATHER.clear; }
+
+  /** Seconds until the next scheduled reroll (dawn or dusk, whichever is nearer). */
+  secondsToNextWeather() {
+    const t = this.timeOfDay;
+    let best = 1;
+    for (const mark of [WEATHER_DAWN, ECON.NIGHT_START]) {
+      const d = mark > t ? mark - t : 1 - t + mark;
+      if (d < best) best = d;
+    }
+    return Math.max(0, Math.round(best * ECON.DAY_SECONDS));
+  }
+
+  weatherPayload() {
+    const def = this.weatherDef();
+    return {
+      type: this.weather,
+      name: def.name,
+      hazard: def.hazard || null,
+      until: this.secondsToNextWeather(),
+    };
+  }
+
+  /**
+   * Apply a weather type. Broadcasts MSG.WEATHER on every actual change and
+   * keeps the rain/storm pity counter honest either way.
+   */
+  setWeather(type) {
+    const next = WEATHER[type] ? type : 'clear';
+    const changed = next !== this.weather;
+    const bad = next === 'rain' || next === 'storm';
+    this.weather = next;
+
+    if (bad) {
+      this.badWeatherToday = true;
+      this.daysSinceBadWeather = 0;
+    }
+
+    // Storms schedule bolts; anything else stands them down.
+    this.nextLightningAt = next === 'storm'
+      ? nowSeconds() + this.lightningInterval()
+      : 0;
+
+    if (!changed) return;
+
+    const def = this.weatherDef();
+    this.broadcast(MSG.WEATHER, this.weatherPayload());
+    this.chat('ISLAND', def.hazard
+      ? `The weather turns: ${def.name}. ${def.hazard}`
+      : `The weather turns: ${def.name}.`);
+  }
+
+  lightningInterval() {
+    const per = Array.isArray(WEATHER_RULES.LIGHTNING_PERIOD) ? WEATHER_RULES.LIGHTNING_PERIOD : [6, 14];
+    const lo = Math.max(1, num(per[0], 6));
+    const hi = Math.max(lo, num(per[1], 14));
+    return lo + Math.random() * (hi - lo);
+  }
+
+  /** Weighted pick over WEATHER, with the no-rain pity override. */
+  rerollWeather() {
+    const pity = Math.max(1, Math.floor(num(WEATHER_RULES.PITY_CLEAR_DAYS, 2)));
+    if (this.daysSinceBadWeather >= pity) {
+      const stormy = Math.random() < clamp(num(WEATHER_RULES.PITY_STORM_CHANCE, 0.6), 0, 1);
+      this.setWeather(stormy ? 'storm' : 'rain');
+      return;
+    }
+
+    const keys = Object.keys(WEATHER);
+    let total = 0;
+    for (const k of keys) total += Math.max(0, num(WEATHER[k].weight, 0));
+    if (total <= 0) { this.setWeather('clear'); return; }
+
+    let r = Math.random() * total;
+    let picked = keys[0];
+    for (const k of keys) {
+      r -= Math.max(0, num(WEATHER[k].weight, 0));
+      if (r <= 0) { picked = k; break; }
+    }
+    this.setWeather(picked);
+  }
+
+  /** Dawn also closes the books on yesterday's pity counter. */
+  onDawnWeather() {
+    if (this.badWeatherToday) this.daysSinceBadWeather = 0;
+    else this.daysSinceBadWeather++;
+    this.badWeatherToday = false;
+    this.rerollWeather();
+  }
+
+  updateWeather(now) {
+    if (this.over || this.weather !== 'storm') return;
+    if (!this.nextLightningAt) { this.nextLightningAt = now + this.lightningInterval(); return; }
+    if (now < this.nextLightningAt) return;
+    this.nextLightningAt = now + this.lightningInterval();
+    this.strikeLightning();
+  }
+
+  /** Anyone above the waterline and off the island is fair game for a bolt. */
+  lightningTargets() {
+    const out = [];
+    for (const p of this.players.values()) {
+      if (!p.alive) continue;
+      if (p.pos[1] < LIGHTNING_MIN_Y) continue;
+      const d2 = p.pos[0] * p.pos[0] + p.pos[2] * p.pos[2];
+      if (d2 <= ISLAND_SHELTER_RADIUS_SQ) continue;
+      out.push(p);
+    }
+    return out;
+  }
+
+  strikeLightning() {
+    const exposed = this.lightningTargets();
+    if (exposed.length) {
+      const t = exposed[Math.floor(Math.random() * exposed.length) % exposed.length];
+      this.broadcast(MSG.LIGHTNING, {
+        p: [r2(t.pos[0]), r2(Math.max(0, t.pos[1])), r2(t.pos[2])],
+        targetId: t.id,
+        dmg: num(WEATHER_RULES.LIGHTNING_DMG, 20),
+      });
+      this.chat('ISLAND', `The sky picks ${t.name} out of the water.`);
+      this.damagePlayer(t, num(WEATHER_RULES.LIGHTNING_DMG, 20), 'lightning');
+      return;
+    }
+
+    // Nobody exposed: a wasted bolt somewhere out on the water near the boat.
+    const ang = Math.random() * Math.PI * 2;
+    const rad = LIGHTNING_MISS_MIN_R + Math.random() * (LIGHTNING_MISS_MAX_R - LIGHTNING_MISS_MIN_R);
+    let x = this.boat.p[0] + Math.cos(ang) * rad;
+    let z = this.boat.p[2] + Math.sin(ang) * rad;
+    const d = Math.sqrt(x * x + z * z);
+    if (d < ISLAND_SHELTER_RADIUS) {
+      const s = (ISLAND_SHELTER_RADIUS + 25) / (d || 1);
+      x *= s;
+      z *= s;
+    }
+    this.broadcast(MSG.LIGHTNING, { p: [r2(x), 0, r2(z)], targetId: null, dmg: 0 });
+  }
 
   sendInventory(p) {
     this.send(p.id, MSG.INVENTORY, {
@@ -354,7 +578,9 @@ export class Game {
     this.tickCount++;
 
     this.updateClock(dt);
+    this.updateWeather(now);
     this.updateCasts(now);
+    this.updateFloppers(now);
     this.updateEvent(now);
     this.updateEnemies(dt, now);
     this.updateTsunami(now);
@@ -368,15 +594,22 @@ export class Game {
   }
 
   updateClock(dt) {
-    const prev = this.timeOfDay;
+    const prevAbs = this.dayNumber + this.timeOfDay;
     this.timeOfDay += dt / ECON.DAY_SECONDS;
 
     let wrapped = false;
     while (this.timeOfDay >= 1) { this.timeOfDay -= 1; this.dayNumber++; wrapped = true; }
 
-    if (wrapped) {
-      this.onSunrise();
-    } else if (prev < ECON.NIGHT_START && this.timeOfDay >= ECON.NIGHT_START) {
+    const nowAbs = this.dayNumber + this.timeOfDay;
+    const dawn = crossedMark(prevAbs, nowAbs, WEATHER_DAWN);
+    const dusk = crossedMark(prevAbs, nowAbs, ECON.NIGHT_START);
+
+    if (wrapped) this.onSunrise();
+    // Weather rerolls twice a day; dusk resolves BEFORE the night's event roll
+    // so the sky that just closed in is the one that decides the odds.
+    if (dawn) this.onDawnWeather();
+    if (dusk) {
+      this.rerollWeather();
       this.onNightfall();
     }
   }
@@ -585,7 +818,7 @@ export class Game {
       areaId: area.id,
       baitId,
       state: 'waiting',
-      biteAt: nowSeconds() + rollBiteDelay(p.gear, baitId),
+      biteAt: nowSeconds() + rollBiteDelay(p.gear, baitId, this.weather),
       failAt: 0,
       roll: null,
     };
@@ -612,6 +845,7 @@ export class Game {
           luck: computeLuck(p.gear, c.baitId),
           eventsSurvived: this.eventsSurvived,
           difficulty: this.difficulty,
+          weather: this.weather,
         }) : null;
 
         if (!roll) {
@@ -651,13 +885,111 @@ export class Game {
       weightKg: roll.weightKg,
       value: roll.value,
     };
+
+    // The fish is on the deck, not in the bag: it lands ALIVE and flopping and
+    // has to be finished (MSG.BONK_FISH) before it counts. Inventory, stats and
+    // the artifact award all wait for killFlopper().
+    const prevBest = this.stats.biggestCatch;
+    const newRecord = !prevBest || roll.value > prevBest.value;
+    const flopper = this.spawnFlopper(p, item, roll);
+
+    this.send(id, MSG.CAST_RESULT, {
+      caught: true,
+      fish: item,
+      newRecord,
+      flopperId: flopper.flopperId,
+    });
+
+    if (roll.mutation) {
+      this.chat('ISLAND', `${p.name} pulled up a ${roll.mutation.toUpperCase()} ${item.name}!`);
+    } else if (roll.tier >= 9) {
+      this.chat('ISLAND', `${p.name} landed a ${item.name} (${item.weightKg} kg).`);
+    }
+  }
+
+  // =========================================================
+  // Landed catches (floppers)
+  // =========================================================
+
+  /** Best whack this player can legally land: bare hands or an owned melee edge. */
+  bestBonkDamage(p) {
+    let best = num(FLOPPER.HAND_DMG, 10);
+    const owned = p && p.gear && Array.isArray(p.gear.weapons) ? p.gear.weapons : [];
+    for (const wid of owned) {
+      const w = shopById(wid);
+      if (!w || w.kind !== 'weapon') continue;
+      let d = 0;
+      if (w.attack === 'melee') d = num(w.dmg, 0);
+      else if (w.attack === 'both') d = num(w.meleeDmg, num(w.dmg, 0));
+      if (d > best) best = d;
+    }
+    return Math.max(1, Math.round(best));
+  }
+
+  spawnFlopper(p, item, roll) {
+    const maxHp = Math.max(1, Math.round(
+      num(FLOPPER.BASE_HP, 10) + num(roll.tier, 1) * num(FLOPPER.HP_PER_TIER, 5),
+    ));
+    const fl = {
+      flopperId: `fl${this.code}${++this.flopperCounter}`,
+      item,
+      fishDef: roll.fish,
+      hp: maxHp,
+      maxHp,
+      expiresAt: nowSeconds() + Math.max(1, num(FLOPPER.ESCAPE_SECONDS, 25)),
+    };
+    p.floppers.set(fl.flopperId, fl);
+
+    this.send(p.id, MSG.FLOPPER, {
+      state: 'spawn',
+      flopperId: fl.flopperId,
+      fish: item,
+      hp: fl.hp,
+      maxHp: fl.maxHp,
+      escapeSeconds: Math.max(1, num(FLOPPER.ESCAPE_SECONDS, 25)),
+    });
+    return fl;
+  }
+
+  onBonkFish(id, d) {
+    const p = this.players.get(id);
+    if (!p || !p.alive || this.over) return;
+    const flopperId = typeof d.flopperId === 'string' ? d.flopperId : '';
+    const fl = p.floppers.get(flopperId);
+    if (!fl) return;
+
+    const now = nowSeconds();
+    if (now - p.lastBonkAt < BONK_COOLDOWN_S) return;   // ~3 whacks/second, no more
+    p.lastBonkAt = now;
+
+    // Never trust the reported number beyond "could they actually swing that".
+    const max = this.bestBonkDamage(p);
+    const asked = Math.round(num(d.dmg, max));
+    const dmg = clamp(asked > 0 ? asked : max, 1, max);
+
+    fl.hp = Math.max(0, fl.hp - dmg);
+
+    if (fl.hp <= 0) { this.killFlopper(p, fl); return; }
+    this.send(p.id, MSG.FLOPPER, {
+      state: 'hit',
+      flopperId: fl.flopperId,
+      hp: fl.hp,
+      maxHp: fl.maxHp,
+      dmg,
+    });
+  }
+
+  /** The catch stops flopping: NOW it is yours (inventory, stats, artifact). */
+  killFlopper(p, fl) {
+    p.floppers.delete(fl.flopperId);
+
+    const item = fl.item;
     p.inventory.push(item);
     p.stats.fish++;
     this.stats.fishCaught++;
 
     const prevBest = this.stats.biggestCatch;
-    const newRecord = !prevBest || roll.value > prevBest.value;
-    if (newRecord) {
+    if (!prevBest || item.value > prevBest.value) {
       this.stats.biggestCatch = {
         fishId: item.fishId,
         name: item.name,
@@ -669,16 +1001,48 @@ export class Game {
       };
     }
 
-    this.send(id, MSG.CAST_RESULT, { caught: true, fish: item, newRecord });
+    this.send(p.id, MSG.FLOPPER, {
+      state: 'dead',
+      flopperId: fl.flopperId,
+      fish: item,
+      hp: 0,
+      maxHp: fl.maxHp,
+    });
     this.sendInventory(p);
+    this.awardArtifact(p, fl.fishDef);
+  }
 
-    if (roll.mutation) {
-      this.chat('ISLAND', `${p.name} pulled up a ${roll.mutation.toUpperCase()} ${item.name}!`);
-    } else if (roll.tier >= 9) {
-      this.chat('ISLAND', `${p.name} landed a ${item.name} (${item.weightKg} kg).`);
+  /** The catch wins: it flips over the gunwale and is gone for good. */
+  escapeFlopper(p, fl, reason) {
+    p.floppers.delete(fl.flopperId);
+    this.send(p.id, MSG.FLOPPER, {
+      state: 'escaped',
+      flopperId: fl.flopperId,
+      fish: fl.item,
+      hp: 0,
+      maxHp: fl.maxHp,
+      reason: reason || 'timeout',
+    });
+    if (fl.item.mutation || num(fl.item.tier, 1) >= 8) {
+      this.chat('ISLAND', `${p.name}'s ${fl.item.name} flopped back into the sea.`);
     }
+  }
 
-    this.awardArtifact(p, roll.fish);
+  clearFloppers(p, notify) {
+    if (!p || !p.floppers || !p.floppers.size) return;
+    for (const fl of Array.from(p.floppers.values())) {
+      if (notify) this.escapeFlopper(p, fl, 'lost');
+      else p.floppers.delete(fl.flopperId);
+    }
+  }
+
+  updateFloppers(now) {
+    for (const p of this.players.values()) {
+      if (!p.floppers.size) continue;
+      for (const fl of Array.from(p.floppers.values())) {
+        if (now >= fl.expiresAt) this.escapeFlopper(p, fl, 'timeout');
+      }
+    }
   }
 
   onCancelCast(id) {
@@ -826,10 +1190,14 @@ export class Game {
         p.gear.diving = item.level;
         message = `${item.name} strapped on. ${item.air}s of air.`;
         break;
-      case 'weapon':
+      case 'weapon': {
         p.gear.weapons.push(item.id);
-        message = `${item.name} in hand. ${item.dmg} damage.`;
+        const swing = item.attack === 'both' ? num(item.meleeDmg, item.dmg) : num(item.dmg, 0);
+        message = (item.attack === 'melee' || item.attack === 'both')
+          ? `${item.name} in hand. ${swing} damage a swing — and it finishes a flopping catch.`
+          : `${item.name} in hand. ${item.dmg} damage.`;
         break;
+      }
       case 'charm':
         p.gear.charms.push(item.id);
         message = `${item.name} on your belt. Luck rising.`;
@@ -873,6 +1241,7 @@ export class Game {
       p.alive = false;
       p.hp = 0;
       p.casting = null;
+      this.clearFloppers(p, true);   // whatever was on the deck slides overboard
       for (let i = 0; i < BOAT_SEATS; i++) if (this.boat.seats[i] === p.id) this.boat.seats[i] = null;
       p.seat = -1;
       p.onBoat = false;
@@ -982,6 +1351,10 @@ export class Game {
   updateEnemies(dt, now) {
     if (!this.enemies.length) return;
     const seaFloorPad = 4;
+    // Dead fog: they cannot see you either, but they hunt on smell and bad intentions.
+    const aggroMult = this.weather === 'fog'
+      ? Math.max(1, num(WEATHER_RULES.FOG_AGGRO_MULT, 1.5))
+      : 1;
 
     for (let i = 0; i < this.enemies.length; i++) {
       const e = this.enemies[i];
@@ -993,7 +1366,8 @@ export class Game {
       const def = e.def;
       // --- pick a target -------------------------------------------
       let target = null;
-      let bestD2 = def.aggroRange * def.aggroRange;
+      const aggro = def.aggroRange * aggroMult;
+      let bestD2 = aggro * aggro;
       for (const p of this.players.values()) {
         if (!p.alive) continue;
         const dx = p.pos[0] - e.p[0];
@@ -1102,14 +1476,27 @@ export class Game {
     if (!weapon || weapon.kind !== 'weapon') return;
     if (p.gear.weapons.indexOf(weapon.id) === -1) return;
 
-    // Out-of-range shots are ignored (generous margin for latency).
+    // Out-of-range hits are ignored (generous margin for latency). Melee has to
+    // be in the enemy's face; 'both' weapons jab up close and fire past that.
     const dx = p.pos[0] - e.p[0];
     const dy = p.pos[1] - e.p[1];
     const dz = p.pos[2] - e.p[2];
-    const maxRange = num(weapon.range, 25) + 12;
-    if (dx * dx + dy * dy + dz * dz > maxRange * maxRange) return;
+    const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
 
-    const dmg = clamp(Math.round(num(d.dmg, weapon.dmg)), 1, weapon.dmg);
+    const attack = typeof weapon.attack === 'string' ? weapon.attack : 'ranged';
+    let maxDmg = num(weapon.dmg, 1);
+    let maxRange;
+    if (attack === 'melee') {
+      // Swing reach only — a club cannot touch something 20 m away.
+      maxRange = Math.max(MELEE_HIT_RANGE, num(weapon.range, 3) + 2.5);
+    } else {
+      maxRange = num(weapon.range, 25) + 12;
+      // 'both': a jab in close does meleeDmg, anything further is the ranged shot.
+      if (attack === 'both' && dist <= MELEE_HIT_RANGE) maxDmg = num(weapon.meleeDmg, maxDmg);
+    }
+    if (dist > maxRange) return;
+
+    const dmg = clamp(Math.round(num(d.dmg, maxDmg)), 1, Math.max(1, Math.round(maxDmg)));
     e.hp = Math.max(0, e.hp - dmg);
     this.broadcast(MSG.ENEMY_HIT, { enemyId: e.id, hp: e.hp, byId: p.id, dmg });
 
@@ -1128,11 +1515,15 @@ export class Game {
 
   onNightfall() {
     if (this.over || this.eventActive || this.tsunamiAt > 0) return;
+    // Bad skies draw bad things out: eventChanceMult scales the nightly roll,
+    // but a normal night is never a certainty (the pity day still is).
+    const mult = Math.max(0, num(this.weatherDef().eventChanceMult, 1));
+    const nightChance = clamp(EVENT_NIGHT_CHANCE * mult, 0, MAX_EVENT_CHANCE);
     for (const type of EVENT_ORDER) {
       if (this.eventsSurvived.indexOf(type) !== -1) continue;
       const def = EVENTS[type];
       if (this.dayNumber < def.firstDay) continue;
-      const chance = this.dayNumber >= def.pityDay ? 1 : EVENT_NIGHT_CHANCE;
+      const chance = this.dayNumber >= def.pityDay ? 1 : nightChance;
       if (Math.random() < chance) { this.startEvent(type); return; }
     }
   }

@@ -6,20 +6,28 @@
 // Owns:   public/js/fishing.js
 // Export: initFishing(ctx) -> { update(dt, t), isCasting() }
 //
+// Also owns the landed catch: a caught fish lands ALIVE on the deck and
+// flops toward the sea until it is bonked to death (MSG.FLOPPER / MSG.BONK_FISH).
+// Melee weapons bonk through enemies.js, which asks us via the handle:
+//   ctx.fishing.floppers          Map flopperId -> record ({ pos, fish, ... })
+//   ctx.fishing.tryBonk(o, d, r)  -> flopperId | null
+//
 // Bus emits:  'castPower' {p}          while charging a cast
 //             'castStart' {areaId, baitId}
 //             'reelState' {tension, sweet:[a,b], progress}
 //             'bite'      BITE payload
 //             'catch'     CAST_RESULT payload
-// Net sends:  MSG.CAST_START, MSG.REEL_DONE, MSG.CANCEL_CAST
+//             'flopper'   {state, flopperId, fish, hp, maxHp}
+// Net sends:  MSG.CAST_START, MSG.REEL_DONE, MSG.CANCEL_CAST, MSG.BONK_FISH
 // SFX names used (audio.js may synthesize what it knows):
 //   'castWhoosh' 'plop' 'bobberSet' 'bite' 'hookSet' 'reelLoop'
 //   'lineSnap' 'splash' 'catchSmall' 'catchMed' 'catchBig'
 //   'catchLegendary' 'catchMutation' 'lineMiss' 'reelIn'
+//   'bonk' 'stow' 'flopperEscape'
 // =============================================================
 
 import * as THREE from 'three';
-import { MSG, AREAS, MUTATIONS, fishById } from '/shared/constants.js';
+import { MSG, AREAS, MUTATIONS, FLOPPER, fishById, shopById } from '/shared/constants.js';
 import { createFishMesh } from './fish.js';
 
 // ---------------------------------------------------------------- temps
@@ -36,10 +44,30 @@ const _q1 = new THREE.Quaternion();
 const _q2 = new THREE.Quaternion();
 const _m1 = new THREE.Matrix4();
 const _col = new THREE.Color();
+// flopper scratch — kept apart from the cast temps so the two never collide
+const _fa = new THREE.Vector3();
+const _fb = new THREE.Vector3();
+const _fc = new THREE.Vector3();
+const _fd = new THREE.Vector3();
+const _fbox = new THREE.Box3();
 
 const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
 const lerp = (a, b, k) => a + (b - a) * k;
 const rand = (a, b) => a + Math.random() * (b - a);
+function shortAng(from, to) {
+  let d = (to - from) % (Math.PI * 2);
+  if (d > Math.PI) d -= Math.PI * 2;
+  if (d < -Math.PI) d += Math.PI * 2;
+  return d;
+}
+
+// ---------------------------------------------------------------- flopper tuning
+const FLOP_GRAV = 20;        // m/s^2 — snappier than real gravity, reads better
+const HAND_RANGE = 2.5;      // bare-hand bonk reach
+const HAND_SWING = 0.34;     // seconds of arm swing
+const HAND_CD = 0.5;         // bare hands are slower than any club
+const BONK_ARC_DOT = 0.40;   // cos(half-arc) for melee-weapon bonks
+const BONK_NEAR = 1.2;       // inside this the arc test is skipped
 
 // ---------------------------------------------------------------- geometry cache
 const _geo = new Map();
@@ -1253,6 +1281,7 @@ export function initFishing(ctx) {
     stowCelebrationFish(true);
     restoreFov();
     ripples.hide();
+    clearFloppers();
   }
 
   function endReelHud() {
@@ -1450,6 +1479,556 @@ export function initFishing(ctx) {
     F.fovActive = false;
   }
 
+  // ==========================================================
+  // THE LANDED CATCH
+  // The fish does not politely vanish into your bag any more: it lands on
+  // the deck alive, flops toward the nearest water in escalating panic and
+  // has to be whacked. The server owns hp and the escape timer; everything
+  // here is the show.
+  // ==========================================================
+  const FLOP = {
+    live: new Map(),   // flopperId -> record (exposed as ctx.fishing.floppers)
+    fading: [],        // records playing their death / escape beat
+    whackT: 0,         // bare-hand swing timer
+    whackCd: 0,
+  };
+
+  const _flopPos = [0, 0, 0];
+  const _flopOpt = { vol: 1, pos: _flopPos };
+  function flopAudio(rec, vol) {
+    _flopPos[0] = rec.pos.x; _flopPos[1] = rec.pos.y; _flopPos[2] = rec.pos.z;
+    _flopOpt.vol = vol === undefined ? 1 : vol;
+    return _flopOpt;
+  }
+
+  function localPosW(out) {
+    const c = localChar();
+    if (c && c.group) { c.group.getWorldPosition(out); return true; }
+    if (ctx.camera) { ctx.camera.getWorldPosition(out); out.y -= 1.45; return true; }
+    return false;
+  }
+  function camForward(out) {
+    if (ctx.camera) {
+      ctx.camera.getWorldDirection(out);
+      out.y = 0;
+      if (out.lengthSq() > 1e-6) { out.normalize(); return; }
+    }
+    out.set(0, 0, 1);
+  }
+
+  // Which weapon would swing if the player pressed fire right now?
+  function activeWeaponDef() {
+    const gear = state.gear;
+    const owned = gear && Array.isArray(gear.weapons) ? gear.weapons : null;
+    if (!owned || owned.length === 0) return null;
+    const act = gear.activeWeapon;
+    if (act && owned.indexOf(act) !== -1) {
+      const d = shopById(act);
+      if (d && d.kind === 'weapon') return d;
+    }
+    let best = null;
+    for (let i = 0; i < owned.length; i++) {
+      const d = shopById(owned[i]);
+      if (d && d.kind === 'weapon' && (!best || d.price > best.price)) best = d;
+    }
+    return best;
+  }
+  // True when enemies.js will handle the bonk with a real weapon instead.
+  function meleeWeaponReady() {
+    if (state.activeTool !== 'weapon') return false;
+    const d = activeWeaponDef();
+    if (!d) return false;
+    return d.attack === 'melee' || d.attack === 'both';
+  }
+
+  // ---- surface sampling ----
+  function groundFor(rec) {
+    if (rec.onDeck) { rec.inWater = false; return rec.deckY; }
+    const wy = waterY(rec.pos.x, rec.pos.z);
+    const ty = terrainY(rec.pos.x, rec.pos.z);
+    if (ty > wy + 0.03) { rec.inWater = false; return ty; }
+    rec.inWater = true;
+    return wy;
+  }
+
+  // Which way is the sea? Sample a ring and take the wettest heading.
+  function computeEscapeDir(rec) {
+    if (rec.onDeck) {
+      // over the gunwale: straight out from the middle of the boat
+      const b = ctx.boat && ctx.boat.group;
+      if (b) { b.getWorldPosition(_fa); _fb.subVectors(rec.pos, _fa); }
+      else if (localPosW(_fa)) _fb.subVectors(rec.pos, _fa);
+      else _fb.set(0, 0, 1);
+      _fb.y = 0;
+      if (_fb.lengthSq() < 1e-4) _fb.set(Math.cos(rec.seed), 0, Math.sin(rec.seed));
+      rec.escDir.copy(_fb).normalize();
+      return;
+    }
+    let bestScore = -Infinity, bx = rec.escDir.x, bz = rec.escDir.z;
+    for (let i = 0; i < 12; i++) {
+      const a = (i / 12) * Math.PI * 2 + rec.seed;
+      const dx = Math.cos(a), dz = Math.sin(a);
+      let score = -Infinity;
+      for (let r = 4; r <= 16; r += 6) {
+        const x = rec.pos.x + dx * r, z = rec.pos.z + dz * r;
+        const s = (waterY(x, z) - terrainY(x, z)) - r * 0.04;
+        if (s > score) score = s;
+      }
+      if (score > bestScore) { bestScore = score; bx = dx; bz = dz; }
+    }
+    if (bx !== 0 || bz !== 0) rec.escDir.set(bx, 0, bz).normalize();
+  }
+
+  // ---- spawn ----
+  function placeFlopper(rec) {
+    if (!localPosW(_fa)) _fa.set(0, 0, 0);
+    camForward(_fb);
+    const side = rand(-0.45, 0.45);
+    rec.pos.set(
+      _fa.x + _fb.x * 1.15 - _fb.z * side,
+      _fa.y + 0.65,
+      _fa.z + _fb.z * 1.15 + _fb.x * side);
+    rec.onDeck = !!state.onBoat;
+    rec.deckY = _fa.y;
+    if (rec.onDeck && ctx.boat && ctx.boat.group) {
+      rec.boatPrev = new THREE.Vector3();
+      ctx.boat.group.getWorldPosition(rec.boatPrev);
+    } else {
+      rec.boatPrev = null;
+    }
+    rec.vel.set(_fb.x * 0.7, 1.3, _fb.z * 0.7);
+    rec.yaw = Math.atan2(_fb.x, _fb.z);
+    rec.yawTarget = rec.yaw;
+    computeEscapeDir(rec);
+    rec.dirT = 0.5;
+  }
+
+  function spawnFlopper(p) {
+    const id = p.flopperId;
+    const existing = FLOP.live.get(id);
+    if (existing) return existing;
+
+    const fish = p.fish || null;
+    const def = fish ? fishById(fish.fishId) : null;
+    const tier = (fish && fish.tier) || (def && def.tier) || 1;
+    const maxHp = (typeof p.maxHp === 'number' && p.maxHp > 0)
+      ? p.maxHp : FLOPPER.BASE_HP + tier * FLOPPER.HP_PER_TIER;
+    const hp = typeof p.hp === 'number' ? p.hp : maxHp;
+    // the server states its own window; fall back to the shared constant
+    const escapeS = (typeof p.escapeSeconds === 'number' && p.escapeSeconds > 0)
+      ? p.escapeSeconds : FLOPPER.ESCAPE_SECONDS;
+
+    let mesh = null;
+    let rest = 0.1;
+    if (def) {
+      const size = (def.model && def.model.size) || 0.5;
+      const shown = clamp(size, 0.35, 1.25);
+      try { mesh = createFishMesh(def, (fish && fish.mutation) || null, shown / size); } catch (e) { mesh = null; }
+    }
+    if (mesh) {
+      mesh.rotation.order = 'YXZ';
+      mesh.traverse(o => { o.frustumCulled = false; if (o.isMesh) o.castShadow = true; });
+      _fbox.setFromObject(mesh);
+      if (!_fbox.isEmpty()) {
+        _fbox.getSize(_fa);
+        rest = clamp(_fa.y * 0.45, 0.05, 0.5);
+      }
+      scene.add(mesh);
+    }
+
+    const rec = {
+      id, fish, def, tier, hp, maxHp, mesh, rest,
+      pos: new THREE.Vector3(), vel: new THREE.Vector3(),
+      yaw: 0, yawTarget: 0, roll: 0, arch: 1, squash: 0,
+      grounded: false, inWater: false,
+      hopT: 0.18, age: 0, panic: 0, escapeS, escapeT: escapeS,
+      flinch: 0, animT: Math.random() * 10, seed: Math.random() * 6.283,
+      dirT: 0, escDir: new THREE.Vector3(0, 0, 1),
+      onDeck: false, deckY: 0, boatPrev: null,
+      state: 'live', fadeT: 0, fadeDur: 0.5, splashed: false,
+      // while the catch celebration is still holding the trophy overhead we
+      // keep the flopper hidden, then let it squirm out of your hands
+      holdT: F.phase === 'celebrating' ? clamp(F.celDur - F.celT + 0.05, 0, 4) : 0,
+    };
+    placeFlopper(rec);
+    if (mesh) {
+      mesh.position.copy(rec.pos);
+      mesh.scale.setScalar(1);
+      mesh.visible = rec.holdT <= 0;
+    }
+    FLOP.live.set(id, rec);
+    return rec;
+  }
+
+  function destroyFlopper(rec) {
+    const m = rec.mesh;
+    rec.mesh = null;
+    if (!m) return;
+    if (m.parent) m.parent.remove(m);
+    if (m.userData && typeof m.userData.dispose === 'function') {
+      try { m.userData.dispose(); } catch (e) { /* shared caches survive */ }
+    }
+  }
+
+  function clearFloppers() {
+    for (const rec of FLOP.live.values()) destroyFlopper(rec);
+    FLOP.live.clear();
+    for (let i = 0; i < FLOP.fading.length; i++) destroyFlopper(FLOP.fading[i]);
+    FLOP.fading.length = 0;
+    FLOP.whackT = 0;
+    FLOP.whackCd = 0;
+  }
+
+  // ---- per-frame flopping ----
+  function slapFX(rec, impact) {
+    const k = clamp(impact * 0.24, 0.15, 1);
+    if (rec.inWater) {
+      doSplash(rec.pos, 0.35 + k * 0.55);
+      ripples.spawn(rec.pos.x, rec.pos.y - rec.rest, rec.pos.z, 0.1, 0.7 + k * 1.1, 0.8, 0xdff4ff, 0.3 + k * 0.25);
+      sfx('splash', flopAudio(rec, 0.26 + k * 0.3));
+    } else {
+      sparks.burst(rec.pos, 3 + Math.floor(k * 5), {
+        color: 0xd9cba6, speed: 1.1 + k, up: 0.7, size: 0.065, life: 0.3, gravity: 15, spread: 0.9,
+      });
+      sfx('plop', flopAudio(rec, 0.18 + k * 0.22));
+    }
+  }
+
+  function updateFlopper(rec, dt) {
+    rec.age += dt;
+    rec.escapeT = Math.max(0, rec.escapeT - dt);
+    rec.panic = clamp(1 - rec.escapeT / Math.max(1, rec.escapeS || FLOPPER.ESCAPE_SECONDS), 0, 1);
+    rec.flinch = Math.max(0, rec.flinch - dt * 3.6);
+    rec.squash = Math.max(0, rec.squash - dt * 5);
+    rec.arch = Math.max(0, rec.arch - dt * 2.4);
+    rec.animT += dt * (2.2 + rec.panic * 5.5 + (rec.grounded ? 0 : 1.6));
+
+    // still in your hands during the catch fanfare
+    if (rec.holdT > 0) {
+      rec.holdT -= dt;
+      if (F.celFish && F.phase === 'celebrating') rec.pos.copy(F.celFish.position);
+      if (rec.mesh) { rec.mesh.visible = false; rec.mesh.position.copy(rec.pos); }
+      if (rec.holdT > 0) return;
+      camForward(_fb);                      // it kicks free of your grip
+      rec.vel.set(_fb.x * 1.2 + rand(-0.5, 0.5), 1.1, _fb.z * 1.2 + rand(-0.5, 0.5));
+      rec.arch = 1;
+      rec.grounded = false;
+      if (rec.mesh) rec.mesh.visible = true;
+      sfx('plop', flopAudio(rec, 0.4));
+    }
+
+    // ride the deck if we landed on a moving boat
+    if (rec.onDeck) {
+      if (state.onBoat && ctx.boat && ctx.boat.group) {
+        ctx.boat.group.getWorldPosition(_fa);
+        if (rec.boatPrev) {
+          rec.pos.x += _fa.x - rec.boatPrev.x;
+          rec.pos.y += _fa.y - rec.boatPrev.y;
+          rec.pos.z += _fa.z - rec.boatPrev.z;
+          rec.boatPrev.copy(_fa);
+        } else {
+          rec.boatPrev = _fa.clone();
+        }
+        if (localPosW(_fb)) rec.deckY = _fb.y;
+      } else {
+        rec.onDeck = false;      // you stepped off: it goes back to the world
+      }
+    }
+
+    rec.dirT -= dt;
+    if (rec.dirT <= 0) {
+      rec.dirT = 0.55 + Math.random() * 0.35;
+      computeEscapeDir(rec);
+    }
+
+    // ---- ballistics ----
+    rec.vel.y -= FLOP_GRAV * dt;
+    rec.pos.addScaledVector(rec.vel, dt);
+    const gy = groundFor(rec) + rec.rest;
+    if (rec.pos.y <= gy) {
+      const impact = -rec.vel.y;
+      rec.pos.y = gy;
+      rec.vel.y = 0;
+      rec.vel.x *= 0.3;
+      rec.vel.z *= 0.3;
+      if (!rec.grounded) {
+        rec.grounded = true;
+        if (impact > 1.3) {
+          rec.squash = clamp(impact * 0.2, 0, 1);
+          slapFX(rec, impact);
+        }
+      }
+    } else {
+      rec.grounded = false;
+      const d = Math.exp(-0.9 * dt);
+      rec.vel.x *= d;
+      rec.vel.z *= d;
+    }
+
+    // ---- the hop itself ----
+    if (rec.grounded) {
+      rec.hopT -= dt * (0.75 + rec.panic * 1.9);
+      if (rec.hopT <= 0) {
+        rec.hopT = rand(0.3, 0.72);
+        const wet = rec.inWater;
+        const power = (wet ? 1.5 : 2.5) + rec.panic * (wet ? 1.2 : 2.7);
+        const spread = (0.95 - rec.panic * 0.6) * (wet ? 1.5 : 1);
+        const a = Math.atan2(rec.escDir.x, rec.escDir.z) + rand(-spread, spread);
+        const push = (wet ? 0.45 : 1.0) * (0.9 + rec.panic * 1.5);
+        rec.vel.set(Math.sin(a) * push, power, Math.cos(a) * push);
+        rec.yawTarget = a;
+        rec.arch = 1;
+        rec.grounded = false;
+        if (Math.random() < 0.35) sfx(wet ? 'splash' : 'plop', flopAudio(rec, wet ? 0.26 : 0.18));
+      }
+    }
+
+    // ---- pose ----
+    rec.yaw += shortAng(rec.yaw, rec.yawTarget) * clamp(dt * 5, 0, 1);
+    const m = rec.mesh;
+    if (!m) return;
+    m.position.copy(rec.pos);
+    const air = rec.grounded ? 0 : 1;
+    const wig = Math.sin(rec.age * (12 + rec.panic * 11) + rec.seed);
+    const pitch = -rec.arch * 0.8 * air + wig * 0.14 * (1 - air) - clamp(rec.vel.y, -6, 6) * 0.035;
+    const roll = wig * (0.32 + rec.panic * 0.55) * (rec.grounded ? 1 : 0.5)
+      + rec.flinch * Math.sin(rec.age * 40) * 0.5;
+    m.rotation.set(pitch, rec.yaw, roll);
+    const sq = rec.squash;
+    const s = 1 + rec.flinch * 0.12;
+    m.scale.set(s * (1 + sq * 0.2), s * (1 - sq * 0.35), s * (1 + sq * 0.12));
+    if (m.userData && typeof m.userData.update === 'function') {
+      try { m.userData.update(rec.animT); } catch (e) { m.userData.update = null; }
+    }
+  }
+
+  // ---- reactions to the server ----
+  function flopperHit(rec) {
+    rec.flinch = 1;
+    rec.arch = 1;
+    rec.grounded = false;
+    if (localPosW(_fa)) {
+      _fb.subVectors(rec.pos, _fa);
+      _fb.y = 0;
+      if (_fb.lengthSq() < 1e-4) _fb.set(0, 0, 1);
+      _fb.normalize();
+    } else {
+      _fb.set(0, 0, 1);
+    }
+    rec.vel.set(_fb.x * 1.5, 3.3, _fb.z * 1.5);
+    rec.yawTarget = rec.yaw + rand(-1.2, 1.2);
+    sparks.burst(rec.pos, 16, {
+      color: () => (Math.random() < 0.5 ? 0xfff2a8 : 0xffffff),
+      speed: 3.2, up: 1.1, size: 0.11, life: 0.5, gravity: 13, spread: 0.9,
+    });
+    sparks.burst(rec.pos, 5, { color: 0xffffff, speed: 0.5, up: 0.2, size: 0.19, life: 0.16, gravity: 0, spread: 0.2 });
+    sfx('bonk', flopAudio(rec, 0.95));
+    F.shake = Math.max(F.shake, 0.16);
+  }
+
+  function flopperDead(rec) {
+    if (rec.state !== 'live') return;
+    rec.state = 'dead';
+    FLOP.live.delete(rec.id);
+    FLOP.fading.push(rec);
+    rec.fadeT = 0;
+    rec.fadeDur = 0.5;
+    sparks.burst(rec.pos, 22, {
+      color: () => (Math.random() < 0.4 ? 0xffe9a8 : 0xeaf4ff),
+      speed: 2.3, up: 1.0, size: 0.1, life: 0.5, gravity: 5, spread: 1.1,
+    });
+    sfx('stow', flopAudio(rec, 0.95));   // audio.js already ends this one on a chime
+    if (rec.mesh) rec.mesh.visible = true;
+  }
+
+  function flopperEscaped(rec) {
+    if (rec.state !== 'live') return;
+    rec.state = 'escaped';
+    FLOP.live.delete(rec.id);
+    FLOP.fading.push(rec);
+    rec.fadeT = 0;
+    rec.fadeDur = 1.4;
+    rec.splashed = false;
+    computeEscapeDir(rec);
+    rec.vel.set(rec.escDir.x * 5.4, 7.2, rec.escDir.z * 5.4);   // one last triumphant leap
+    rec.arch = 1;
+    rec.grounded = false;
+    if (rec.mesh) rec.mesh.visible = true;
+    sfx('flopperEscape', flopAudio(rec, 1));
+  }
+
+  // returns true when the record is finished and can be disposed
+  function updateFading(rec, dt) {
+    rec.fadeT += dt;
+    rec.animT += dt * 6;
+    const m = rec.mesh;
+
+    if (rec.state === 'dead') {
+      // shrink and arc into the (implied) bag at your hip
+      const k = clamp(rec.fadeT / rec.fadeDur, 0, 1);
+      if (!localPosW(_fa)) _fa.copy(rec.pos);
+      _fa.y += 0.95;
+      camForward(_fb);
+      _fa.addScaledVector(_fb, 0.18);
+      rec.pos.lerp(_fa, clamp(dt * 9, 0, 1));
+      rec.pos.y += Math.sin(k * Math.PI) * dt * 2.2;
+      if (m) {
+        m.position.copy(rec.pos);
+        m.rotation.set(-0.7 * k, m.rotation.y + dt * 10, m.rotation.z);
+        m.scale.setScalar(Math.max(0.001, 1 - k * k));
+        m.visible = k < 1;
+      }
+      return k >= 1;
+    }
+
+    // escaped: sail back into the sea
+    rec.vel.y -= FLOP_GRAV * 0.75 * dt;
+    rec.pos.addScaledVector(rec.vel, dt);
+    const wy = waterY(rec.pos.x, rec.pos.z);
+    if (m && !rec.splashed) {
+      m.position.copy(rec.pos);
+      rec.yawTarget = Math.atan2(rec.vel.x, rec.vel.z);
+      rec.yaw += shortAng(rec.yaw, rec.yawTarget) * clamp(dt * 6, 0, 1);
+      const hor = Math.sqrt(rec.vel.x * rec.vel.x + rec.vel.z * rec.vel.z);
+      m.rotation.set(
+        clamp(Math.atan2(rec.vel.y, Math.max(0.001, hor)), -1.2, 1.2),
+        rec.yaw,
+        Math.sin(rec.fadeT * 22) * 0.35);
+      if (m.userData && typeof m.userData.update === 'function') {
+        try { m.userData.update(rec.animT); } catch (e) { m.userData.update = null; }
+      }
+    }
+    if (!rec.splashed && rec.pos.y <= wy) {
+      rec.splashed = true;
+      doSplash(rec.pos, 2.4);
+      ripples.spawn(rec.pos.x, wy, rec.pos.z, 0.2, 4.2, 1.2, 0xdff4ff, 0.75);
+      sparks.burst(rec.pos, 28, {
+        color: 0xdff4ff, speed: 3.4, up: 1.5, size: 0.12, life: 0.7, gravity: 12, spread: 0.7,
+      });
+      sfx('splash', flopAudio(rec, 1));
+      F.shake = Math.max(F.shake, 0.24);
+      if (m) m.visible = false;
+    }
+    return rec.fadeT >= rec.fadeDur || (rec.splashed && rec.fadeT > 0.3);
+  }
+
+  // ---- targeting ----
+  function pickFlopper(origin, dir, range) {
+    let best = null, bd = Infinity;
+    for (const rec of FLOP.live.values()) {
+      if (rec.state !== 'live' || rec.holdT > 0) continue;
+      _fa.subVectors(rec.pos, origin);
+      const d = _fa.length();
+      if (d > range + 0.4) continue;
+      if (dir && d > BONK_NEAR) {
+        _fa.multiplyScalar(1 / d);
+        if (_fa.dot(dir) < BONK_ARC_DOT) continue;
+      }
+      if (d < bd) { bd = d; best = rec; }
+    }
+    return best;
+  }
+
+  // Shared convention with enemies.js: every melee swing asks us whether it
+  // also caught a landed fish. Returns the flopper id or null.
+  function tryBonk(originPos, dirVec, range) {
+    if (!originPos || typeof originPos.x !== 'number') return null;
+    if (FLOP.live.size === 0) return null;
+    const r = (typeof range === 'number' && range > 0) ? range : 3;
+    _fc.set(originPos.x, originPos.y || 0, originPos.z || 0);
+    let dir = null;
+    if (dirVec && typeof dirVec.x === 'number') {
+      _fd.set(dirVec.x, dirVec.y || 0, dirVec.z || 0);
+      if (_fd.lengthSq() > 1e-6) { _fd.normalize(); dir = _fd; }
+    }
+    const rec = pickFlopper(_fc, dir, r);
+    return rec ? rec.id : null;
+  }
+
+  // ---- bare hands ----
+  function handWhack(rec) {
+    if (FLOP.whackCd > 0) return;
+    FLOP.whackCd = HAND_CD;
+    FLOP.whackT = HAND_SWING;
+    setAnim('cast');
+    sfx('castWhoosh', { vol: 0.4 });
+    if (ctx.net && typeof ctx.net.send === 'function') {
+      ctx.net.send(MSG.BONK_FISH, { flopperId: rec.id, dmg: FLOPPER.HAND_DMG });
+    }
+  }
+
+  // We run after player.js has posed the rig, so writing bones here wins for
+  // this frame; player.js damps back out of it on the next one.
+  function applyWhackPose() {
+    const c = localChar();
+    if (!c || !c.bones) return;
+    const b = c.bones;
+    const k = clamp(1 - FLOP.whackT / HAND_SWING, 0, 1);
+    const wk = 0.3;
+    let arm, lean;
+    if (k < wk) {
+      const u = k / wk;
+      arm = -0.5 - 1.6 * u * u;
+      lean = -0.08 * u;
+    } else {
+      const u = (k - wk) / (1 - wk);
+      const e = 1 - Math.pow(1 - u, 2.4);
+      arm = -2.1 + 2.45 * e;
+      lean = -0.08 + 0.3 * e * (1 - u * 0.5);
+    }
+    if (b.armR) { b.armR.rotation.x = arm; b.armR.rotation.y = -0.1; b.armR.rotation.z = 0.22; }
+    if (b.foreR) b.foreR.rotation.x = -0.5 + 0.32 * k;
+    if (b.hips) b.hips.rotation.x += (lean - b.hips.rotation.x) * 0.5;
+    if (b.head) b.head.rotation.x += ((lean * 0.5) - b.head.rotation.x) * 0.4;
+  }
+
+  function updateFloppers(dt) {
+    if (FLOP.whackCd > 0) FLOP.whackCd = Math.max(0, FLOP.whackCd - dt);
+    if (FLOP.whackT > 0) {
+      FLOP.whackT = Math.max(0, FLOP.whackT - dt);
+      applyWhackPose();
+    }
+    for (const rec of FLOP.live.values()) {
+      try { updateFlopper(rec, dt); } catch (e) { /* one bad fish must not stop the frame */ }
+    }
+    for (let i = FLOP.fading.length - 1; i >= 0; i--) {
+      const rec = FLOP.fading[i];
+      let done = false;
+      try { done = updateFading(rec, dt); } catch (e) { done = true; }
+      if (done) { destroyFlopper(rec); FLOP.fading.splice(i, 1); }
+    }
+  }
+
+  // ---- MSG.FLOPPER ----
+  function onFlopper(p) {
+    if (!p || typeof p !== 'object') return;
+    const id = p.flopperId;
+    if (id === undefined || id === null) return;
+    const st = p.state;
+    let rec = FLOP.live.get(id) || null;
+
+    if (st === 'spawn') {
+      rec = spawnFlopper(p);
+    } else if (rec) {
+      if (typeof p.hp === 'number') rec.hp = p.hp;
+      if (typeof p.maxHp === 'number' && p.maxHp > 0) rec.maxHp = p.maxHp;
+      if (st === 'hit') flopperHit(rec);
+      else if (st === 'dead') flopperDead(rec);
+      else if (st === 'escaped') flopperEscaped(rec);
+    }
+
+    // ui.js draws the bonk prompt / hp pips / escape timer off this
+    bus.emit('flopper', {
+      state: st,
+      flopperId: id,
+      fish: p.fish || (rec && rec.fish) || null,
+      hp: typeof p.hp === 'number' ? p.hp : (rec ? rec.hp : undefined),
+      maxHp: (typeof p.maxHp === 'number' && p.maxHp > 0) ? p.maxHp : (rec ? rec.maxHp : undefined),
+      escapeSeconds: (typeof p.escapeSeconds === 'number' && p.escapeSeconds > 0)
+        ? p.escapeSeconds : (rec ? rec.escapeS : undefined),
+    });
+  }
+
   // ---------------------------------------------------------- listeners
   // BITE / CAST_RESULT are taken from BOTH the socket and the bus (main.js
   // mirrors them onto the bus). onBite/onCatch are idempotent - they only act
@@ -1458,6 +2037,7 @@ export function initFishing(ctx) {
   if (ctx.net && typeof ctx.net.on === 'function') {
     ctx.net.on(MSG.BITE, onBite);
     ctx.net.on(MSG.CAST_RESULT, onCatch);
+    ctx.net.on(MSG.FLOPPER, onFlopper);
   }
   bus.on('bite', onBite);
   bus.on('catch', onCatch);
@@ -1700,6 +2280,7 @@ export function initFishing(ctx) {
 
     if (state.phase !== 'playing') {
       if (F.phase !== 'idle') hardReset();
+      else if (FLOP.live.size > 0 || FLOP.fading.length > 0) clearFloppers();
       if (F.rod) F.rod.group.visible = false;
       lineObj.visible = false;
       bobber.visible = false;
@@ -1724,6 +2305,14 @@ export function initFishing(ctx) {
     const showRod = state.activeTool === 'rod' && !isDriver() && state.hp > 0;
     if (F.rod) F.rod.group.visible = showRod;
 
+    // ---- landed catch takes priority over starting a new cast.
+    // A melee weapon in hand means enemies.js owns the swing instead.
+    let bonkRec = null;
+    if (FLOP.live.size > 0 && state.hp > 0 && !meleeWeaponReady() && localPosW(_fc)) {
+      _fc.y += 0.9;
+      bonkRec = pickFlopper(_fc, null, HAND_RANGE);
+    }
+
     // ---- cancel
     if ((keyRPressed || rmb) && F.phase !== 'idle' && F.phase !== 'celebrating') {
       if (F.phase === 'charging') {
@@ -1740,10 +2329,23 @@ export function initFishing(ctx) {
     // ---- state machine
     switch (F.phase) {
       case 'idle': {
+        if (bonkRec) {
+          if (lmbPressed && !rmb) handWhack(bonkRec);
+          break;                                   // no cast while it is still kicking
+        }
         if (lmbPressed && !rmb && canStartCast()) beginCharge();
         break;
       }
       case 'charging': {
+        if (bonkRec) {
+          // it landed right beside you mid-wind-up: deal with it first
+          F.phase = 'idle';
+          F.power = 0;
+          F.powerMsg.p = 0;
+          bus.emit('castPower', F.powerMsg);
+          setAnim('idle');
+          break;
+        }
         if (!canStartCast()) {
           F.phase = 'idle'; F.power = 0;
           F.powerMsg.p = 0; bus.emit('castPower', F.powerMsg);
@@ -1825,6 +2427,7 @@ export function initFishing(ctx) {
     updateRodFx(sdt);
     updateIdleBobberPose(dt);
     updateLine(dt);
+    updateFloppers(dt);
     applyCameraFx(dt);
   }
 
@@ -1899,6 +2502,9 @@ export function initFishing(ctx) {
       return F.phase === 'flying' || F.phase === 'waiting' || F.phase === 'hooking'
         || F.phase === 'reeling' || F.phase === 'resolving' || F.phase === 'celebrating';
     },
+    // shared with enemies.js so a melee swing can also bonk your own catch
+    floppers: FLOP.live,
+    tryBonk,
   };
   return handle;
 }

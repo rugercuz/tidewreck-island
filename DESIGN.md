@@ -156,3 +156,35 @@ hat, arms/legs animated procedurally (walk/run/swim/cast/sit/drive), player-colo
 floating name tag (canvas sprite). Rods get visibly cooler per level (driftwood → glowing
 mythline). Fish read as their species at a glance; mutations are unmistakable (see
 MUTATIONS.fx). Boat upgrades change the hull visibly (dinghy → lamp-rigged abyss-runner).
+
+## Wave 2 addendum — weather, melee, catch-bonking (see constants: WEATHER, WEATHER_RULES, FLOPPER, weapon `attack` fields)
+
+**Protocol additions:** WORLD_STATE gains `weather: {type}`. On change server broadcasts
+MSG.WEATHER `{type}`. MSG.LIGHTNING `{p:[x,y,z], targetId|null}` per strike during storms.
+MSG.FLOPPER `{state:'spawn'|'hit'|'dead'|'escaped', flopperId, fish?, hp?, maxHp?}` — a caught
+fish no longer goes straight to inventory: the server creates a flopper (hp = FLOPPER.BASE_HP +
+tier * HP_PER_TIER); the catcher sends MSG.BONK_FISH `{flopperId, dmg}` per whack (server clamps
+dmg to the player's best owned melee option; bare hands = FLOPPER.HAND_DMG; weapons with
+attack 'melee' use dmg, 'both' use meleeDmg); hp<=0 -> state 'dead' + INVENTORY (artifact award
+happens HERE now, not at catch); no kill within FLOPPER.ESCAPE_SECONDS -> 'escaped', fish lost.
+
+**Client wiring:** modules subscribe to new messages directly via `ctx.net.on(MSG.X, cb)`
+(net.js fans out every server event; no main.js changes needed). fishing.js re-emits bus
+'flopper' `{state, flopperId, fish, hp, maxHp}` for ui. Current weather readable at
+`ctx.state.world.weather.type` (may be absent on old payloads — guard).
+
+**Server effects:** weather rerolled at dawn + dusk (WEATHER weights; pity per WEATHER_RULES,
+storm-biased). Fishing rolls add weather luck/tierBias, bite delay divided by biteSpeed,
+weather-exclusive fish (FISH[].weather) join their tier pool only during that weather. Nightly
+horror-event odds x eventChanceMult. Storms strike lightning every LIGHTNING_PERIOD seconds at
+a random player on open water above the surface (LIGHTNING_DMG, or a random sea point if nobody
+is exposed). Fog multiplies enemy aggroRange by FOG_AGGRO_MULT.
+
+**Visuals/feel:** world.js renders weather (clouds, rain streaks, fog density, storm darkening,
+lightning bolts + flash on MSG.LIGHTNING, palm wind-lean), transitions ~5s, never fighting
+setNightSnap. water.js lerps a waveScale uniform toward WEATHER[type].waveScale (~8s) applied
+identically in the shader AND ctx.getWaterHeight. enemies.js implements melee swings (arc hit,
+range ~3.5m) for 'melee'/'both' weapons; trident jabs when a target is within 4m, else fires.
+fishing.js spawns the comedic flopping catch on deck (hops toward the water!), bonk impacts,
+stow-on-kill, sad escape. ui.js: weather chip + hazard toast, BONK prompt + hp pips + escape
+timer, attack-type badges in the shop. audio.js: rain/thunder/wind, thwack bonks, escape sting.

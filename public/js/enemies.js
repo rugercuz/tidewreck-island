@@ -5,9 +5,11 @@
 // Owns:
 //   * Rendering / interpolation / animation of server-driven enemies
 //     (bus 'enemyState', bus 'enemyHit', MSG.ENEMY_STATE, MSG.ENEMY_HIT)
-//   * The three weapons (Harpoon, Speargun, Storm Trident): hand models,
-//     firing, projectiles, the trident's lightning lance, hit detection and
-//     MSG.DAMAGE_ENEMY reporting.
+//   * Every weapon (Fish Bonker, Harpoon, Rusty Cutlass, Speargun, Storm
+//     Trident): hand models, firing, projectiles, the trident's lightning
+//     lance, melee swings, hit detection and MSG.DAMAGE_ENEMY reporting.
+//   * Melee swings also bonk the local player's landed catch through
+//     fishing.js (ctx.fishing.tryBonk -> MSG.BONK_FISH).
 //
 // Damage to the LOCAL player from enemies is entirely server-authoritative —
 // this module never sends MSG.PLAYER_HIT. It only plays the bite feedback
@@ -40,6 +42,15 @@ const HARPOON_RETURN = 0.8;   // seconds until the harpoon is back in hand
 const BOLT_SPEED = 58;
 const BEAM_TIME = 0.17;
 
+// Melee: a short wind-up followed by a ~120 degree arc.
+const MELEE_SWING = 0.26;      // seconds, whole swing
+const MELEE_WINDUP = 0.09;     // seconds spent cocking the arm back
+const MELEE_CONTACT = 0.145;   // seconds until the blow lands
+const MELEE_ARC_DOT = 0.42;    // cos(half-arc) -> ~130 deg of frontal cone
+const MELEE_JAB_RANGE = 4.0;   // 'both' weapons jab instead of firing inside this
+const MELEE_NEAR = 1.3;        // closer than this the arc test is skipped
+const MELEE_MAX_TARGETS = 3;   // a wide swing may catch a small shoal
+
 // ------------------------------------------------------------------
 // Scratch objects — module level so per-frame allocation stays at zero
 // ------------------------------------------------------------------
@@ -51,6 +62,7 @@ const _v5 = new THREE.Vector3();
 const _camPos = new THREE.Vector3();
 const _camDir = new THREE.Vector3();
 const _localPos = new THREE.Vector3();
+const _impactP = new THREE.Vector3();
 const _box = new THREE.Box3();
 const _boxSize = new THREE.Vector3();
 const _boxCtr = new THREE.Vector3();
@@ -402,9 +414,15 @@ function weaponAssets() {
       box: new THREE.BoxGeometry(1, 1, 1),
       ring: new THREE.TorusGeometry(0.05, 0.014, 5, 10),
       beadZ: new THREE.OctahedronGeometry(0.05, 0),
+      ball: new THREE.SphereGeometry(0.5, 12, 9),
+      rock: new THREE.IcosahedronGeometry(0.5, 1),
+      discZ: (() => { const g = new THREE.CylinderGeometry(0.5, 0.5, 1, 14, 1); g.rotateX(Math.PI / 2); return g; })(),
     },
     mat: {
       wood: new THREE.MeshStandardMaterial({ map: woodTexture(), color: 0xc7a071, roughness: 0.88, metalness: 0.02, flatShading: true }),
+      clubWood: new THREE.MeshStandardMaterial({ map: woodTexture(), color: 0x9d7042, roughness: 0.93, metalness: 0.02, flatShading: true }),
+      rust: new THREE.MeshStandardMaterial({ color: 0x9d8878, roughness: 0.68, metalness: 0.55, flatShading: true }),
+      edge: new THREE.MeshStandardMaterial({ color: 0xe7edf1, roughness: 0.26, metalness: 0.92, flatShading: true }),
       steel: new THREE.MeshStandardMaterial({ color: 0xcdd7de, roughness: 0.28, metalness: 0.82, flatShading: true }),
       darkSteel: new THREE.MeshStandardMaterial({ color: 0x2b313a, roughness: 0.42, metalness: 0.88, flatShading: true }),
       leather: new THREE.MeshStandardMaterial({ color: 0x5b3a23, roughness: 0.95, metalness: 0.0, flatShading: true }),
@@ -444,6 +462,142 @@ function makeGlowSprite(color, size, opacity) {
   const s = new THREE.Sprite(mat);
   s.scale.set(size, size, 1);
   return s;
+}
+
+// Fish Bonker — a stubby, cartoonishly top-heavy wooden club. Tiny grip,
+// enormous rounded head, brass bands, a couple of dents from past business.
+function buildBonker() {
+  const A = weaponAssets();
+  const g = new THREE.Group();
+
+  const grip = new THREE.Mesh(A.geo.shaftZ, A.mat.leather);
+  grip.scale.set(1.2, 1.2, 0.36);
+  grip.position.z = 0;
+  g.add(grip);
+  for (let i = 0; i < 3; i++) {
+    const wrap = new THREE.Mesh(A.geo.shaftZ, A.mat.clubWood);
+    wrap.scale.set(1.3, 1.3, 0.03);
+    wrap.position.z = -0.12 + i * 0.11;
+    g.add(wrap);
+  }
+  const pommel = new THREE.Mesh(A.geo.ball, A.mat.clubWood);
+  pommel.scale.set(0.078, 0.078, 0.06);
+  pommel.position.z = -0.2;
+  g.add(pommel);
+  const collar = new THREE.Mesh(A.geo.shaftZ, A.mat.brass);
+  collar.scale.set(1.65, 1.65, 0.04);
+  collar.position.z = 0.19;
+  g.add(collar);
+
+  // head: fat barrel, slightly squashed on the slapping face
+  const neck = new THREE.Mesh(A.geo.shaftZ, A.mat.clubWood);
+  neck.scale.set(2.1, 2.1, 0.13);
+  neck.position.z = 0.27;
+  g.add(neck);
+  const head = new THREE.Mesh(A.geo.ball, A.mat.clubWood);
+  head.scale.set(0.23, 0.19, 0.31);
+  head.position.z = 0.48;
+  g.add(head);
+  const cap = new THREE.Mesh(A.geo.ball, A.mat.clubWood);
+  cap.scale.set(0.175, 0.15, 0.11);
+  cap.position.z = 0.63;
+  g.add(cap);
+  for (let i = 0; i < 2; i++) {
+    const band = new THREE.Mesh(A.geo.shaftZ, A.mat.brass);
+    band.scale.set(3.4 - i * 0.45, 2.9 - i * 0.4, 0.03);
+    band.position.z = 0.37 + i * 0.2;
+    g.add(band);
+  }
+  const dent = new THREE.Mesh(A.geo.rock, A.mat.clubWood);
+  dent.scale.set(0.1, 0.085, 0.1);
+  dent.position.set(0.1, 0.045, 0.52);
+  g.add(dent);
+  const dent2 = new THREE.Mesh(A.geo.rock, A.mat.clubWood);
+  dent2.scale.set(0.08, 0.07, 0.08);
+  dent2.position.set(-0.09, -0.04, 0.42);
+  g.add(dent2);
+
+  const tip = new THREE.Object3D();
+  tip.position.z = 0.72;
+  g.add(tip);
+  g.traverse((c) => { if (c.isMesh) { c.castShadow = true; c.receiveShadow = false; } });
+  return { group: g, tip, glow: null };
+}
+
+// Rusty Cutlass — leather grip, brass knuckle bow, a worn curved blade
+// swept out of short segments so the curve reads from any angle.
+function buildCutlass() {
+  const A = weaponAssets();
+  const g = new THREE.Group();
+
+  const grip = new THREE.Mesh(A.geo.shaftZ, A.mat.leather);
+  grip.scale.set(0.95, 0.95, 0.28);
+  grip.position.z = -0.07;
+  g.add(grip);
+  for (let i = 0; i < 4; i++) {
+    const wrap = new THREE.Mesh(A.geo.shaftZ, A.mat.darkSteel);
+    wrap.scale.set(1.02, 1.02, 0.014);
+    wrap.position.z = -0.17 + i * 0.06;
+    g.add(wrap);
+  }
+  const pommel = new THREE.Mesh(A.geo.ball, A.mat.brass);
+  pommel.scale.set(0.07, 0.07, 0.055);
+  pommel.position.z = -0.225;
+  g.add(pommel);
+
+  // guard: oval brass plate plus a knuckle bow looping back to the pommel
+  const guard = new THREE.Mesh(A.geo.discZ, A.mat.brass);
+  guard.scale.set(0.13, 0.085, 0.026);
+  guard.position.z = 0.09;
+  g.add(guard);
+  const bow = [
+    [0, -0.035, 0.10], [0, -0.135, 0.045], [0, -0.155, -0.075], [0, -0.09, -0.195],
+  ];
+  for (let i = 0; i < bow.length - 1; i++) {
+    const a = bow[i], b = bow[i + 1];
+    g.add(segMesh(A.geo.cordZ, A.mat.brass, a[0], a[1], a[2], b[0], b[1], b[2], 1.7));
+  }
+
+  // blade: seven segments, each tilted a little further, sweeping upward
+  const SEG = 7;
+  const L = 0.115;
+  let py = 0, pz = 0.13, ang = 0.04;
+  for (let i = 0; i < SEG; i++) {
+    const s = new THREE.Group();
+    s.position.set(0, py, pz);
+    s.rotation.x = -ang;
+    g.add(s);
+    const w = 0.056 - i * 0.0048;
+    const th = 0.019 - i * 0.0013;
+    const body = new THREE.Mesh(A.geo.box, A.mat.rust);
+    body.scale.set(th, w, L * 1.04);
+    body.position.set(0, 0, L * 0.5);
+    s.add(body);
+    const ed = new THREE.Mesh(A.geo.box, A.mat.edge);
+    ed.scale.set(th * 0.55, w * 0.22, L * 1.02);
+    ed.position.set(0, w * 0.4, L * 0.5);
+    s.add(ed);
+    if (i === 0) {
+      const ricasso = new THREE.Mesh(A.geo.box, A.mat.brass);
+      ricasso.scale.set(th * 1.5, w * 1.15, 0.022);
+      s.add(ricasso);
+    }
+    if (i === SEG - 1) {
+      const point = new THREE.Mesh(A.geo.spikeZ, A.mat.edge);
+      point.scale.set(0.36, 0.62, 0.34);
+      point.position.set(0, w * 0.16, L * 1.06);
+      s.add(point);
+    }
+    py += Math.sin(ang) * L;
+    pz += Math.cos(ang) * L;
+    ang += 0.077;
+  }
+
+  const tip = new THREE.Object3D();
+  tip.position.set(0, py, pz);
+  g.add(tip);
+  g.traverse((c) => { if (c.isMesh) { c.castShadow = true; c.receiveShadow = false; } });
+  return { group: g, tip, glow: null };
 }
 
 function buildHarpoon() {
@@ -578,7 +732,29 @@ function buildTrident() {
   return { group: g, tip, glow: { mats: glowMats, tips, halo } };
 }
 
-const WEAPON_BUILDERS = { harpoon: buildHarpoon, speargun: buildSpeargun, trident: buildTrident };
+const WEAPON_BUILDERS = {
+  bonker: buildBonker,
+  harpoon: buildHarpoon,
+  cutlass: buildCutlass,
+  speargun: buildSpeargun,
+  trident: buildTrident,
+};
+
+// attack type for a shop weapon def, defaulting to the pre-wave-2 behaviour
+function attackKind(def) {
+  const a = def && def.attack;
+  return (a === 'melee' || a === 'both') ? a : 'ranged';
+}
+function meleeRange(def) {
+  if (!def) return 3.2;
+  if (attackKind(def) === 'both') return MELEE_JAB_RANGE;
+  return clamp(typeof def.range === 'number' ? def.range : 3.2, 2.5, 4);
+}
+function meleeDamage(def) {
+  if (!def) return 0;
+  if (attackKind(def) === 'both' && typeof def.meleeDmg === 'number') return def.meleeDmg;
+  return def.dmg;
+}
 
 // ------------------------------------------------------------------
 // Segment / sphere intersection (returns closest-approach t in [0,1] or -1)
@@ -646,6 +822,12 @@ export function initEnemies(ctx) {
   // Weapon firing state
   let fireCooldown = 0;
   let harpoonHidden = 0;   // >0 while the thrown harpoon is away from the hand
+
+  // Melee swing state (one at a time)
+  const melee = {
+    active: false, t: 0, dur: MELEE_SWING, weaponId: null, dealt: false,
+    origin: new THREE.Vector3(), dir: new THREE.Vector3(0, 0, 1),
+  };
 
   // ---------------- audio helper ----------------
   function sfx(name, volume, pos) {
@@ -981,6 +1163,10 @@ export function initEnemies(ctx) {
     if (beam) beam.visible = false;
     beamT = 0;
     harpoonHidden = 0;
+    melee.active = false;
+    melee.t = 0;
+    melee.dealt = false;
+    fireCooldown = 0;
     camShake = 0;
     sparks.clear();
     bubbles.clear();
@@ -1213,17 +1399,40 @@ export function initEnemies(ctx) {
     return best;
   }
 
-  function dealDamage(rec, def, weaponId, point, dirX, dirY, dirZ) {
+  // dmgOverride / kind are optional: ranged callers pass neither and keep the
+  // original behaviour, melee callers pass the weapon's melee damage + 'melee'.
+  function dealDamage(rec, def, weaponId, point, dirX, dirY, dirZ, dmgOverride, kind) {
     if (!rec || rec.dead) return;
+    const dmg = typeof dmgOverride === 'number' ? dmgOverride : def.dmg;
     if (ctx.net && typeof ctx.net.send === 'function') {
-      ctx.net.send(MSG.DAMAGE_ENEMY, { enemyId: rec.id, dmg: def.dmg, weaponId });
+      ctx.net.send(MSG.DAMAGE_ENEMY, { enemyId: rec.id, dmg, weaponId });
     }
     // local feedback (server confirms with ENEMY_HIT)
-    rec.flash = Math.max(rec.flash, 0.85);
-    rec.nudge.x += dirX * 0.42;
-    rec.nudge.y += dirY * 0.22;
-    rec.nudge.z += dirZ * 0.42;
-    impactFX(point, dirX, dirY, dirZ, weaponId);
+    const isMelee = kind === 'melee';
+    rec.flash = Math.max(rec.flash, isMelee ? 1 : 0.85);
+    rec.telegraph = Math.max(rec.telegraph, isMelee ? 0.6 : 0);
+    const push = isMelee ? 0.62 : 0.42;
+    rec.nudge.x += dirX * push;
+    rec.nudge.y += dirY * (isMelee ? 0.3 : 0.22);
+    rec.nudge.z += dirZ * push;
+    if (isMelee) meleeImpactFX(point, dirX, dirY, dirZ, false);
+    else impactFX(point, dirX, dirY, dirZ, weaponId);
+  }
+
+  // The thwack: a white pop on contact plus a small radial puff of grit,
+  // kicked back along the swing so it reads as a solid connection.
+  // `soft` = a landed catch rather than an enemy; the sound for those is
+  // fishing.js's to play when the server confirms the hit, so we stay quiet.
+  function meleeImpactFX(p, dx, dy, dz, soft) {
+    if (!soft) sfx('bonk', 0.9, p);
+    sparks.burst(p.x, p.y, p.z, soft ? 17 : 14, soft ? 2.5 : 3.1,
+      soft ? 0.135 : 0.115, soft ? 0.34 : 0.28,
+      soft ? 0xfff0b4 : 0xfff6e0, -3.2, 4.2, -dx, -dy, -dz, 1.1);
+    sparks.burst(p.x, p.y, p.z, 6, 0.55, 0.2, 0.14, 0xffffff, 0, 6.5, 0, 0, 0, 0);
+    const t = ctx.clock ? ctx.clock.getElapsedTime() : 0;
+    if (p.y < waterHeight(p.x, p.z, t)) {
+      bubbles.burst(p.x, p.y, p.z, 7, 1.1, 0.09, 1.0, 0xdff0ff, 1.2, 1.2, 0, 0, 0, 0);
+    }
   }
 
   function impactFX(p, dx, dy, dz, weaponId) {
@@ -1313,6 +1522,156 @@ export function initEnemies(ctx) {
       }
       if (hit) dealDamage(hit, def, 'trident', _v5, _v2.x, _v2.y, _v2.z);
     }
+  }
+
+  // ==================================================================
+  // Melee — swing arc, hit resolution, and bonking your own landed catch
+  // ==================================================================
+
+  // Swing from the chest, along the look direction (so a fish flopping at
+  // your boots is still inside the arc).
+  function meleeAim(outOrigin, outDir) {
+    const cam = ctx.camera;
+    if (cam) { cam.getWorldPosition(_camPos); cam.getWorldDirection(_camDir); }
+    if (getLocalPos(_localPos)) { outOrigin.copy(_localPos); outOrigin.y += 1.05; }
+    else outOrigin.copy(_camPos);
+    outDir.copy(_camDir);
+    if (outDir.lengthSq() < 1e-6) outDir.set(0, 0, 1);
+    outDir.normalize();
+  }
+
+  function inMeleeArc(cx, cy, cz, radius, range, origin, dir) {
+    _v3.set(cx - origin.x, cy - origin.y, cz - origin.z);
+    const d = _v3.length();
+    if (d - radius > range) return -1;
+    if (d <= MELEE_NEAR) return d;
+    _v3.multiplyScalar(1 / d);
+    return _v3.dot(dir) >= MELEE_ARC_DOT ? d : -1;
+  }
+
+  // Is anything worth jabbing right now? Drives the trident's jab-or-fire choice.
+  function meleeTargetInRange(range) {
+    meleeAim(melee.origin, melee.dir);
+    for (const rec of enemies.values()) {
+      if (rec.dead || rec.despawn > 0) continue;
+      if (inMeleeArc(rec.renderPos.x, rec.renderPos.y + rec.visual.center.y * 0.4, rec.renderPos.z,
+        rec.radius, range, melee.origin, melee.dir) >= 0) return true;
+    }
+    return flopperInRange(melee.origin, melee.dir, range) !== null;
+  }
+
+  // fishing.js owns the floppers; we only ever ask it politely.
+  function flopperInRange(origin, dir, range) {
+    const f = ctx.fishing;
+    if (!f || typeof f.tryBonk !== 'function') return null;
+    let id = null;
+    try { id = f.tryBonk(origin, dir, range); } catch (e) { id = null; }
+    return (id === null || id === undefined) ? null : id;
+  }
+
+  function bonkFlopper(origin, dir, range, dmg) {
+    const id = flopperInRange(origin, dir, range);
+    if (id === null) return false;
+    if (ctx.net && typeof ctx.net.send === 'function') {
+      ctx.net.send(MSG.BONK_FISH, { flopperId: id, dmg });
+    }
+    // thwack where the fish actually is, if fishing.js will tell us
+    _impactP.copy(origin).addScaledVector(dir, Math.min(range, 1.4));
+    const f = ctx.fishing;
+    const map = f && f.floppers;
+    const rec = (map && typeof map.get === 'function') ? map.get(id) : null;
+    if (rec && rec.pos && rec.pos.isVector3) _impactP.copy(rec.pos);
+    meleeImpactFX(_impactP, dir.x, dir.y, dir.z, true);
+    return true;
+  }
+
+  function startMelee(w, def) {
+    melee.active = true;
+    melee.t = 0;
+    melee.dur = MELEE_SWING;
+    melee.weaponId = w.id;
+    melee.dealt = false;
+    meleeAim(melee.origin, melee.dir);
+    w.kick = 0.5;
+    sfx('castWhoosh', 0.55);
+    const ch = localChar();
+    // remote players only see the networked action, so play one for them too
+    if (ch && typeof ch.setAnim === 'function') { try { ch.setAnim('cast'); } catch (e) { /* rig optional */ } }
+  }
+
+  function resolveMelee() {
+    const def = weaponDef(melee.weaponId);
+    if (!def) return;
+    const range = meleeRange(def);
+    const dmg = meleeDamage(def);
+    meleeAim(melee.origin, melee.dir);   // re-aim on contact: the swing tracks the look
+
+    let hits = 0;
+    for (const rec of enemies.values()) {
+      if (hits >= MELEE_MAX_TARGETS) break;
+      if (rec.dead || rec.despawn > 0) continue;
+      const cy = rec.renderPos.y + rec.visual.center.y * 0.4;
+      const d = inMeleeArc(rec.renderPos.x, cy, rec.renderPos.z, rec.radius, range, melee.origin, melee.dir);
+      if (d < 0) continue;
+      _v4.set(rec.renderPos.x - melee.origin.x, cy - melee.origin.y, rec.renderPos.z - melee.origin.z);
+      if (_v4.lengthSq() > 1e-6) _v4.normalize(); else _v4.copy(melee.dir);
+      _v5.copy(melee.origin).addScaledVector(_v4, Math.max(0.25, d - rec.radius * 0.55));
+      dealDamage(rec, def, melee.weaponId, _v5, _v4.x, _v4.y, _v4.z, dmg, 'melee');
+      hits++;
+    }
+    // your own landed catch is a perfectly valid thing to hit
+    if (bonkFlopper(melee.origin, melee.dir, range, dmg)) hits++;
+
+    if (hits > 0) camShake = Math.min(1.2, camShake + 0.16);
+  }
+
+  function updateMelee(dt, w) {
+    if (!melee.active) return;
+    const st = ctx.state;
+    if (st && (st.phase !== 'playing' || (typeof st.hp === 'number' && st.hp <= 0))) {
+      melee.active = false;
+      return;
+    }
+    melee.t += dt;
+    if (!melee.dealt && melee.t >= MELEE_CONTACT) {
+      melee.dealt = true;
+      resolveMelee();
+    }
+    const k = clamp(melee.t / melee.dur, 0, 1);
+    const wk = MELEE_WINDUP / melee.dur;
+    let arm, pitch, lean;
+    if (k < wk) {
+      const u = k / wk;
+      const e = u * u;
+      arm = -0.55 - 1.75 * e;        // cock the arm up and back
+      pitch = -0.12 - 1.15 * e;
+      lean = -0.09 * e;
+    } else {
+      const u = (k - wk) / (1 - wk);
+      const e = 1 - Math.pow(1 - u, 2.6);   // snap down, then settle
+      arm = -2.30 + 2.72 * e;
+      pitch = -1.27 + 2.12 * e;             // ~120 degrees of arc
+      lean = -0.09 + 0.34 * e * (1 - u * 0.45);
+    }
+
+    // We run after player.js has posed the rig, so writing bones here wins for
+    // this frame and player.js damps back out of it on the next one.
+    const ch = localChar();
+    if (ch && ch.bones) {
+      const b = ch.bones;
+      if (b.armR) { b.armR.rotation.x = arm; b.armR.rotation.y = -0.12; b.armR.rotation.z = 0.26; }
+      if (b.foreR) b.foreR.rotation.x = -0.62 + 0.42 * k;
+      if (b.armL) b.armL.rotation.x += ((arm * 0.22) - b.armL.rotation.x) * 0.35;
+      if (b.hips) b.hips.rotation.x += (lean - b.hips.rotation.x) * 0.55;
+      if (b.head) b.head.rotation.x += ((lean * 0.55) - b.head.rotation.x) * 0.45;
+    }
+
+    if (w && w.id === melee.weaponId && w.attached && w.group.visible && w.group.parent) {
+      aimWeaponForward(w, w.group.parent, ch && ch.group, pitch);
+      w.group.position.set(0, w.sway, Math.max(0, lean) * 0.36);
+    }
+
+    if (melee.t >= melee.dur) melee.active = false;
   }
 
   function updateProjectiles(dt, t) {
@@ -1435,21 +1794,28 @@ export function initEnemies(ctx) {
     if (harpoonHidden > 0) harpoonHidden = Math.max(0, harpoonHidden - dt);
 
     const w = syncWeapons(dt, t);
-    if (!w || !w.ready) return w;
     const st = ctx.state;
-    if (!st || st.phase !== 'playing') return w;
-    if (typeof st.hp === 'number' && st.hp <= 0) return w;
+    let ok = !!(w && w.ready) && !!st && st.phase === 'playing';
+    if (ok && typeof st.hp === 'number' && st.hp <= 0) ok = false;
     const input = ctx.input;
-    if (!input || !input.mouseDown) return w;
+    if (ok && (!input || !input.mouseDown)) ok = false;
     // don't shoot through open menus — a locked pointer means we're really playing
-    if (!input.pointerLocked && !document.pointerLockElement) return w;
-    if (ctx.fishing && typeof ctx.fishing.isCasting === 'function' && ctx.fishing.isCasting()) return w;
-    if (fireCooldown > 0) return w;
+    if (ok && !input.pointerLocked && !document.pointerLockElement) ok = false;
+    if (ok && ctx.fishing && typeof ctx.fishing.isCasting === 'function' && ctx.fishing.isCasting()) ok = false;
+    if (ok && (fireCooldown > 0 || melee.active)) ok = false;
 
-    const def = w.def || weaponDef(w.id);
-    if (!def) return w;
-    fireCooldown = 1 / Math.max(0.1, def.rate);
-    fireWeapon(w, t);
+    if (ok) {
+      const def = w.def || weaponDef(w.id);
+      if (def) {
+        fireCooldown = 1 / Math.max(0.1, def.rate);
+        const kind = attackKind(def);
+        // 'both' (Storm Trident): jab what is already on top of you, otherwise unleash.
+        if (kind === 'melee' || (kind === 'both' && meleeTargetInRange(MELEE_JAB_RANGE))) startMelee(w, def);
+        else fireWeapon(w, t);
+      }
+    }
+    // a swing already under way finishes even if the weapon is being stowed
+    updateMelee(dt, w);
     return w;
   }
 

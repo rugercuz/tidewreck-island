@@ -9,6 +9,7 @@ import {
   FISH,
   MUTATIONS,
   ECON,
+  WEATHER,
   shopById,
   fishValue,
 } from '../shared/constants.js';
@@ -29,6 +30,9 @@ const MUTATION_KEYS = Object.keys(MUTATIONS)
 
 /** Tier at which fish become event-locked "Tier X" creatures. */
 export const TIER_X = 11;
+
+/** Tiers that hold at least one weather-exclusive species (cheap fast path). */
+const WEATHER_LOCKED_TIERS = new Set(FISH.filter(f => f.weather).map(f => f.tier));
 
 /** Small difficulty nudge applied to the tier-weighting curve. */
 const DIFFICULTY_TIER_BONUS = { chill: 0.05, normal: 0, hard: -0.03 };
@@ -52,6 +56,27 @@ function num(v, dflt) {
 function roundTo(v, places) {
   const m = Math.pow(10, places);
   return Math.round(v * m) / m;
+}
+
+// ---------------- Weather ----------------
+
+/**
+ * Normalize a weather argument (type string, WEATHER def, or a
+ * `{type}` payload) into a WEATHER key, or null when unknown.
+ */
+export function weatherKey(weather) {
+  if (!weather) return null;
+  if (typeof weather === 'string') return WEATHER[weather] ? weather : null;
+  if (typeof weather === 'object' && typeof weather.type === 'string') {
+    return WEATHER[weather.type] ? weather.type : null;
+  }
+  return null;
+}
+
+/** WEATHER definition for whatever the caller passed, or null. */
+export function weatherDef(weather) {
+  const key = weatherKey(weather);
+  return key ? WEATHER[key] : null;
 }
 
 // ---------------- Bait / luck ----------------
@@ -97,9 +122,10 @@ export function isVoidbait(bait) {
 
 /**
  * Seconds to wait between CAST_START and BITE. Baseline is the 2-6 s band
- * from the design doc; better rods and greedier baits pull it tighter.
+ * from the design doc; better rods and greedier baits pull it tighter, and
+ * the weather's biteSpeed divides the whole window (storms bite fast).
  */
-export function rollBiteDelay(gear, bait) {
+export function rollBiteDelay(gear, bait, weather) {
   const rod = clamp(Math.floor(num(gear && gear.rod, 1)), 1, 5);
   const b = resolveBait(bait);
   const bias = b ? num(b.tierBias, 0) : 0;
@@ -109,7 +135,10 @@ export function rollBiteDelay(gear, bait) {
   lo = Math.max(1.0, lo);
   hi = Math.max(lo + 0.9, hi);
 
-  return roundTo(lo + Math.random() * (hi - lo), 2);
+  const wdef = weatherDef(weather);
+  const speed = clamp(wdef ? num(wdef.biteSpeed, 1) : 1, 0.25, 4);
+
+  return roundTo(Math.max(0.5, (lo + Math.random() * (hi - lo)) / speed), 2);
 }
 
 /**
@@ -126,12 +155,17 @@ export function biteStrength(tier) {
 /**
  * Which species can actually be pulled out of `area` at `tier` right now.
  * Tier X fish are Abyss-only and stay locked until the team has survived
- * the matching horror event.
+ * the matching horror event. Weather-exclusive species (FISH[].weather)
+ * only join their tier's pool while that weather is actually running.
  */
-export function speciesForTier(tier, area, eventsSurvived) {
+export function speciesForTier(tier, area, eventsSurvived, weather) {
   const list = FISH_BY_TIER.get(tier);
   if (!list || !list.length) return [];
-  if (tier < TIER_X) return list;
+  if (tier < TIER_X) {
+    if (!WEATHER_LOCKED_TIERS.has(tier)) return list;
+    const w = weatherKey(weather);
+    return list.filter(f => !f.weather || f.weather === w);
+  }
   if (!area || area.id !== 'abyss') return [];
   const survived = Array.isArray(eventsSurvived) ? eventsSurvived : [];
   return list.filter(f => f.requiresEvent && survived.indexOf(f.requiresEvent) !== -1);
@@ -142,13 +176,13 @@ export function speciesForTier(tier, area, eventsSurvived) {
  * Index 0 is the area's floor tier — the exponential rarity curve is
  * applied against that index.
  */
-export function candidateTiers(area, eventsSurvived) {
+export function candidateTiers(area, eventsSurvived, weather) {
   const out = [];
   if (!area || !Array.isArray(area.tiers)) return out;
   const minT = Math.floor(num(area.tiers[0], 1));
   const maxT = Math.floor(num(area.tiers[1], minT));
   for (let t = minT; t <= maxT; t++) {
-    const species = speciesForTier(t, area, eventsSurvived);
+    const species = speciesForTier(t, area, eventsSurvived, weather);
     if (species.length) out.push({ tier: t, species });
   }
   return out;
@@ -184,6 +218,7 @@ export function rollMutation(luck, bait) {
  * @param {number} [opts.luck]          precomputed total luck (else derived)
  * @param {string[]} [opts.eventsSurvived]
  * @param {string} [opts.difficulty]    'chill' | 'normal' | 'hard'
+ * @param {string} [opts.weather]       active WEATHER key ('clear' when absent)
  * @returns {{fish:object, tier:number, mutation:string|null, weightKg:number, value:number}|null}
  */
 export function rollFish(opts) {
@@ -194,19 +229,24 @@ export function rollFish(opts) {
   const gear = o.gear || { rod: 1, charms: [] };
   const bait = resolveBait(o.baits !== undefined ? o.baits : o.bait);
   const eventsSurvived = Array.isArray(o.eventsSurvived) ? o.eventsSurvived : [];
-  const luck = Number.isFinite(o.luck) ? o.luck : computeLuck(gear, bait);
+  const weather = weatherKey(o.weather);
+  const wdef = weather ? WEATHER[weather] : null;
 
-  const tiers = candidateTiers(area, eventsSurvived);
+  // Weather stacks ADDITIVELY on top of gear/bait luck and bait tier bias.
+  const baseLuck = Number.isFinite(o.luck) ? o.luck : computeLuck(gear, bait);
+  const luck = Math.max(0, baseLuck + (wdef ? num(wdef.luck, 0) : 0));
+
+  const tiers = candidateTiers(area, eventsSurvived, weather);
   if (!tiers.length) return null;
 
   // --- tier selection -------------------------------------------------
   // Higher tiers are exponentially rarer: weight = base^tierIndex.
-  // base 0.5 = each step up is half as likely; rod overshoot, bait tierBias,
-  // luck and difficulty all raise `base`, flattening the curve upward.
+  // base 0.5 = each step up is half as likely; rod overshoot, bait + weather
+  // tierBias, luck and difficulty all raise `base`, flattening the curve upward.
   const rod = clamp(Math.floor(num(gear.rod, 1)), 1, 5);
   const areaRodReq = Math.max(1, Math.floor(num(area.unlock && area.unlock.rod, 1)));
   const rodBonus = Math.max(0, rod - areaRodReq);
-  const tierBias = bait ? num(bait.tierBias, 0) : 0;
+  const tierBias = (bait ? num(bait.tierBias, 0) : 0) + (wdef ? num(wdef.tierBias, 0) : 0);
   const diffBonus = DIFFICULTY_TIER_BONUS[o.difficulty] !== undefined
     ? DIFFICULTY_TIER_BONUS[o.difficulty] : 0;
 
