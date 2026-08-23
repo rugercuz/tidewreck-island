@@ -350,6 +350,49 @@ kbd.wide { min-width: 54px; }
 .swatch.is-on .swatch-in { box-shadow: 0 0 0 3px var(--deep-0), 0 0 0 5.5px var(--foam), 0 4px 14px rgba(142, 230, 242, 0.5); }
 .swatch:focus-visible { outline: 3px solid var(--foam); outline-offset: 2px; }
 
+/* ---- character customization: hat + skin chips ----
+   Same foam highlight language as the crew-colour swatches above. */
+.field-pick { gap: 7px; }
+.field-pick .field-val { font-size: 13px; letter-spacing: 0.04em; }
+
+.pick-row { display: grid; gap: 7px; }
+.pick-row.row-hat { grid-template-columns: repeat(5, 1fr); }
+.pick-row.row-skin { grid-template-columns: repeat(4, 1fr); }
+
+.pick-chip {
+  font-family: inherit; cursor: pointer; pointer-events: auto;
+  display: flex; flex-direction: column; align-items: center; gap: 4px;
+  padding: 7px 2px 6px;
+  border-radius: var(--r-sm);
+  border: 1.5px solid var(--stroke);
+  background: rgba(2, 14, 24, 0.5);
+  color: var(--text-dim);
+  transition: transform 120ms ease, border-color 140ms ease, background 140ms ease, box-shadow 140ms ease;
+}
+.pick-chip i {
+  font-style: normal; font-size: 9px; font-weight: 800;
+  letter-spacing: 0.1em; text-transform: uppercase; color: var(--text-faint);
+}
+.pick-chip:hover { transform: translateY(-2px); border-color: var(--stroke-hot); }
+.pick-chip:hover i { color: var(--text-dim); }
+.pick-chip:focus-visible { outline: 3px solid var(--foam); outline-offset: 2px; }
+.pick-chip.is-on {
+  background: linear-gradient(180deg, rgba(142, 230, 242, 0.20), rgba(142, 230, 242, 0.05));
+  border-color: var(--foam);
+  box-shadow: 0 0 0 2px rgba(142, 230, 242, 0.18), 0 4px 14px rgba(142, 230, 242, 0.18);
+}
+.pick-chip.is-on i { color: var(--foam); }
+
+.pick-ico { width: 24px; height: 24px; display: block; flex: none; }
+.hat-ico { color: var(--sand-2); transition: color 140ms ease; }
+.pick-chip:hover .hat-ico { color: var(--sand); }
+.pick-chip.is-on .hat-ico { color: var(--gold); filter: drop-shadow(0 2px 6px rgba(255, 202, 74, 0.45)); }
+.skin-disc {
+  border-radius: 50%;
+  background: radial-gradient(circle at 34% 28%, rgba(255, 255, 255, 0.5), rgba(255, 255, 255, 0) 58%), var(--c);
+  box-shadow: 0 2px 0 rgba(0, 0, 0, 0.32), inset 0 -2px 5px rgba(0, 0, 0, 0.28);
+}
+
 .menu-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; transition: opacity 180ms ease; }
 .menu-actions.is-dim { opacity: 0.55; }
 
@@ -476,6 +519,15 @@ kbd.wide { min-width: 54px; }
   box-shadow: 0 2px 5px rgba(0, 0, 0, 0.5), inset 0 -2px 4px rgba(0, 0, 0, 0.35);
 }
 .pdot.empty { background: rgba(255, 255, 255, 0.08); box-shadow: none; }
+/* tiny look preview: skin tone dot + hat glyph, straight off ROOM_STATE */
+.plook { display: flex; align-items: center; gap: 5px; flex: none; }
+.pskin {
+  width: 13px; height: 13px; border-radius: 50%;
+  background: radial-gradient(circle at 34% 28%, rgba(255, 255, 255, 0.5), rgba(255, 255, 255, 0) 58%), var(--c);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.4), inset 0 -2px 3px rgba(0, 0, 0, 0.32);
+}
+.phat { width: 19px; height: 19px; color: var(--sand-2); opacity: 0.92; }
+.player-row.is-me .phat { color: var(--sand); opacity: 1; }
 .pname { font-size: 16px; font-weight: 700; letter-spacing: 0.02em; }
 .pname .you {
   font-style: normal; font-size: 10px; letter-spacing: 0.16em; text-transform: uppercase;
@@ -1692,6 +1744,8 @@ kbd.wide { min-width: 54px; }
 @media (max-width: 900px) {
   .menu-stack { width: 94vw; }
   .menu-actions { grid-template-columns: 1fr; }
+  .pick-row { gap: 5px; }
+  .pick-chip i { font-size: 8px; letter-spacing: 0.04em; }
   .weather-chip { padding: 4px 10px 4px 6px; gap: 6px; }
   .wx-ico { width: 22px; height: 22px; }
   .wx-txt i { display: none; }
@@ -1714,6 +1768,9 @@ kbd.wide { min-width: 54px; }
   .title-block { margin-top: 0; }
   .menu-stack { margin-top: 1.6vh; gap: 10px; }
   .menu-card { padding: 13px 16px; }
+  .identity-card { gap: 11px; }
+  .pick-chip { padding: 5px 2px 4px; gap: 3px; }
+  .pick-ico { width: 20px; height: 20px; }
   .btn-big { padding: 14px 24px; font-size: 17px; }
   .controls-footer { padding: 8px 12px 10px; gap: 6px 14px; }
   .reel-track { height: 132px; }

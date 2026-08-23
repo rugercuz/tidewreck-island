@@ -188,3 +188,46 @@ range ~3.5m) for 'melee'/'both' weapons; trident jabs when a target is within 4m
 fishing.js spawns the comedic flopping catch on deck (hops toward the water!), bonk impacts,
 stow-on-kill, sad escape. ui.js: weather chip + hazard toast, BONK prompt + hp pips + escape
 timer, attack-type badges in the shop. audio.js: rain/thunder/wind, thwack bonks, escape sting.
+
+## Wave 3 addendum — audio repair, walkable boats, collision, customization
+
+**Cross-module contracts (exact names):**
+- `world.js` handle gains `surfaceHeight(x, z)` -> ground y including dock decking/steps
+  (max of terrain and any walkable structure), and `resolveCollide(pos, radius)` -> pushes a
+  THREE.Vector3 out of solid props (palms, rocks, hut walls, standing stones, campfire ring,
+  dock posts). player.js grounds on surfaceHeight (not raw getTerrainHeight) and calls
+  resolveCollide after integrating movement each frame.
+- `boat.js` handle gains `deckInfo(x, z)` -> `null | { y, localX, localZ }` (walkable deck top at
+  that world XZ), `toWorld(localVec3, out)` / `toLocal(worldVec3, out)` (full boat frame incl.
+  yaw/pitch/roll), and `helmPos(out)` (world position of the wheel). Boats are BIG walkable
+  platforms per level: Dinghy ~5.5 m, Skiff ~8 m, Cutter ~11 m, Abyss-Runner ~14 m, visibly
+  distinct hulls. Wake/foam is speed-scaled: invisible when idle, ramping in above ~1.5 m/s,
+  bigger/brighter for higher boat levels and speeds.
+- Standing on deck: player state gains `onDeck: bool`. Boarding = E near the hull -> hop onto
+  nearest deck point; walking on deck uses boat-local anchoring (store local pos, boat motion
+  carries you; WASD moves the local anchor; walking off the edge = fall in the water). Driving =
+  E within 2 m of helmPos -> seat 0 snap (E again releases the wheel back to walking).
+  Fishing while standing on deck must work (state.onBoat stays true while onDeck so existing
+  fishing/ui checks hold; seat stays -1 unless driving).
+- MOVE payload gains `bl: [x,y,z] | null` — boat-local position when on deck. Remote players
+  with `bl` are rendered attached to the boat frame (toWorld), NOT at their last absolute pos.
+  The server relays the field untouched.
+- Character customization: `createCharacter(colorIndex, name, opts = { hat, skin })` — hat
+  0..4 (bucket, beanie, captain, bandana, none), skin 0..3 (light tan, tan, brown, deep).
+  CREATE_ROOM/JOIN_ROOM accept `{hat, skin}` (server sanitizes ints, defaults 0), and every
+  players list (ROOM_STATE + WORLD_STATE) carries hat/skin so remotes render them.
+
+**Audio repair (root cause measured live):** on startMusic the master output grows
+exponentially (~e^3.6/s: peak 0.07 -> 372 in 2.4 s) and hits NaN at ~2.8 s; the NaN circulates
+in the feedback-delay reverb forever = one ugly ring, then permanent total silence. The
+runaway begins immediately (before the first melody bar), so it lives in the always-on layer
+(pad / ocean-ambience / wind "breathing"/"sweep" filter LFOs — a biquad driven to <=0 Hz or an
+effective feedback >=1). Required: (1) find and fix the actual runaway; (2) clamp EVERY
+AudioParam write through safe helpers (frequency 10..18000, Q 0..20, gain 0..2, delay
+0.001..0.5, pan -1..1, no non-finite values); (3) a DynamicsCompressor + hard WaveShaper
+limiter on the master; (4) a NaN watchdog: analyser on master sampled ~1/s — if NaN or
+sustained peak > 4 is seen, tear down and rebuild the entire graph silently so sound can NEVER
+permanently die; (5) verify audible coverage of every game action.
+
+**Also:** area-name floating signs must distance-fade (invisible inside ~25 m of the area
+center's label and clamped in screen size) — they currently fill the screen when close.

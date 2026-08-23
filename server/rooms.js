@@ -19,6 +19,9 @@ const MIN_PLAYERS = 2;
 const MAX_PLAYERS = 8;
 const DIFFICULTIES = ['chill', 'normal', 'hard'];
 const RELOBBY_DELAY_MS = 2500;
+// Character customization (see player.js createCharacter(colorIndex, name, opts)).
+const MAX_HAT = 4;   // 0..4 = bucket, beanie, captain, bandana, none
+const MAX_SKIN = 3;  // 0..3 = light tan, tan, brown, deep
 
 // ---------------- Sanitizers ----------------
 
@@ -42,6 +45,17 @@ function sanitizeColor(value) {
   if (!Number.isFinite(n)) return 0;
   return ((n % PLAYER_COLORS.length) + PLAYER_COLORS.length) % PLAYER_COLORS.length;
 }
+
+/** Clamped integer index (never wraps) — used for cosmetic look-up tables. */
+function sanitizeIndex(value, maxIndex) {
+  const n = Math.floor(Number(value));
+  if (!Number.isFinite(n)) return 0;
+  return Math.min(maxIndex, Math.max(0, n));
+}
+
+function sanitizeHat(value) { return sanitizeIndex(value, MAX_HAT); }
+
+function sanitizeSkin(value) { return sanitizeIndex(value, MAX_SKIN); }
 
 function sanitizeMaxPlayers(value) {
   const n = Math.floor(Number(value));
@@ -111,6 +125,8 @@ export class RoomManager {
         id: m.id,
         name: m.name,
         color: m.color,
+        hat: m.hat,
+        skin: m.skin,
         ready: m.ready,
         isHost: m.id === room.hostId,
       });
@@ -155,7 +171,7 @@ export class RoomManager {
       seed: seedFromCode(code),
     };
     this.rooms.set(code, room);
-    this.addMember(room, socket, name, sanitizeColor(data.color));
+    this.addMember(room, socket, name, sanitizeColor(data.color), sanitizeHat(data.hat), sanitizeSkin(data.skin));
     console.log(`[room] ${code} created by ${name} (${room.settings.difficulty}, max ${room.settings.maxPlayers})`);
     this.broadcastRoomState(room);
   }
@@ -182,12 +198,12 @@ export class RoomManager {
     if (this.socketRoom.has(socket.id)) this.leaveRoom(socket, true);
 
     const name = sanitizeName(data.playerName);
-    this.addMember(room, socket, name, sanitizeColor(data.color));
+    this.addMember(room, socket, name, sanitizeColor(data.color), sanitizeHat(data.hat), sanitizeSkin(data.skin));
     this.io.to(room.code).emit(MSG.CHAT_MSG, { fromName: 'ISLAND', text: `${name} joined.` });
     this.broadcastRoomState(room);
   }
 
-  addMember(room, socket, name, color) {
+  addMember(room, socket, name, color, hat, skin) {
     // Give everyone a distinct colour when the requested one is taken.
     const taken = new Set();
     for (const m of room.members.values()) taken.add(m.color);
@@ -198,7 +214,16 @@ export class RoomManager {
         if (!taken.has(cand)) { c = cand; break; }
       }
     }
-    room.members.set(socket.id, { id: socket.id, name, color: c, ready: false, lastChat: 0 });
+    // Hat/skin are pure cosmetics — duplicates between crewmates are fine.
+    room.members.set(socket.id, {
+      id: socket.id,
+      name,
+      color: c,
+      hat: sanitizeHat(hat),
+      skin: sanitizeSkin(skin),
+      ready: false,
+      lastChat: 0,
+    });
     this.socketRoom.set(socket.id, room.code);
     socket.join(room.code);
   }
@@ -287,7 +312,9 @@ export class RoomManager {
     }
 
     const members = [];
-    for (const m of room.members.values()) members.push({ id: m.id, name: m.name, color: m.color });
+    for (const m of room.members.values()) {
+      members.push({ id: m.id, name: m.name, color: m.color, hat: m.hat, skin: m.skin });
+    }
 
     const game = new Game({
       io: this.io,
@@ -304,7 +331,7 @@ export class RoomManager {
     for (const m of room.members.values()) {
       this.io.to(m.id).emit(MSG.GAME_START, {
         world: { seed: room.seed, code: room.code, difficulty: room.settings.difficulty },
-        you: { id: m.id, name: m.name, color: m.color },
+        you: { id: m.id, name: m.name, color: m.color, hat: m.hat, skin: m.skin },
         state,
       });
     }

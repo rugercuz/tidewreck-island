@@ -767,9 +767,146 @@ const CAMP_Y = terrainHeight(CAMP_X, CAMP_Z);
 const RING_Y = terrainHeight(RINGSITE.x, RINGSITE.z);
 const RING_R = 9.6;
 
+// ---- landmark footprints (derived from the geometry below) ----
+const DOCK_W = 6.4;
+const DECK_TOP = DECK_Y + 0.085;             // top face of the deck planks
+const DOCK_HALF_W = DOCK_W * 0.5 - 0.15;     // walkable half-width (planks jitter a little)
+const DOCK_Z_LAND = DOCK_START_Z + 0.26;     // landward plank edge
+const DOCK_Z_SEA = DOCK_END_Z + 0.10;        // seaward plank edge
+const DOCK_MID_Z = (DOCK_Z_LAND + DOCK_Z_SEA) * 0.5;
+const DOCK_HALF_L = (DOCK_Z_LAND - DOCK_Z_SEA) * 0.5;
+const SHOP_YAW = -0.55;
+const SHOP_FLOOR = 0.825;                    // hut decking top, local to SHOP_Y
+
+// =============================================================
+// COLLISION + WALKABLE SURFACES
+// Every prop registers its footprint while it is being built, so what
+// you can see and what you can bump into can never drift apart.
+//   SOLIDS : flat [x, z, r] cylinders - always solid
+//   POSTS  : [x, z, r] cylinders that only bite UNDER the dock deck
+//   WALLS  : [cx, cz, ax, az, hx, hz] oriented boxes (local +X axis = ax,az)
+//   PLATS  : walkable tops; surfaceHeight() takes the max of these and terrain
+// All four are plain flat number arrays / small monomorphic objects, filled
+// once at build time and only READ per frame - no allocation in the queries.
+// =============================================================
+const SOLIDS = [];
+const POSTS = [];
+const WALLS = [];
+const PLATS = [];
+
+function solidCyl(x, z, r) { SOLIDS.push(x, z, r); }
+function solidPost(x, z, r) { POSTS.push(x, z, r); }
+function solidBox(cx, cz, yaw, hx, hz) {
+  WALLS.push(cx, cz, Math.cos(yaw), -Math.sin(yaw), hx, hz);
+}
+// ramp = width of the invisible lip that lets you step up onto the top,
+// step = the tallest rise that lip will bridge (anything higher stays a cliff).
+function platRect(cx, cz, yaw, hx, hz, topY, ramp, step) {
+  PLATS.push({ cx, cz, ax: Math.cos(yaw), az: -Math.sin(yaw), hx, hz, r: 0, y: topY, ramp, step });
+}
+function platDisc(cx, cz, r, topY, ramp, step) {
+  PLATS.push({ cx, cz, ax: 1, az: 0, hx: 0, hz: 0, r, y: topY, ramp, step });
+}
+function clearCollision() {
+  SOLIDS.length = 0; POSTS.length = 0; WALLS.length = 0; PLATS.length = 0;
+}
+
+// Walkable ground at (x, z): terrain, or the top of any structure that
+// should carry a player (dock decking, shop hut floor, stone-ring plinth).
+// Optional yRef (the sampler's own height) makes structures far ABOVE the
+// sampler transparent - that is what lets you swim under the dock.
+function surfaceHeight(x, z, yRef) {
+  if (!isFinite(x) || !isFinite(z)) return 0;
+  const h = terrainHeight(x, z);
+  const cap = (typeof yRef === 'number' && isFinite(yRef)) ? yRef + 1.6 : Infinity;
+  let best = h;
+  for (let i = 0; i < PLATS.length; i++) {
+    const P = PLATS[i];
+    if (P.y <= best || P.y > cap) continue;
+    const dx = x - P.cx, dz = z - P.cz;
+    let d;
+    if (P.r > 0) {
+      d = Math.sqrt(dx * dx + dz * dz) - P.r;
+    } else {
+      const ox = Math.abs(dx * P.ax + dz * P.az) - P.hx;
+      const oz = Math.abs(dz * P.ax - dx * P.az) - P.hz;
+      d = (ox > 0 && oz > 0) ? Math.sqrt(ox * ox + oz * oz) : (ox > oz ? ox : oz);
+    }
+    if (d <= 0) { best = P.y; continue; }
+    if (d >= P.ramp || P.y - best > P.step) continue;
+    const k = 1 - d / P.ramp;
+    const y = best + (P.y - best) * k * k * (3 - 2 * k);
+    if (y > best) best = y;
+  }
+  return best;
+}
+
+// scratch for the cylinder pass (module scope - resolveCollide allocates nothing)
+let _colX = 0, _colZ = 0, _colHit = false;
+function pushOutCyls(list, r) {
+  for (let i = 0; i < list.length; i += 3) {
+    const cr = list[i + 2] + r;
+    let dx = _colX - list[i];
+    if (dx > cr || dx < -cr) continue;
+    let dz = _colZ - list[i + 1];
+    if (dz > cr || dz < -cr) continue;
+    const d2 = dx * dx + dz * dz;
+    if (d2 >= cr * cr) continue;
+    let d = Math.sqrt(d2);
+    if (d < 1e-4) { dx = 1; dz = 0; d = 1; }
+    const k = (cr - d) / d;
+    _colX += dx * k;
+    _colZ += dz * k;
+    _colHit = true;
+  }
+}
+
+// Push a THREE.Vector3 out of every solid prop it overlaps. XZ only - the
+// height comes from surfaceHeight(). Called once per frame for one player.
+function resolveCollide(pos, radius) {
+  if (!pos) return pos;
+  const px = pos.x, pz = pos.z;
+  if (!isFinite(px) || !isFinite(pz)) return pos;
+  let r = (typeof radius === 'number' && isFinite(radius)) ? radius : 0.42;
+  if (r < 0.05) r = 0.05; else if (r > 4) r = 4;
+  const py = (typeof pos.y === 'number' && isFinite(pos.y)) ? pos.y : 0;
+  const underDeck = py < DECK_TOP - 0.5;
+  _colX = px; _colZ = pz;
+  for (let it = 0; it < 3; it++) {
+    _colHit = false;
+    pushOutCyls(SOLIDS, r);
+    if (underDeck) pushOutCyls(POSTS, r);
+    for (let i = 0; i < WALLS.length; i += 6) {
+      const ax = WALLS[i + 2], az = WALLS[i + 3];
+      const dx = _colX - WALLS[i], dz = _colZ - WALLS[i + 1];
+      const lx = dx * ax + dz * az;
+      const ox = WALLS[i + 4] + r - (lx < 0 ? -lx : lx);
+      if (ox <= 0) continue;
+      const lz = dz * ax - dx * az;
+      const oz = WALLS[i + 5] + r - (lz < 0 ? -lz : lz);
+      if (oz <= 0) continue;
+      if (ox < oz) {
+        const s = lx < 0 ? -ox : ox;
+        _colX += s * ax; _colZ += s * az;
+      } else {
+        const s = lz < 0 ? -oz : oz;
+        _colX -= s * az; _colZ += s * ax;
+      }
+      _colHit = true;
+    }
+    if (!_colHit) break;
+  }
+  if (isFinite(_colX) && isFinite(_colZ)) { pos.x = _colX; pos.z = _colZ; }
+  return pos;
+}
+
 function buildDock(parts) {
   const rnd = mulberry32(777);
-  const w = 6.4;
+  const w = DOCK_W;
+  // the deck planks carry players for the dock's whole length and width.
+  // The beach sits a hair ABOVE the planks at the landward end, so
+  // max(terrain, deck) already reads as a natural little step down.
+  platRect(0, DOCK_MID_Z, 0, DOCK_HALF_W, DOCK_HALF_L, DECK_TOP, 0.5, 0.35);
   // planks
   for (let z = DOCK_START_Z; z > DOCK_END_Z; z -= 0.62) {
     const shade = rnd();
@@ -790,6 +927,7 @@ function buildDock(parts) {
       const bot = Math.min(g - 0.7, DECK_Y - 1.4);
       const hgt = DECK_Y - 0.12 - bot;
       push(parts, G_CYL6, WOOD_B, px, bot + hgt * 0.5, z, 0, rnd() * 1.2, 0, 0.42, hgt, 0.42);
+      solidPost(px, z, 0.3);   // only solid while you are under the deck
     }
   }
   // mooring posts at the seaward end
@@ -800,18 +938,21 @@ function buildDock(parts) {
     const hgt = DECK_Y + 1.15 - bot;
     push(parts, G_CYL6, WOOD_C, px, bot + hgt * 0.5, DOCK_END_Z + 0.4, 0, 0.4, 0, 0.5, hgt, 0.5);
     push(parts, G_CYL8, 0x51402c, px, bot + hgt - 0.3, DOCK_END_Z + 0.4, 0, 0, 0, 0.66, 0.16, 0.66);
+    solidCyl(px, DOCK_END_Z + 0.4, 0.34);   // stands proud of the deck: always solid
   }
   // a crate and two barrels waiting at the landward end
   push(parts, G_BOX, WOOD_C, -2.1, DECK_Y + 0.5, DOCK_START_Z - 1.6, 0, 0.32, 0, 1.0, 0.9, 1.0);
   push(parts, G_BOX, WOOD_B, -2.1, DECK_Y + 0.98, DOCK_START_Z - 1.6, 0, 0.32, 0, 1.05, 0.08, 1.05);
+  solidCyl(-2.1, DOCK_START_Z - 1.6, 0.6);
   for (let i = 0; i < 2; i++) {
     push(parts, G_CYL8, 0x7d5a38, 2.2, DECK_Y + 0.55, DOCK_START_Z - 1.2 - i * 1.25, 0, 0.2 * i, 0, 0.92, 1.1, 0.92);
     push(parts, G_CYL8, 0x4a4038, 2.2, DECK_Y + 0.55, DOCK_START_Z - 1.2 - i * 1.25, 0, 0.2 * i, 0, 0.98, 0.14, 0.98);
+    solidCyl(2.2, DOCK_START_Z - 1.2 - i * 1.25, 0.48);
   }
 }
 
 function buildShopHut(parts) {
-  const yaw = -0.55;
+  const yaw = SHOP_YAW;
   const cy = Math.cos(yaw), sy = Math.sin(yaw);
   const g = SHOP_Y;
   // local -> world helper
@@ -820,6 +961,18 @@ function buildShopHut(parts) {
       SHOP_X + lx * cy + lz * sy, g + ly, SHOP_Z + (-lx * sy + lz * cy),
       rx || 0, (ry || 0) + yaw, rz || 0, sx, syy, sz, sway);
   }
+  // collision, in the same local frame: a walkable floor, solid walls on
+  // three sides, and the FRONT (-z, the counter) deliberately left open.
+  function W(lx, lz, hx, hz) {
+    solidBox(SHOP_X + lx * cy + lz * sy, SHOP_Z + (-lx * sy + lz * cy), yaw, hx, hz);
+  }
+  function S(lx, lz, r) {
+    solidCyl(SHOP_X + lx * cy + lz * sy, SHOP_Z + (-lx * sy + lz * cy), r);
+  }
+  platRect(SHOP_X, SHOP_Z, yaw, 3.5, 2.9, g + SHOP_FLOOR, 1.3, 1.4);
+  W(0, 2.82, 3.45, 0.18);      // back wall
+  W(-3.32, 1.2, 0.18, 1.55);   // left wall
+  W(3.32, 1.2, 0.18, 1.55);    // right wall
   // stilts + floor
   for (let sx = -1; sx <= 1; sx += 2) {
     for (let sz = -1; sz <= 1; sz += 2) {
@@ -881,13 +1034,17 @@ function buildShopHut(parts) {
   P(G_CYL8, 0x7d5a38, 4.3, 0.6, -1.4, 0, 0, 0, 1.0, 1.2, 1.0);
   P(G_CYL8, 0x4a4038, 4.3, 0.6, -1.4, 0, 0, 0, 1.06, 0.16, 1.06);
   P(G_BOX, WOOD_C, -4.6, 0.45, 0.6, 0, 0.5, 0, 1.1, 0.9, 1.1);
+  S(4.3, -1.4, 0.55);
+  S(-4.6, 0.6, 0.7);
 }
 
 function buildStoneRing(parts) {
   const rnd = mulberry32(1357);
-  // altar plinth
+  // altar plinth (two raised steps you can stand on)
   push(parts, G_CYL12, STONE_B, RINGSITE.x, RING_Y + 0.22, RINGSITE.z, 0, 0, 0, 7.4, 0.45, 7.4);
   push(parts, G_CYL12, STONE_C, RINGSITE.x, RING_Y + 0.5, RINGSITE.z, 0, 0.26, 0, 6.2, 0.2, 6.2);
+  platDisc(RINGSITE.x, RINGSITE.z, 3.7, RING_Y + 0.445, 0.6, 0.6);
+  platDisc(RINGSITE.x, RINGSITE.z, 3.1, RING_Y + 0.6, 0.4, 0.4);
   const stones = 9;
   for (let i = 0; i < stones; i++) {
     const a = (i / stones) * Math.PI * 2;
@@ -898,6 +1055,7 @@ function buildStoneRing(parts) {
     const tilt = (rnd() - 0.5) * 0.13;
     push(parts, G_CYL5, i % 2 ? STONE_A : STONE_B, x, g + h * 0.45 - 0.35, z,
       tilt, a + rnd(), tilt * 0.6, 1.5 + rnd() * 0.4, h, 1.05 + rnd() * 0.3);
+    solidCyl(x, z, 0.62);
     // capstone on every third pair
     if (i % 3 === 0) {
       push(parts, G_BOX, STONE_C, x, g + h - 0.15, z, 0, a, tilt * 0.4, 2.0, 0.42, 1.3);
@@ -924,6 +1082,7 @@ function buildCampfireBase(parts) {
       Math.cos(a) * 0.5, -a, Math.sin(a) * 0.5, 0.26, 2.1, 0.26);
   }
   push(parts, G_ICO0, 0x241a14, CAMP_X, CAMP_Y + 0.12, CAMP_Z, 0, 0, 0, 1.5, 0.16, 1.5);
+  solidCyl(CAMP_X, CAMP_Z, 1.45);   // the stone ring keeps you out of the fire
   // log benches around the fire
   for (let i = 0; i < 3; i++) {
     const a = i * 2.3 + 0.6;
@@ -949,10 +1108,16 @@ function buildScatter(staticParts, foliageParts) {
     if (Math.hypot(x - SHOP_X, z - SHOP_Z) < 7) continue;
     if (Math.abs(x) < 5 && z < DOCK_START_Z + 6) continue;
     const s = 0.7 + rnd() * 2.6;
-    push(staticParts, rnd() < 0.5 ? G_ICO0 : G_ICO1,
-      rnd() < 0.4 ? STONE_A : (rnd() < 0.6 ? STONE_B : STONE_C),
-      x, h + s * 0.32, z, rnd() * 3, rnd() * 3, rnd() * 3,
-      s * (0.8 + rnd() * 0.5), s * (0.55 + rnd() * 0.5), s * (0.8 + rnd() * 0.5));
+    // (hoisted in the exact original rnd() order so the layout is unchanged)
+    const rGeo = rnd() < 0.5 ? G_ICO0 : G_ICO1;
+    const rCol = rnd() < 0.4 ? STONE_A : (rnd() < 0.6 ? STONE_B : STONE_C);
+    const rrx = rnd() * 3, rry = rnd() * 3, rrz = rnd() * 3;
+    const rsx = s * (0.8 + rnd() * 0.5);
+    const rsy = s * (0.55 + rnd() * 0.5);
+    const rsz = s * (0.8 + rnd() * 0.5);
+    push(staticParts, rGeo, rCol, x, h + s * 0.32, z, rrx, rry, rrz, rsx, rsy, rsz);
+    const rockR = (rsx + rsz) * 0.42;
+    if (rockR > 0.62) solidCyl(x, z, rockR);   // pebbles stay walk-over-able
     placed++;
   }
   // ---- driftwood on the beach ----
@@ -985,9 +1150,11 @@ function buildScatter(staticParts, foliageParts) {
     const th = 6.5 + rnd() * 4.2;
     const bendX = (rnd() - 0.5) * 2.4, bendZ = (rnd() - 0.5) * 2.4;
     const phase = rnd() * 6.283;
-    const trunkGeo = makeTrunkGeo(th, 0.42 + rnd() * 0.1, 0.24, bendX, bendZ, 7);
+    const trunkR = 0.42 + rnd() * 0.1;
+    const trunkGeo = makeTrunkGeo(th, trunkR, 0.24, bendX, bendZ, 7);
     push(foliageParts, trunkGeo, rnd() < 0.5 ? 0x8a7050 : 0x77603f, x, h - 0.25, z,
       0, rnd() * 6.283, 0, 1, 1, 1, [h + th * 0.25, h + th, 0.22, phase]);
+    solidCyl(x, z, trunkR + 0.16);
     const crownY = h - 0.25 + th;
     const fronds = 8 + Math.floor(rnd() * 3);
     for (let f = 0; f < fronds; f++) {
@@ -1281,6 +1448,20 @@ function wxGrade(col, mul, desat, tr, tg, tb, amt) {
   return col;
 }
 
+// =============================================================
+// AREA SIGNS - readable from a distance, never in your face.
+// They fade OUT below LABEL_NEAR m (you are standing in the area, you
+// know where you are), reach full strength by LABEL_FULL m, and their
+// on-screen height is capped at LABEL_SCREEN of the viewport so a sign
+// can never take over the view no matter how close the camera gets.
+// =============================================================
+const LABEL_NEAR = 25;
+const LABEL_FULL = 58;
+const LABEL_FAR = 175;
+const LABEL_GONE = 275;
+const LABEL_SCREEN = 0.17;
+const LABEL_W = 30, LABEL_H = 9.4, LABEL_Y = 8.5;
+
 // rain-splash sprites: per-point size + alpha (PointsMaterial has neither)
 const SPLASH_VERT = `
 attribute float aSize;
@@ -1322,6 +1503,8 @@ export function initWorld(ctx) {
   scene.add(terrain);
 
   // ---------- static props ----------
+  // (the builders also register their collision footprints - see SOLIDS/PLATS)
+  clearCollision();
   const staticParts = [];
   const foliageParts = [];
   buildDock(staticParts);
@@ -1860,12 +2043,12 @@ export function initWorld(ctx) {
       transparent: true, depthWrite: false, fog: false, opacity: 0,
     });
     const spr = new THREE.Sprite(sprMat);
-    spr.position.set(lxp, 8.5, lzp);
-    spr.scale.set(30, 9.4, 1);
+    spr.position.set(lxp, LABEL_Y, lzp);
+    spr.scale.set(LABEL_W, LABEL_H, 1);
     spr.renderOrder = 7;
     spr.visible = false;
     scene.add(spr);
-    labels.push({ spr, mat: sprMat, x: lxp, z: lzp });
+    labels.push({ spr, mat: sprMat, x: lxp, y: LABEL_Y, z: lzp });
   }
 
   const buoyCount = buoys.length;
@@ -2442,12 +2625,21 @@ export function initWorld(ctx) {
     buoyHalo.instanceMatrix.needsUpdate = true;
 
     // ---- area labels ----
+    // far fade + NEAR fade (they used to fill the screen up close) and a
+    // hard cap on how much of the viewport a sign is allowed to cover.
+    const labTan = Math.tan(((cam.fov || 60) * Math.PI / 180) * 0.5) || 0.5774;
     for (let i = 0; i < labels.length; i++) {
       const L = labels[i];
-      const dx = cam.position.x - L.x, dz = cam.position.z - L.z;
-      const op = smoothstep(275, 175, Math.sqrt(dx * dx + dz * dz)) * (1 - underAmt * 0.75);
+      const dx = cam.position.x - L.x, dy = cam.position.y - L.y, dz = cam.position.z - L.z;
+      const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+      const op = smoothstep(LABEL_GONE, LABEL_FAR, dist)
+        * smoothstep(LABEL_NEAR, LABEL_FULL, dist) * (1 - underAmt * 0.75);
       L.mat.opacity = op * 0.95;
       L.spr.visible = op > 0.02;
+      if (!L.spr.visible) continue;
+      const maxH = LABEL_SCREEN * 2 * labTan * dist;
+      const hh = maxH < LABEL_H ? maxH : LABEL_H;
+      L.spr.scale.set(hh * (LABEL_W / LABEL_H), hh, 1);
     }
 
     // ---- campfire ----
@@ -2521,6 +2713,8 @@ export function initWorld(ctx) {
   return {
     update,
     getTerrainHeight: terrainHeight,
+    surfaceHeight,
+    resolveCollide,
     setNightSnap,
     setPortalBuilt,
     portalPos: new THREE.Vector3(RINGSITE.x, RING_Y + 1.2, RINGSITE.z),

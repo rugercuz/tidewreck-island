@@ -57,6 +57,12 @@ const DIFFICULTY_MULT = { chill: 0.7, normal: 1, hard: 1.4 };
 const START_TIME_OF_DAY = 0.28;   // just after sunrise
 const DOCK_SPAWN = [0, 1.2, -126];
 
+// --- character customization (mirrors rooms.js sanitizers) -----------
+const HAT_COUNT = 5;              // 0..4 = bucket, beanie, captain, bandana, none
+const SKIN_COUNT = 4;             // 0..3 = light tan, tan, brown, deep
+// --- walkable decks ---------------------------------------------------
+const BOAT_LOCAL_LIMIT = 60;      // sane bound for a boat-local deck coordinate
+
 // --- weather ---------------------------------------------------------
 const WEATHER_DAWN = 0.06;        // timeOfDay of the dawn reroll (dusk = ECON.NIGHT_START)
 const START_WEATHER = 'clear';
@@ -93,6 +99,36 @@ function coord(v, dflt) {
   if (typeof v !== 'number' || !Number.isFinite(v)) return dflt;
   return clamp(v, -6000, 6000);
 }
+
+/** Clamped cosmetic index (never wraps) — hat 0..4, skin 0..3, default 0. */
+function styleIndex(v, count) {
+  return clamp(Math.floor(num(v, 0)), 0, count - 1);
+}
+
+/**
+ * Boat-local deck position off the wire: exactly three real finite numbers or
+ * null. Relayed to PLAYERS_MOVE as-is so remotes anchor to the boat frame.
+ */
+function boatLocal(v) {
+  if (!Array.isArray(v) || v.length < 3) return null;
+  for (let i = 0; i < 3; i++) {
+    if (typeof v[i] !== 'number' || !Number.isFinite(v[i])) return null;
+  }
+  return [
+    clamp(v[0], -BOAT_LOCAL_LIMIT, BOAT_LOCAL_LIMIT),
+    clamp(v[1], -BOAT_LOCAL_LIMIT, BOAT_LOCAL_LIMIT),
+    clamp(v[2], -BOAT_LOCAL_LIMIT, BOAT_LOCAL_LIMIT),
+  ];
+}
+
+/** Own-property lookup so wire strings like 'constructor' can never match. */
+function ownDef(table, key) {
+  if (typeof key !== 'string') return null;
+  return Object.prototype.hasOwnProperty.call(table, key) ? table[key] : null;
+}
+
+/** Horror-event definition for any EVENTS key (serpent / kraken / bloop). */
+function eventDef(type) { return ownDef(EVENTS, type); }
 
 function r2(v) { return Math.round(v * 100) / 100; }
 function r3(v) { return Math.round(v * 1000) / 1000; }
@@ -239,6 +275,8 @@ export class Game {
       id: member.id,
       name: member.name,
       color: num(member.color, 0),
+      hat: styleIndex(member.hat, HAT_COUNT),
+      skin: styleIndex(member.skin, SKIN_COUNT),
       gear: { rod: 1, weapons: [], charms: [], diving: 1 },
       baits: { worms: 5 },
       inventory: [],
@@ -249,6 +287,7 @@ export class Game {
       anim: 'idle',
       swimming: false,
       onBoat: false,
+      bl: null,              // boat-local position while standing on the deck
       seat: -1,
       casting: null,
       floppers: new Map(),   // flopperId -> live landed catch, see FLOPPER
@@ -365,6 +404,8 @@ export class Game {
         id: p.id,
         name: p.name,
         color: p.color,
+        hat: p.hat,
+        skin: p.skin,
         gear: this.gearPayload(p),
         hp: p.hp,
         alive: p.alive,
@@ -651,8 +692,11 @@ export class Game {
       return;
     }
     if (this.dayNumber > this.quota.deadlineDay && this.quota.progress < this.quota.target) {
+      // A tsunami trumps whatever is circling the boat, but the event still has
+      // to close properly (EVENT_END) or clients keep the night snap and the
+      // cut music forever. Do it before tsunamiAt so endEvent() runs normally.
+      if (this.eventActive) this.endEvent();
       this.tsunamiAt = now;
-      this.eventActive = null;
       this.chat('ISLAND', 'The water pulls away from the beach. All of it.');
       this.broadcast(MSG.TSUNAMI, {});
     }
@@ -674,6 +718,9 @@ export class Game {
     p.anim = cleanAnim(d.anim);
     p.swimming = !!d.swimming;
     p.onBoat = !!d.onBoat;
+    // Walking the deck: the client anchors itself in the boat's frame and the
+    // server relays that anchor untouched. Absent/garbage => plain world pos.
+    p.bl = boatLocal(d.bl);
     this.moveDirty.add(id);
   }
 
@@ -690,6 +737,7 @@ export class Game {
         anim: p.anim,
         swimming: p.swimming,
         onBoat: p.onBoat,
+        bl: p.bl ? [r2(p.bl[0]), r2(p.bl[1]), r2(p.bl[2])] : null,
       });
     }
     this.moveDirty.clear();
@@ -1233,8 +1281,8 @@ export class Game {
 
   damagePlayer(p, dmg, cause) {
     if (!p || !p.alive || this.over) return;
-    const amount = Math.max(0, Math.round(dmg));
-    if (amount <= 0) return;
+    const amount = Math.max(0, Math.round(num(dmg, 0)));
+    if (!(amount > 0)) return;
     p.hp = clamp(p.hp - amount, 0, PLAYER_MAX_HP);
 
     if (p.hp <= 0) {
@@ -1245,6 +1293,7 @@ export class Game {
       for (let i = 0; i < BOAT_SEATS; i++) if (this.boat.seats[i] === p.id) this.boat.seats[i] = null;
       p.seat = -1;
       p.onBoat = false;
+      p.bl = null;                   // no longer anchored to the deck
       this.broadcastBoatState();
       this.chat('ISLAND', `${p.name} went under. They will wake at the campfire.`);
     }
@@ -1261,8 +1310,10 @@ export class Game {
 
     const cause = typeof d.cause === 'string' ? d.cause.slice(0, 24) : 'unknown';
     let max = MAX_ENEMY_DMG;
-    if (ENEMIES[cause]) max = ENEMIES[cause].dmg;
-    else if (EVENTS[cause]) max = EVENT_HIT_MAX_DMG;
+    const enemyDef = ownDef(ENEMIES, cause);
+    // Every horror event caps the same — serpent, kraken and bloop alike.
+    if (enemyDef) max = num(enemyDef.dmg, MAX_ENEMY_DMG);
+    else if (eventDef(cause)) max = EVENT_HIT_MAX_DMG;
     else {
       const byName = Object.keys(ENEMIES).find(k => ENEMIES[k].name === cause);
       if (byName) max = ENEMIES[byName].dmg;
@@ -1528,9 +1579,15 @@ export class Game {
     }
   }
 
+  /**
+   * Start a horror event. Works for every EVENTS key (serpent, kraken, bloop) —
+   * nothing here is creature-specific; the client picks its visuals off `type`.
+   * Also reachable from the host's "/event <type>" debug chat command.
+   */
   startEvent(type) {
-    const def = EVENTS[type];
+    const def = eventDef(type);
     if (!def) return;
+    if (this.over || this.eventActive || this.tsunamiAt > 0) return;
     const now = nowSeconds();
     this.eventActive = {
       type,
@@ -1583,6 +1640,13 @@ export class Game {
           pos,
           boat: [r2(this.boat.p[0]), r2(this.boat.p[1]), r2(this.boat.p[2])],
           timeLeft: Math.max(0, Math.round(ev.endsAt - now)),
+          // additive extras (safe for clients that ignore them) — the same
+          // three phases drive all three creatures, so hand the client enough
+          // to ramp its own staging for kraken/bloop as well as the serpent.
+          name: ev.def.name,
+          phaseIdx: ev.phaseIdx - 1,
+          duration: num(ev.def.duration, 90),
+          progress: r3(clamp((now - ev.startedAt) / Math.max(1, num(ev.def.duration, 90)), 0, 1)),
         },
       });
     }
@@ -1601,10 +1665,12 @@ export class Game {
     let unlocked = null;
     if (survived) {
       if (this.eventsSurvived.indexOf(ev.type) === -1) this.eventsSurvived.push(ev.type);
-      unlocked = ev.def.unlocksFish;
+      // Each event names its own Tier-X juvenile (serpenthatchling /
+      // krakenspawnling / bloopcalf) — never assume one of them.
+      unlocked = typeof ev.def.unlocksFish === 'string' ? ev.def.unlocksFish : null;
     }
 
-    this.broadcast(MSG.EVENT_END, { type: ev.type, survived, unlocked });
+    this.broadcast(MSG.EVENT_END, { type: ev.type, survived, unlocked, name: ev.def.name });
     this.chat('ISLAND', survived
       ? `${ev.def.name} sank back into the dark. Its young can be hooked in The Abyss now.`
       : `${ev.def.name} took the whole crew. It will come back.`);

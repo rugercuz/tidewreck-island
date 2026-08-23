@@ -5,18 +5,20 @@
 // Owner module: exports initBoat(ctx).
 // =============================================================
 import * as THREE from 'three';
-import { MSG, ECON } from '/shared/constants.js';
+import { MSG, ECON, WEATHER } from '/shared/constants.js';
 
 /* ------------------------------------------------------------------ *
  * Tuning tables
  * ------------------------------------------------------------------ */
 
 // len/wid/depth in metres. free = freeboard (gunwale height above waterline).
+// Wave 3: every hull is a real walkable platform — people fish from these
+// together, so the flat deck area is the point.
 const SPECS = {
-  1: { name: 'Dinghy',       len: 4.4,  wid: 1.85, depth: 0.62, free: 0.50, seats: 2, maxSpeed: 8,  accel: 8.5,  turn: 1.70, drag: 0.36, quad: 0.0878 },
-  2: { name: 'Skiff',        len: 6.3,  wid: 2.35, depth: 0.80, free: 0.62, seats: 4, maxSpeed: 12, accel: 12.5, turn: 1.45, drag: 0.30, quad: 0.0618 },
-  3: { name: 'Cutter',       len: 8.4,  wid: 2.95, depth: 0.98, free: 0.76, seats: 6, maxSpeed: 16, accel: 15.5, turn: 1.20, drag: 0.26, quad: 0.0443 },
-  4: { name: 'Abyss-Runner', len: 10.4, wid: 3.50, depth: 1.18, free: 0.90, seats: 8, maxSpeed: 20, accel: 19.0, turn: 1.02, drag: 0.24, quad: 0.0355 },
+  1: { name: 'Dinghy',       len: 5.5,  wid: 2.30, depth: 0.70, free: 0.54, seats: 2, maxSpeed: 8,  accel: 8.5,  turn: 1.55, drag: 0.36, quad: 0.0878 },
+  2: { name: 'Skiff',        len: 8.0,  wid: 3.00, depth: 0.88, free: 0.68, seats: 4, maxSpeed: 12, accel: 12.5, turn: 1.30, drag: 0.30, quad: 0.0618 },
+  3: { name: 'Cutter',       len: 11.0, wid: 3.90, depth: 1.06, free: 0.82, seats: 6, maxSpeed: 16, accel: 15.5, turn: 1.08, drag: 0.26, quad: 0.0443 },
+  4: { name: 'Abyss-Runner', len: 14.0, wid: 4.90, depth: 1.30, free: 0.98, seats: 8, maxSpeed: 20, accel: 19.0, turn: 0.92, drag: 0.24, quad: 0.0355 },
 };
 
 // Painted palettes per hull tier.
@@ -36,7 +38,8 @@ const WORLD_BOUND = 952;      // hard sailing limit on each axis
 const WORLD_SOFT = 930;       // soft wall starts here (clears the Abyss ring)
 const NET_INTERVAL = 1 / 12;  // DRIVE_BOAT send rate
 const NET_SMOOTH = 0.15;      // passenger interpolation time constant (s)
-const BOARD_RANGE = 6;        // metres, boarding affordance radius
+const BOARD_RANGE = 3;        // metres OUTSIDE the hull box (hull size + 3 m)
+const WAKE_MIN_SPEED = 1.5;   // below this the water stays perfectly clean
 
 /* ------------------------------------------------------------------ *
  * Module scratch (single boat instance -> safe to share, zero alloc)
@@ -47,6 +50,12 @@ const _euler = new THREE.Euler(0, 0, 0, 'YXZ');
 const _cornerH = [0, 0, 0, 0];
 const _cornerX = [0, 0, 0, 0];
 const _cornerZ = [0, 0, 0, 0];
+const _q = new THREE.Quaternion();
+const _qi = new THREE.Quaternion();
+const _c0 = new THREE.Vector3();
+const _c1 = new THREE.Vector3();
+const _c2 = new THREE.Vector3();
+const _deckOut = { y: 0, localX: 0, localZ: 0 };
 
 function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
 function smoothstep(a, b, x) { const t = clamp((x - a) / (b - a || 1e-6), 0, 1); return t * t * (3 - 2 * t); }
@@ -242,6 +251,8 @@ function sheerProfile(u) {
 }
 
 function deckY(spec) { return -spec.depth * 0.34; }
+// Top of the walkable sole — this is the height feet stand at.
+function deckTopY(spec) { return deckY(spec) + 0.06; }
 
 // Cross-section key points at station u, starboard(-x is starboard; +x is port).
 function station(spec, u, out) {
@@ -351,7 +362,7 @@ function makeBuilder(root) {
     root,
     _geoms: [],
     _mats: [],
-    anim: { props: [], oars: [], wheel: null, motor: null, rudder: null, flags: [], beacons: [], lampSpot: null, lampCones: [], lampLens: [], sprites: [], crane: null },
+    anim: { props: [], oars: [], wheel: null, tiller: null, motor: null, rudder: null, flags: [], beacons: [], lampSpot: null, lampCones: [], lampLens: [], sprites: [], crane: null },
     glowMats: [],
     seats: [],
     g(geom) { this._geoms.push(geom); return geom; },
@@ -530,36 +541,124 @@ function makeMaterials(B, pal, level) {
   return mats;
 }
 
-// Deck sole plate over the flat part of the cockpit floor.
+// Inner (walkable) half-width of the cockpit at local z.
+function innerHalfWidth(spec, lz) {
+  const u = clamp(lz / spec.len + 0.5, 0, 1);
+  station(spec, u, _st);
+  const inset = Math.min(_st.hw * 0.40, 0.09 + spec.wid * 0.030);
+  return Math.max(0.05, _st.hw - inset);
+}
+
+// Flat sole plate that follows the hull sides — a real floor to walk on.
+function buildFloorGeometry(spec, z0, z1, y, stations) {
+  const rings = [];
+  for (let i = 0; i < stations; i++) {
+    const f = i / (stations - 1);
+    const lz = z0 + (z1 - z0) * f;
+    const hw = innerHalfWidth(spec, lz);
+    rings.push([[-hw, y, lz], [0, y, lz], [hw, y, lz]]);
+  }
+  const pos = [], idx = [], uv = [];
+  addLoft(pos, idx, uv, rings, Math.max(1, (z1 - z0) * 0.45), 2);
+  return finishGeometry(pos, idx, uv);
+}
+
+// Deck sole over the flat part of the cockpit floor (z0/z1 = fractions of len).
 function buildSole(B, mats, spec, z0, z1) {
-  station(spec, 0.45, _st);
-  const w = Math.max(0.4, (_st.hw - Math.min(_st.hw * 0.40, 0.09 + spec.wid * 0.030)) * 1.86);
-  const len = (z1 - z0) * spec.len;
-  const geo = uvScaled(B.box(w, 0.05, len), spec.wid * 0.5, spec.len * 0.35);
-  const m = B.mesh(geo, mats.deck, 0, deckY(spec) + 0.03, (z0 + z1) * 0.5 * spec.len);
+  const geo = B.g(buildFloorGeometry(spec, z0 * spec.len, z1 * spec.len, deckTopY(spec) - 0.01, 16));
+  const m = B.mesh(geo, mats.deck, 0, 0, 0);
   m.castShadow = false;
+  m.receiveShadow = true;
   return m;
+}
+
+/* ------------------------------------------------------------------ *
+ * Layout: the handful of numbers that BOTH the mesh builders and the
+ * walkable deck plan need. Single source of truth so they never drift.
+ * deckZ0/deckZ1 are fractions of len; everything else is metres.
+ * ------------------------------------------------------------------ */
+function layout(level, spec) {
+  const L = spec.len, W = spec.wid, dY = deckY(spec), tY = deckTopY(spec);
+  const o = {
+    L: L, W: W, dY: dY, tY: tY,
+    deckZ0: -0.44, deckZ1: 0.42, helmZ: -L * 0.32,
+    cabZ: 0, cabD: 0, cabW: 0, cabH: 0, roofY: 0,
+    conZ: 0, conW: 0, conD: 0, conTopY: 0,
+  };
+  if (level === 2) {
+    o.deckZ1 = 0.24;
+    o.conZ = L * 0.29; o.conW = 0.92; o.conD = 0.62; o.conTopY = tY + 0.96;
+    o.helmZ = L * 0.20;
+  } else if (level === 3) {
+    o.cabZ = L * 0.33; o.cabD = L * 0.26; o.cabW = W * 0.62; o.cabH = 1.18;
+    o.roofY = dY + o.cabH + 0.16;
+    o.conZ = o.cabZ - o.cabD * 0.5 - 0.28; o.conW = 1.05; o.conD = 0.52; o.conTopY = tY + 1.04;
+    o.deckZ1 = (o.cabZ - o.cabD * 0.5) / L;   // deck runs right up to the bulkhead
+    o.helmZ = L * 0.125;
+  } else if (level === 4) {
+    o.cabZ = L * 0.33; o.cabD = L * 0.24; o.cabW = W * 0.60; o.cabH = 1.34;
+    o.roofY = dY + o.cabH + 0.18;
+    o.conZ = o.cabZ - o.cabD * 0.5 - 0.30; o.conW = 1.15; o.conD = 0.56; o.conTopY = tY + 1.10;
+    o.deckZ1 = (o.cabZ - o.cabD * 0.5) / L;   // deck runs right up to the bulkhead
+    o.helmZ = L * 0.13;
+  }
+  return o;
+}
+
+/* ------------------------------------------------------------------ *
+ * Walkable deck plan. 'hull' zones follow the station width curve;
+ * 'rect' zones are flat plates (cabin roofs, console tops used as steps).
+ * ------------------------------------------------------------------ */
+const DECK_EDGE = 0.20;   // metres kept clear of the inner hull skin
+
+function hullZone(spec, z0, z1, y) {
+  return { kind: 'hull', spec: spec, z0: z0 * spec.len, z1: z1 * spec.len, y: y };
+}
+function rectZone(hx, z0, z1, y) {
+  return { kind: 'rect', hx: hx, z0: z0, z1: z1, y: y };
+}
+function zoneContains(zone, lx, lz) {
+  if (lz < zone.z0 || lz > zone.z1) return false;
+  if (zone.kind === 'rect') return Math.abs(lx) <= zone.hx;
+  return Math.abs(lx) <= Math.max(0.10, innerHalfWidth(zone.spec, lz) - DECK_EDGE);
+}
+
+function buildDeckPlan(level, spec) {
+  const Y = layout(level, spec);
+  const zones = [hullZone(spec, Y.deckZ0, Y.deckZ1, Y.tY)];
+  if (level >= 3) {
+    // console top doubles as the step up to the cabin roof; the roof zone
+    // starts exactly at the bulkhead so there is no hole to fall through.
+    zones.push(rectZone(Y.conW * 0.42, Y.conZ - Y.conD * 0.5, Y.conZ + Y.conD * 0.5, Y.conTopY));
+    zones.push(rectZone(Y.cabW * 0.46, Y.cabZ - Y.cabD * 0.5, Y.cabZ + Y.cabD * 0.46, Y.roofY));
+  }
+  return { zones: zones, helm: new THREE.Vector3(0, Y.tY, Y.helmZ) };
 }
 
 /* ------------------------------------------------------------------ *
  * TIER 1 - Dinghy: tiny wooden rowboat, thwarts, oars, lantern.
  * ------------------------------------------------------------------ */
 function buildDinghy(B, mats, spec, pal) {
-  const L = spec.len, dY = deckY(spec);
-  // ribs across the bare floor
-  const ribGeo = B.box(spec.wid * 0.74, 0.05, 0.09);
-  for (let i = -2; i <= 2; i++) {
-    const m = B.mesh(ribGeo, mats.trim, 0, dY + 0.03, i * L * 0.13);
-    m.scale.x = 0.72 + 0.28 * (1 - Math.abs(i) / 2.6);
+  const Y = layout(1, spec);
+  const L = spec.len, dY = deckY(spec), tY = Y.tY;
+  // flat floor boards spanning almost the whole hull — this is the deck
+  buildSole(B, mats, spec, Y.deckZ0 - 0.02, Y.deckZ1 + 0.02);
+  // raised ribs laid ON the boards (low enough to step over)
+  const ribGeo = B.box(spec.wid * 0.74, 0.035, 0.10);
+  for (let i = -3; i <= 3; i++) {
+    const lz = i * L * 0.115;
+    const m = B.mesh(ribGeo, mats.trim, 0, tY + 0.02, lz);
+    m.scale.x = clamp(innerHalfWidth(spec, lz) * 2 / (spec.wid * 0.74), 0.25, 1.0);
     m.castShadow = false;
   }
-  // thwarts (seat 0 aft at the tiller, seat 1 forward)
-  buildBench(B, mats, spec.wid * 0.80, 0.30, 0, dY + 0.40, -L * 0.14);
-  buildBench(B, mats, spec.wid * 0.72, 0.28, 0, dY + 0.40, L * 0.14);
-  // transom knee + tiller
-  B.mesh(B.box(spec.wid * 0.5, 0.10, 0.30), mats.trim, 0, dY + 0.44, -L * 0.42);
-  const tiller = B.mesh(B.box(0.06, 0.06, 0.95), mats.trim, 0, dY + 0.60, -L * 0.30);
+  // thwarts pushed right out to the ends so the middle stays clear to stand in
+  buildBench(B, mats, innerHalfWidth(spec, -L * 0.33) * 1.8, 0.30, 0, tY + 0.36, -L * 0.33);
+  buildBench(B, mats, innerHalfWidth(spec, L * 0.33) * 1.8, 0.28, 0, tY + 0.36, L * 0.33);
+  // transom knee + tiller (the dinghy's helm)
+  B.mesh(B.box(spec.wid * 0.5, 0.10, 0.30), mats.trim, 0, dY + 0.46, -L * 0.46);
+  const tiller = B.mesh(B.box(0.07, 0.07, 1.05), mats.trim, 0, tY + 0.66, Y.helmZ - 0.34);
   tiller.rotation.x = -0.12;
+  B.anim.tiller = tiller;
   B.anim.rudder = B.mesh(B.box(0.05, 0.55, 0.34), mats.trim, 0, -spec.depth * 0.55, -L * 0.49);
   // oarlocks + oars
   const lockGeo = B.cyl(0.045, 0.05, 0.16, 8);
@@ -584,10 +683,10 @@ function buildDinghy(B, mats, spec, pal) {
   const coil = B.mesh(B.g(new THREE.TorusGeometry(0.16, 0.045, 5, 12)), mats.rope, 0, _st.chineY + 0.14, L * 0.34);
   coil.rotation.x = Math.PI * 0.5;
   buildCleat(B, mats, 0, _st.gy + 0.04, L * 0.40);
-  // bait bucket
-  const bucket = B.mesh(B.cyl(0.17, 0.14, 0.30, 10), mats.metal, spec.wid * 0.18, dY + 0.18, -L * 0.30);
+  // bait bucket, tucked into the aft quarter so nobody trips over it
+  const bucket = B.mesh(B.cyl(0.17, 0.14, 0.30, 10), mats.metal, spec.wid * 0.28, tY + 0.15, -L * 0.24);
   bucket.material = mats.metal;
-  B.mesh(B.g(new THREE.TorusGeometry(0.17, 0.015, 4, 10)), mats.trim, spec.wid * 0.18, dY + 0.32, -L * 0.30).rotation.x = Math.PI * 0.5;
+  B.mesh(B.g(new THREE.TorusGeometry(0.17, 0.015, 4, 10)), mats.trim, spec.wid * 0.28, tY + 0.29, -L * 0.24).rotation.x = Math.PI * 0.5;
   // bow lantern - warm and charming at night
   station(spec, 0.94, _st);
   const post = B.mesh(B.cyl(0.03, 0.035, 0.55, 6), mats.metal, 0, _st.gy + 0.28, L * 0.44);
@@ -603,48 +702,54 @@ function buildDinghy(B, mats, spec, pal) {
  * TIER 2 - Skiff: outboard, console, windshield, benches.
  * ------------------------------------------------------------------ */
 function buildSkiff(B, mats, spec, pal) {
-  const L = spec.len, W = spec.wid, dY = deckY(spec);
-  buildSole(B, mats, spec, -0.44, 0.20);
+  const Y = layout(2, spec);
+  const L = spec.len, W = spec.wid, dY = deckY(spec), tY = Y.tY;
+  // wide open working deck from transom to the console
+  buildSole(B, mats, spec, Y.deckZ0 - 0.03, Y.deckZ1 + 0.06);
   // gunwale rub rail
   B.mesh(B.g(buildRailGeometry(spec, 16, 0.015, 0.055, 0)), mats.trim, 0, 0, 0);
-  // console + windshield + wheel
-  const cX = W * 0.02;
-  B.mesh(uvScaled(B.box(0.78, 0.86, 0.60), 1, 1), mats.hull, cX, dY + 0.46, L * 0.20);
-  B.mesh(B.box(0.86, 0.08, 0.68), mats.trim, cX, dY + 0.90, L * 0.20);
-  const shield = B.mesh(B.g(new THREE.PlaneGeometry(0.80, 0.42)), mats.glass, cX, dY + 1.12, L * 0.235);
+  // console + windshield + wheel, pushed forward so the deck stays clear
+  const cX = 0;
+  const conZ = Y.conZ;
+  B.mesh(uvScaled(B.box(Y.conW, 0.92, Y.conD), 1, 1), mats.hull, cX, tY + 0.46, conZ);
+  B.mesh(B.box(Y.conW + 0.08, 0.08, Y.conD + 0.08), mats.trim, cX, tY + 0.92, conZ);
+  const shield = B.mesh(B.g(new THREE.PlaneGeometry(0.92, 0.46)), mats.glass, cX, tY + 1.16, conZ + 0.04);
   shield.rotation.x = -0.42;
   shield.castShadow = false;
-  const frame = B.mesh(B.box(0.86, 0.05, 0.05), mats.metal, cX, dY + 1.30, L * 0.20);
+  const frame = B.mesh(B.box(0.98, 0.05, 0.05), mats.metal, cX, tY + 1.35, conZ);
   frame.rotation.x = -0.42;
-  buildWheel(B, mats, 0.20, cX, dY + 0.78, L * 0.14, 0.55);
+  buildWheel(B, mats, 0.22, cX, tY + 0.80, conZ - 0.36, 0.55);
   // throttle lever
-  B.mesh(B.box(0.07, 0.07, 0.20), mats.metal, cX + 0.50, dY + 0.86, L * 0.20);
-  B.mesh(B.cyl(0.022, 0.022, 0.30, 6), mats.trim, cX + 0.50, dY + 1.00, L * 0.18).rotation.x = 0.35;
-  // benches
-  buildBench(B, mats, W * 0.86, 0.40, 0, dY + 0.44, L * 0.12);
-  buildBench(B, mats, W * 0.86, 0.42, 0, dY + 0.44, -L * 0.20);
-  B.mesh(B.box(W * 0.86, 0.36, 0.07), mats.deck, 0, dY + 0.62, -L * 0.20 - 0.20);
-  // side lockers
-  const lockerGeo = uvScaled(B.box(0.34, 0.30, L * 0.30), 1, 2);
+  B.mesh(B.box(0.07, 0.07, 0.20), mats.metal, cX + 0.54, tY + 0.88, conZ);
+  B.mesh(B.cyl(0.022, 0.022, 0.30, 6), mats.trim, cX + 0.54, tY + 1.02, conZ - 0.02).rotation.x = 0.35;
+  // fore-and-aft side benches: seating without blocking the middle
   for (let s = -1; s <= 1; s += 2) {
-    station(spec, 0.35, _st);
-    B.mesh(lockerGeo, mats.deck, s * (_st.hw - 0.30), dY + 0.18, -L * 0.05);
+    const bz = -L * 0.12;
+    const bx = s * (innerHalfWidth(spec, bz) - 0.28);
+    B.mesh(uvScaled(B.box(0.50, 0.075, L * 0.34), 1, 2), mats.deck, bx, tY + 0.40, bz);
+    B.mesh(B.box(0.09, 0.34, 0.09), mats.trim, bx, tY + 0.20, bz + L * 0.14);
+    B.mesh(B.box(0.09, 0.34, 0.09), mats.trim, bx, tY + 0.20, bz - L * 0.14);
+    B.mesh(uvScaled(B.box(0.09, 0.34, L * 0.34), 1, 2), mats.deck, bx + s * 0.24, tY + 0.60, bz);
   }
+  // transom bench + splash well
+  B.mesh(uvScaled(B.box(innerHalfWidth(spec, -L * 0.40) * 1.8, 0.075, 0.46), 1, 1), mats.deck, 0, tY + 0.40, -L * 0.40);
+  B.mesh(B.box(innerHalfWidth(spec, -L * 0.44) * 1.8, 0.38, 0.08), mats.deck, 0, tY + 0.60, -L * 0.44);
   // outboard motor on the transom
   station(spec, 0.02, _st);
-  B.anim.motor = buildMotor(B, mats, 1.0, 0, _st.gy - 0.02, -L * 0.50 - 0.16);
+  B.anim.motor = buildMotor(B, mats, 1.25, 0, _st.gy - 0.02, -L * 0.50 - 0.18);
   // nav lights + bow rail + cleats
   station(spec, 0.88, _st);
   B.anim.navPort = buildNavLight(B, mats, 0xff4433, _st.hw * 0.9, _st.gy + 0.10, _st.z, 0.055);
   B.anim.navStbd = buildNavLight(B, mats, 0x44ff66, -_st.hw * 0.9, _st.gy + 0.10, _st.z, 0.055);
-  B.mesh(B.g(buildRailGeometry(spec, 16, 0.34, 0.032, 0.72)), mats.metal, 0, 0, 0);
+  B.mesh(B.g(buildRailGeometry(spec, 16, 0.40, 0.034, 0.70)), mats.metal, 0, 0, 0);
+  buildRailPosts(B, mats, spec, 16, 0.40, 0.028, 0.70);
   station(spec, 0.94, _st);
   buildCleat(B, mats, 0, _st.gy + 0.05, L * 0.44);
-  buildLifeRing(B, mats, 0.26, -W * 0.30, dY + 0.95, -L * 0.34, 0);
+  buildLifeRing(B, mats, 0.28, -W * 0.34, tY + 0.98, conZ + 0.30, 0);
   // pennant
-  station(spec, 0.90, _st);
-  buildFlag(B, mats, 0.62, 0.34, 0, _st.gy + 0.05, L * 0.40, 1.05);
-  void pal;
+  station(spec, 0.92, _st);
+  buildFlag(B, mats, 0.62, 0.34, 0, _st.gy + 0.05, L * 0.44, 1.05);
+  void pal; void dY;
 }
 const _dummy = new THREE.Object3D();
 
@@ -678,19 +783,30 @@ function buildRailPosts(B, mats, spec, stations, height, radius, fromU) {
  * TIER 3 - Cutter: forward cuddy cabin, T-top helm, rails, nav lights.
  * ------------------------------------------------------------------ */
 function buildCutter(B, mats, spec, pal) {
-  const L = spec.len, W = spec.wid, dY = deckY(spec);
-  buildSole(B, mats, spec, -0.44, 0.22);
+  const Y = layout(3, spec);
+  const L = spec.len, W = spec.wid, dY = deckY(spec), tY = Y.tY;
+  buildSole(B, mats, spec, Y.deckZ0 - 0.03, Y.deckZ1 + 0.02);
   B.mesh(B.g(buildRailGeometry(spec, 18, 0.018, 0.065, 0)), mats.trim, 0, 0, 0);
 
-  // ---- forward cuddy cabin ----
-  const cabZ = L * 0.29, cabD = L * 0.26, cabW = W * 0.66, cabH = 1.12;
+  // ---- forward cuddy cabin (its roof is a second deck) ----
+  const cabZ = Y.cabZ, cabD = Y.cabD, cabW = Y.cabW, cabH = Y.cabH;
+  const roofY = Y.roofY;
   const cabin = B.mesh(uvScaled(B.box(cabW, cabH, cabD), 1, 1), mats.hull, 0, dY + cabH * 0.5 + 0.05, cabZ);
   cabin.name = 'cuddy';
   // sloped front face
   const front = B.mesh(B.box(cabW * 0.98, 0.09, 0.62), mats.hull, 0, dY + cabH + 0.02, cabZ + cabD * 0.42);
   front.rotation.x = 0.55;
-  // roof + trim
-  B.mesh(uvScaled(B.box(cabW * 1.06, 0.10, cabD * 1.05), 1, 1), mats.trim, 0, dY + cabH + 0.10, cabZ);
+  // walkable roof plate + trim lip
+  B.mesh(uvScaled(B.box(cabW * 1.04, 0.10, cabD * 1.02), 1, 1), mats.deck, 0, roofY - 0.05, cabZ);
+  B.mesh(B.box(cabW * 1.08, 0.06, 0.07), mats.trim, 0, roofY + 0.06, cabZ - cabD * 0.51);
+  for (let s = -1; s <= 1; s += 2) {
+    B.mesh(B.box(0.07, 0.06, cabD * 1.02), mats.trim, s * cabW * 0.53, roofY + 0.06, cabZ);
+    // roof grab rail
+    B.mesh(B.cyl(0.026, 0.026, 0.44, 6), mats.metal, s * cabW * 0.46, roofY + 0.22, cabZ - cabD * 0.30);
+    B.mesh(B.cyl(0.026, 0.026, 0.44, 6), mats.metal, s * cabW * 0.46, roofY + 0.22, cabZ + cabD * 0.28);
+    const bar = B.mesh(B.cyl(0.026, 0.026, cabD * 0.60, 6), mats.metal, s * cabW * 0.46, roofY + 0.44, cabZ - cabD * 0.01);
+    bar.rotation.x = Math.PI * 0.5;
+  }
   // windows
   const winSide = B.g(new THREE.PlaneGeometry(cabD * 0.62, 0.38));
   for (let s = -1; s <= 1; s += 2) {
@@ -700,46 +816,51 @@ function buildCutter(B, mats, spec, pal) {
   }
   const winFront = B.mesh(B.g(new THREE.PlaneGeometry(cabW * 0.74, 0.34)), mats.glass, 0, dY + cabH * 0.74, cabZ + cabD * 0.51);
   winFront.castShadow = false;
-  // cabin door at the aft face
-  B.mesh(B.box(cabW * 0.42, 0.86, 0.06), mats.dark, 0, dY + 0.48, cabZ - cabD * 0.5 - 0.02);
+  // cabin door + climbing steps on the aft face
+  B.mesh(B.box(cabW * 0.40, 0.86, 0.06), mats.dark, 0, tY + 0.44, cabZ - cabD * 0.5 - 0.02);
+  for (let i = 0; i < 3; i++) {
+    B.mesh(B.box(0.34, 0.05, 0.14), mats.metal, cabW * 0.34, tY + 0.32 + i * 0.36, cabZ - cabD * 0.5 - 0.09);
+  }
 
-  // ---- helm station under a T-top ----
-  const hz = L * 0.09;
-  B.mesh(uvScaled(B.box(0.95, 0.94, 0.62), 1, 1), mats.hull, 0, dY + 0.50, hz + 0.14);
-  B.mesh(B.box(1.02, 0.09, 0.72), mats.trim, 0, dY + 0.99, hz + 0.14);
-  buildWheel(B, mats, 0.24, 0, dY + 0.86, hz - 0.08, 0.5);
-  B.mesh(B.box(0.10, 0.09, 0.26), mats.metal, 0.56, dY + 0.95, hz + 0.14);
-  B.mesh(B.cyl(0.026, 0.026, 0.34, 6), mats.trim, 0.56, dY + 1.12, hz + 0.10).rotation.x = 0.4;
-  // canopy
-  const postGeo = B.cyl(0.045, 0.05, 1.95, 7);
+  // ---- helm station on the cabin bulkhead, under a T-top ----
+  const hz = Y.conZ;                                       // console face
+  B.mesh(uvScaled(B.box(Y.conW, 0.98, Y.conD), 1, 1), mats.hull, 0, tY + 0.49, hz);
+  B.mesh(B.box(Y.conW + 0.09, 0.09, Y.conD + 0.10), mats.trim, 0, Y.conTopY - 0.045, hz);
+  buildWheel(B, mats, 0.26, 0, tY + 0.86, hz - 0.30, 0.5);
+  B.mesh(B.box(0.10, 0.09, 0.26), mats.metal, 0.60, tY + 0.96, hz);
+  B.mesh(B.cyl(0.026, 0.026, 0.34, 6), mats.trim, 0.60, tY + 1.13, hz - 0.04).rotation.x = 0.4;
+  // canopy — posts hug the rails so the walking lane stays clear
+  const canZ = hz - 0.70;
+  const postGeo = B.cyl(0.045, 0.05, 2.10, 7);
   for (let sx = -1; sx <= 1; sx += 2) {
     for (let sz = -1; sz <= 1; sz += 2) {
-      B.mesh(postGeo, mats.metal, sx * W * 0.30, dY + 1.02, hz + sz * 0.52);
+      B.mesh(postGeo, mats.metal, sx * W * 0.385, tY + 1.05, canZ + sz * 0.72);
     }
   }
-  B.mesh(uvScaled(B.box(W * 0.74, 0.10, 1.5), 1, 1), mats.trim, 0, dY + 2.02, hz);
-  B.mesh(B.box(W * 0.68, 0.04, 1.36), mats.hull, 0, dY + 2.08, hz).castShadow = false;
+  B.mesh(uvScaled(B.box(W * 0.90, 0.10, 1.9), 1, 1), mats.trim, 0, tY + 2.12, canZ);
+  B.mesh(B.box(W * 0.84, 0.04, 1.74), mats.hull, 0, tY + 2.18, canZ).castShadow = false;
 
   // ---- mast + lights ----
-  B.mesh(B.cyl(0.05, 0.07, 1.5, 7), mats.metal, 0, dY + 2.80, hz);
-  B.mesh(B.box(0.62, 0.05, 0.05), mats.metal, 0, dY + 3.35, hz);
-  const mastLight = buildNavLight(B, mats, 0xfff0cc, 0, dY + 3.62, hz, 0.06);
+  B.mesh(B.cyl(0.05, 0.07, 1.5, 7), mats.metal, 0, tY + 2.90, canZ);
+  B.mesh(B.box(0.62, 0.05, 0.05), mats.metal, 0, tY + 3.45, canZ);
+  const mastLight = buildNavLight(B, mats, 0xfff0cc, 0, tY + 3.72, canZ, 0.06);
   B.anim.beacons.push({ sprite: mastLight.sprite, mat: mastLight.mat, col: new THREE.Color(0xfff0cc), base: 0.5, rate: 0, warm: true });
   station(spec, 0.86, _st);
   B.anim.navPort = buildNavLight(B, mats, 0xff4433, _st.hw * 0.92, _st.gy + 0.12, _st.z, 0.06);
   B.anim.navStbd = buildNavLight(B, mats, 0x44ff66, -_st.hw * 0.92, _st.gy + 0.12, _st.z, 0.06);
 
   // ---- rails, hatch, gear ----
-  B.mesh(B.g(buildRailGeometry(spec, 18, 0.66, 0.034, 0.10)), mats.metal, 0, 0, 0);
-  buildRailPosts(B, mats, spec, 18, 0.66, 0.028, 0.10);
-  B.mesh(uvScaled(B.box(W * 0.52, 0.12, 1.0), 1, 1), mats.deck, 0, dY + 0.10, -L * 0.30);
-  B.mesh(B.box(0.14, 0.14, 0.14), mats.metal, W * 0.18, dY + 0.20, -L * 0.30);
-  buildLifeRing(B, mats, 0.30, W * 0.34, dY + 1.30, hz + 0.70, 0);
-  buildLifeRing(B, mats, 0.30, -W * 0.34, dY + 1.30, hz + 0.70, 0);
+  B.mesh(B.g(buildRailGeometry(spec, 18, 0.88, 0.036, 0.06)), mats.metal, 0, 0, 0);
+  B.mesh(B.g(buildRailGeometry(spec, 18, 0.48, 0.026, 0.06)), mats.metal, 0, 0, 0);
+  buildRailPosts(B, mats, spec, 18, 0.88, 0.030, 0.06);
+  B.mesh(uvScaled(B.box(W * 0.44, 0.09, 1.0), 1, 1), mats.deck, 0, tY + 0.05, -L * 0.34);
+  B.mesh(B.box(0.13, 0.10, 0.13), mats.metal, W * 0.14, tY + 0.13, -L * 0.34);
+  buildLifeRing(B, mats, 0.30, W * 0.41, tY + 1.62, canZ + 0.72, 0);
+  buildLifeRing(B, mats, 0.30, -W * 0.41, tY + 1.62, canZ + 0.72, 0);
   station(spec, 0.94, _st);
   buildCleat(B, mats, 0, _st.gy + 0.06, L * 0.44);
-  buildCleat(B, mats, W * 0.30, dY + 0.55, -L * 0.42);
-  buildCleat(B, mats, -W * 0.30, dY + 0.55, -L * 0.42);
+  buildCleat(B, mats, W * 0.34, dY + 0.55, -L * 0.44);
+  buildCleat(B, mats, -W * 0.34, dY + 0.55, -L * 0.44);
   // exhaust + rudder
   B.mesh(B.cyl(0.09, 0.09, 0.24, 8), mats.dark, W * 0.24, -0.10, -L * 0.49).rotation.x = Math.PI * 0.5;
   B.anim.rudder = B.mesh(B.box(0.07, 0.72, 0.46), mats.metal, 0, -spec.depth * 0.72, -L * 0.47);
@@ -757,7 +878,7 @@ function buildCutter(B, mats, spec, pal) {
     bl.rotation.y = 0.5;
   }
   B.anim.props.push(propPivot);
-  buildFlag(B, mats, 0.72, 0.40, 0, dY + 0.18, -L * 0.44, 1.35);
+  buildFlag(B, mats, 0.72, 0.40, -W * 0.32, tY, -L * 0.45, 1.35);
   void pal;
 }
 
@@ -765,9 +886,17 @@ function buildCutter(B, mats, spec, pal) {
  * TIER 4 - Abyss-Runner: armoured hull, deep-lamp gantry, crane, pods.
  * ------------------------------------------------------------------ */
 function buildAbyssRunner(B, mats, spec, pal) {
-  const L = spec.len, W = spec.wid, dY = deckY(spec);
-  buildSole(B, mats, spec, -0.44, 0.20);
+  const Y = layout(4, spec);
+  const L = spec.len, W = spec.wid, dY = deckY(spec), tY = Y.tY;
+  buildSole(B, mats, spec, Y.deckZ0 - 0.03, Y.deckZ1 + 0.02);
   B.mesh(B.g(buildRailGeometry(spec, 20, 0.02, 0.075, 0)), mats.trim, 0, 0, 0);
+  // reinforced deck: welded cross plates laid on the sole
+  for (let i = -4; i <= 2; i++) {
+    const lz = i * L * 0.088;
+    const hw = innerHalfWidth(spec, lz);
+    const pl = B.mesh(B.box(hw * 1.94, 0.03, 0.09), mats.metal, 0, tY + 0.015, lz);
+    pl.castShadow = false;
+  }
 
   // ---- armour plates + rivets along both flanks ----
   const plates = [];
@@ -809,12 +938,14 @@ function buildAbyssRunner(B, mats, spec, pal) {
   rivInst.instanceMatrix.needsUpdate = true;
   B.root.add(rivInst);
 
-  // ---- armoured wheelhouse ----
-  const cabZ = L * 0.27, cabD = L * 0.24, cabW = W * 0.64, cabH = 1.24;
+  // ---- armoured wheelhouse (walkable roof) ----
+  const cabZ = Y.cabZ, cabD = Y.cabD, cabW = Y.cabW, cabH = Y.cabH;
+  const roofY = Y.roofY;
   B.mesh(uvScaled(B.box(cabW, cabH, cabD), 1, 1), mats.hull, 0, dY + cabH * 0.5 + 0.06, cabZ);
   const slope = B.mesh(B.box(cabW * 0.99, 0.10, 0.72), mats.hull, 0, dY + cabH + 0.02, cabZ + cabD * 0.40);
   slope.rotation.x = 0.62;
-  B.mesh(uvScaled(B.box(cabW * 1.08, 0.12, cabD * 1.06), 1, 1), mats.trim, 0, dY + cabH + 0.12, cabZ);
+  B.mesh(uvScaled(B.box(cabW * 1.06, 0.12, cabD * 1.04), 1, 1), mats.metal, 0, roofY - 0.06, cabZ);
+  B.mesh(B.box(cabW * 1.10, 0.07, 0.08), mats.trim, 0, roofY + 0.07, cabZ - cabD * 0.51);
   const winF = B.mesh(B.g(new THREE.PlaneGeometry(cabW * 0.72, 0.30)), mats.glass, 0, dY + cabH * 0.80, cabZ + cabD * 0.51);
   winF.castShadow = false;
   const winSide = B.g(new THREE.PlaneGeometry(cabD * 0.56, 0.28));
@@ -822,69 +953,89 @@ function buildAbyssRunner(B, mats, spec, pal) {
     const w = B.mesh(winSide, mats.glass, s * (cabW * 0.5 + 0.012), dY + cabH * 0.74, cabZ);
     w.rotation.y = s * Math.PI * 0.5;
     w.castShadow = false;
+    B.mesh(B.box(0.08, 0.07, cabD * 1.04), mats.trim, s * cabW * 0.54, roofY + 0.07, cabZ);
+    // roof grab rail + climbing rungs up the bulkhead
+    const bar = B.mesh(B.cyl(0.028, 0.028, cabD * 0.62, 6), mats.metal, s * cabW * 0.47, roofY + 0.50, cabZ);
+    bar.rotation.x = Math.PI * 0.5;
+    B.mesh(B.cyl(0.028, 0.028, 0.50, 6), mats.metal, s * cabW * 0.47, roofY + 0.25, cabZ - cabD * 0.29);
+    B.mesh(B.cyl(0.028, 0.028, 0.50, 6), mats.metal, s * cabW * 0.47, roofY + 0.25, cabZ + cabD * 0.29);
+  }
+  for (let i = 0; i < 3; i++) {
+    B.mesh(B.box(0.36, 0.05, 0.15), mats.metal, cabW * 0.32, tY + 0.34 + i * 0.40, cabZ - cabD * 0.5 - 0.10);
   }
   // cyan strip lighting along the cabin base
   const stripGeo = B.box(cabW * 1.02, 0.05, cabD * 1.0);
-  const strip = B.mesh(stripGeo, mats.lamp, 0, dY + 0.10, cabZ);
+  const strip = B.mesh(stripGeo, mats.lamp, 0, tY + 0.06, cabZ);
   strip.castShadow = false;
 
-  // ---- helm + canopy ----
-  const hz = L * 0.06;
-  B.mesh(uvScaled(B.box(1.05, 1.00, 0.66), 1, 1), mats.hull, 0, dY + 0.52, hz + 0.16);
-  B.mesh(B.box(1.14, 0.10, 0.78), mats.trim, 0, dY + 1.05, hz + 0.16);
-  buildWheel(B, mats, 0.26, 0, dY + 0.90, hz - 0.10, 0.5);
-  const screen = B.mesh(B.g(new THREE.PlaneGeometry(0.34, 0.22)), mats.lamp, -0.34, dY + 1.14, hz + 0.10);
+  // ---- helm on the wheelhouse bulkhead + canopy ----
+  const hz = Y.conZ;
+  B.mesh(uvScaled(B.box(Y.conW, 1.02, Y.conD), 1, 1), mats.hull, 0, tY + 0.51, hz);
+  B.mesh(B.box(Y.conW + 0.11, 0.10, Y.conD + 0.12), mats.trim, 0, Y.conTopY - 0.05, hz);
+  buildWheel(B, mats, 0.28, 0, tY + 0.90, hz - 0.32, 0.5);
+  const screen = B.mesh(B.g(new THREE.PlaneGeometry(0.34, 0.22)), mats.lamp, -0.36, tY + 1.16, hz - 0.06);
   screen.rotation.x = -0.5;
   screen.castShadow = false;
-  const postGeo = B.cyl(0.055, 0.06, 2.05, 7);
+  const canZ = hz - 0.78;
+  const postGeo = B.cyl(0.055, 0.06, 2.20, 7);
   for (let sx = -1; sx <= 1; sx += 2) {
     for (let sz = -1; sz <= 1; sz += 2) {
-      B.mesh(postGeo, mats.metal, sx * W * 0.30, dY + 1.06, hz + sz * 0.56);
+      B.mesh(postGeo, mats.metal, sx * W * 0.385, tY + 1.10, canZ + sz * 0.78);
     }
   }
-  B.mesh(uvScaled(B.box(W * 0.76, 0.12, 1.6), 1, 1), mats.trim, 0, dY + 2.12, hz);
+  B.mesh(uvScaled(B.box(W * 0.90, 0.12, 2.0), 1, 1), mats.trim, 0, tY + 2.24, canZ);
 
-  // ---- bow gantry with deep-lamps ----
-  station(spec, 0.78, _st);
-  const gz = _st.z, gH = 2.3, gx = _st.hw * 0.80;
+  // ---- deep-lamp gantry arching over the wheelhouse roof ----
+  const gz = cabZ + cabD * 0.38, gH = 1.55, gx = cabW * 0.50;
   const gPost = B.cyl(0.07, 0.08, gH, 7);
-  B.mesh(gPost, mats.metal, gx, _st.gy + gH * 0.5, gz);
-  B.mesh(gPost, mats.metal, -gx, _st.gy + gH * 0.5, gz);
-  B.mesh(B.box(gx * 2.1, 0.13, 0.16), mats.metal, 0, _st.gy + gH, gz);
-  B.mesh(B.box(0.10, 0.10, 1.1), mats.metal, gx, _st.gy + gH - 0.30, gz - 0.5).rotation.x = 0.5;
-  B.mesh(B.box(0.10, 0.10, 1.1), mats.metal, -gx, _st.gy + gH - 0.30, gz - 0.5).rotation.x = 0.5;
-  const lampY = _st.gy + gH - 0.22;
+  B.mesh(gPost, mats.metal, gx, roofY + gH * 0.5, gz);
+  B.mesh(gPost, mats.metal, -gx, roofY + gH * 0.5, gz);
+  B.mesh(B.box(gx * 2.1, 0.13, 0.16), mats.metal, 0, roofY + gH, gz);
+  B.mesh(B.box(0.10, 0.10, 1.1), mats.metal, gx, roofY + gH - 0.30, gz - 0.5).rotation.x = 0.5;
+  B.mesh(B.box(0.10, 0.10, 1.1), mats.metal, -gx, roofY + gH - 0.30, gz - 0.5).rotation.x = 0.5;
+  const lampY = roofY + gH - 0.22;
   for (let s = -1; s <= 1; s += 2) {
-    const housing = B.mesh(B.cyl(0.20, 0.24, 0.36, 10), mats.motor, s * gx * 0.72, lampY, gz + 0.10);
+    const housing = B.mesh(B.cyl(0.22, 0.26, 0.38, 10), mats.motor, s * gx * 0.78, lampY, gz + 0.10);
     housing.rotation.x = Math.PI * 0.5 - 0.30;
-    const lens = B.mesh(B.cyl(0.19, 0.19, 0.05, 10), mats.lamp, s * gx * 0.72, lampY - 0.06, gz + 0.28);
+    const lens = B.mesh(B.cyl(0.21, 0.21, 0.05, 10), mats.lamp, s * gx * 0.78, lampY - 0.06, gz + 0.30);
     lens.rotation.x = Math.PI * 0.5 - 0.30;
     lens.castShadow = false;
     B.anim.lampLens.push(lens);
-    const sp = B.sprite(pal.accent, 2.2, s * gx * 0.72, lampY - 0.06, gz + 0.30);
+    const sp = B.sprite(pal.accent, 2.6, s * gx * 0.78, lampY - 0.06, gz + 0.32);
     sp.material.opacity = 0;
     B.anim.beacons.push({ sprite: sp, mat: null, base: 0.0, rate: 0, lamp: true });
     // volumetric shaft
-    const cone = new THREE.Mesh(B.g(new THREE.ConeGeometry(2.4, 16, 12, 1, true)), mats.cone);
-    cone.position.set(s * gx * 0.72, lampY - 3.6, gz + 7.2);
+    const cone = new THREE.Mesh(B.g(new THREE.ConeGeometry(2.6, 18, 12, 1, true)), mats.cone);
+    cone.position.set(s * gx * 0.78, lampY - 4.2, gz + 8.2);
     cone.rotation.x = Math.PI * 0.5 + 0.30;
     cone.castShadow = false;
     cone.renderOrder = 3;
     B.root.add(cone);
     B.anim.lampCones.push(cone);
+    // hull-side deep-lamps that wash the water alongside the deck
+    station(spec, 0.30, _st);
+    const pod = B.mesh(B.cyl(0.14, 0.16, 0.22, 9), mats.motor, s * (_st.hw + 0.06), _st.chineY + 0.10, _st.z);
+    pod.rotation.z = Math.PI * 0.5;
+    const podLens = B.mesh(B.cyl(0.13, 0.13, 0.04, 9), mats.lamp, s * (_st.hw + 0.19), _st.chineY + 0.10, _st.z);
+    podLens.rotation.z = Math.PI * 0.5;
+    podLens.castShadow = false;
+    B.anim.lampLens.push(podLens);
+    const psp = B.sprite(pal.accent, 1.5, s * (_st.hw + 0.20), _st.chineY + 0.10, _st.z);
+    psp.material.opacity = 0;
+    B.anim.beacons.push({ sprite: psp, mat: null, base: 0.0, rate: 0, lamp: true });
   }
   // real light that actually pools on the water ahead
-  const spot = new THREE.SpotLight(0x7bf0ff, 0, 70, Math.PI * 0.20, 0.55, 1.0);
+  const spot = new THREE.SpotLight(0x7bf0ff, 0, 80, Math.PI * 0.20, 0.55, 1.0);
   spot.position.set(0, lampY, gz);
   spot.castShadow = false;
   B.root.add(spot);
-  spot.target.position.set(0, -7, gz + 26);
+  spot.target.position.set(0, -8, gz + 28);
   B.root.add(spot.target);
   B.anim.lampSpot = spot;
 
-  // ---- stern crane ----
+  // ---- stern crane, planted on the transom platform ----
   const crane = new THREE.Group();
-  crane.position.set(W * 0.26, dY + 0.10, -L * 0.30);
+  crane.position.set(W * 0.22, tY, -L * 0.475);
   B.root.add(crane);
   B.mesh(B.cyl(0.22, 0.26, 0.20, 8), mats.metal, 0, 0.10, 0, crane);
   const mast = B.mesh(B.cyl(0.10, 0.12, 1.5, 8), mats.metal, 0, 0.90, 0, crane);
@@ -898,47 +1049,49 @@ function buildAbyssRunner(B, mats, spec, pal) {
 
   // ---- twin pods ----
   station(spec, 0.02, _st);
-  B.anim.motor = buildMotor(B, mats, 1.15, W * 0.24, _st.gy - 0.04, -L * 0.50 - 0.18);
-  const pod2 = buildMotor(B, mats, 1.15, -W * 0.24, _st.gy - 0.04, -L * 0.50 - 0.18);
+  B.anim.motor = buildMotor(B, mats, 1.35, W * 0.24, _st.gy - 0.04, -L * 0.50 - 0.20);
+  const pod2 = buildMotor(B, mats, 1.35, -W * 0.24, _st.gy - 0.04, -L * 0.50 - 0.20);
   B.anim.motor2 = pod2;
 
   // ---- rails, lights, gear ----
-  B.mesh(B.g(buildRailGeometry(spec, 20, 0.72, 0.038, 0.10)), mats.metal, 0, 0, 0);
-  buildRailPosts(B, mats, spec, 20, 0.72, 0.030, 0.10);
+  B.mesh(B.g(buildRailGeometry(spec, 20, 0.94, 0.040, 0.06)), mats.metal, 0, 0, 0);
+  B.mesh(B.g(buildRailGeometry(spec, 20, 0.52, 0.028, 0.06)), mats.metal, 0, 0, 0);
+  buildRailPosts(B, mats, spec, 20, 0.94, 0.032, 0.06);
   station(spec, 0.86, _st);
   B.anim.navPort = buildNavLight(B, mats, 0xff4433, _st.hw * 0.92, _st.gy + 0.14, _st.z, 0.065);
   B.anim.navStbd = buildNavLight(B, mats, 0x44ff66, -_st.hw * 0.92, _st.gy + 0.14, _st.z, 0.065);
-  const beacon = buildNavLight(B, mats, 0xff2a2a, 0, dY + 2.34, hz, 0.07);
+  const beacon = buildNavLight(B, mats, 0xff2a2a, 0, tY + 2.46, canZ, 0.07);
   B.anim.beacons.push({ sprite: beacon.sprite, mat: beacon.mat, col: new THREE.Color(0xff2a2a), base: 0.8, rate: 2.2 });
-  B.mesh(B.cyl(0.03, 0.03, 1.1, 5), mats.metal, W * 0.22, dY + 2.65, hz - 0.4);
-  B.mesh(B.cyl(0.03, 0.03, 0.8, 5), mats.metal, -W * 0.22, dY + 2.50, hz - 0.4);
-  buildLifeRing(B, mats, 0.32, -W * 0.32, dY + 1.36, hz + 0.74, 0);
+  B.mesh(B.cyl(0.03, 0.03, 1.1, 5), mats.metal, W * 0.22, tY + 2.78, canZ - 0.4);
+  B.mesh(B.cyl(0.03, 0.03, 0.8, 5), mats.metal, -W * 0.22, tY + 2.62, canZ - 0.4);
+  buildLifeRing(B, mats, 0.32, -W * 0.41, tY + 1.70, canZ + 0.80, 0);
+  buildLifeRing(B, mats, 0.32, W * 0.41, tY + 1.70, canZ + 0.80, 0);
   buildCleat(B, mats, 0, _st.gy + 0.07, L * 0.44);
-  buildFlag(B, mats, 0.78, 0.42, 0, dY + 0.20, -L * 0.45, 1.5);
+  buildFlag(B, mats, 0.78, 0.42, -W * 0.30, tY, -L * 0.46, 1.5);
 }
 /* ------------------------------------------------------------------ *
  * Seats. Index 0 is always the helm. Positions are feet-level anchors
  * on the deck, in boat-local space.
  * ------------------------------------------------------------------ */
-function seatLayout(level, spec) {
-  const L = spec.len, W = spec.wid, y = deckY(spec) + 0.06;
+function seatLayout(level, spec, plan) {
+  const L = spec.len, W = spec.wid, y = deckTopY(spec);
   const raw = [];
   if (level === 1) {
-    raw.push([0, -L * 0.14], [0, L * 0.14]);
+    raw.push([0, 0.16]);
   } else if (level === 2) {
-    raw.push([W * 0.19, L * 0.12], [-W * 0.19, L * 0.12], [W * 0.21, -L * 0.20], [-W * 0.21, -L * 0.20]);
+    raw.push([W * 0.24, -0.02], [-W * 0.24, -0.02], [0, -0.36]);
   } else if (level === 3) {
-    raw.push([W * 0.17, L * 0.04], [-W * 0.17, L * 0.04],
-             [W * 0.25, -L * 0.14], [-W * 0.25, -L * 0.14],
-             [W * 0.25, -L * 0.30], [-W * 0.25, -L * 0.30]);
+    raw.push([W * 0.26, -0.08], [-W * 0.26, -0.08],
+             [W * 0.28, -0.22], [-W * 0.28, -0.22],
+             [0, -0.36]);
   } else {
-    raw.push([W * 0.17, L * 0.01], [-W * 0.17, L * 0.01],
-             [W * 0.25, -L * 0.13], [-W * 0.25, -L * 0.13],
-             [W * 0.25, -L * 0.25], [-W * 0.25, -L * 0.25],
-             [W * 0.25, -L * 0.37], [-W * 0.25, -L * 0.37]);
+    raw.push([W * 0.26, -0.06], [-W * 0.26, -0.06],
+             [W * 0.28, -0.18], [-W * 0.28, -0.18],
+             [W * 0.28, -0.30], [-W * 0.28, -0.30],
+             [0, -0.39]);
   }
-  const out = [];
-  for (let i = 0; i < raw.length; i++) out.push(new THREE.Vector3(raw[i][0], y, raw[i][1]));
+  const out = [plan.helm.clone()];             // seat 0 is always the helm
+  for (let i = 0; i < raw.length; i++) out.push(new THREE.Vector3(raw[i][0], y, raw[i][1] * L));
   return out;
 }
 
@@ -959,7 +1112,8 @@ function buildBoatVisual(level) {
   else if (level === 2) buildSkiff(B, mats, spec, pal);
   else if (level === 3) buildCutter(B, mats, spec, pal);
   else buildAbyssRunner(B, mats, spec, pal);
-  B.seats = seatLayout(level, spec);
+  B.deck = buildDeckPlan(level, spec);
+  B.seats = seatLayout(level, spec, B.deck);
   B.mats = mats;
   B.spec = spec;
   B.pal = pal;
@@ -1078,7 +1232,7 @@ function buildFoam() {
   points.renderOrder = 3;
   const parts = new Array(FOAM_COUNT);
   for (let i = 0; i < FOAM_COUNT; i++) {
-    parts[i] = { life: 0, max: 1, vx: 0, vy: 0, vz: 0, size: 1, alpha: 0 };
+    parts[i] = { life: 0, max: 1, vx: 0, vy: 0, vz: 0, size: 1, alpha: 0, a0: 0.8 };
   }
   return { points: points, geo: geo, mat: mat, pos: pos, size: size, alpha: alpha, parts: parts, cursor: 0, live: 0 };
 }
@@ -1266,6 +1420,79 @@ export function initBoat(ctx) {
     if ((w && w.dockPos) || moorTimer > 3) moorAtDock();
   }
 
+  /* ---------------- boat frame (yaw + pitch + roll) ---------------- */
+  function frame() {
+    _euler.set(S.pitch, S.yaw, S.roll, 'YXZ');
+    _q.setFromEuler(_euler);
+    _qi.copy(_q).invert();
+  }
+
+  // Boat-local -> world. Guarded: junk in gives the hull centre back.
+  function toWorld(localVec, out) {
+    const o = out || new THREE.Vector3();
+    frame();
+    const lx = localVec && isFinite(localVec.x) ? localVec.x : 0;
+    const ly = localVec && isFinite(localVec.y) ? localVec.y : 0;
+    const lz = localVec && isFinite(localVec.z) ? localVec.z : 0;
+    o.set(lx, ly, lz).applyQuaternion(_q).add(S.pos);
+    return o;
+  }
+
+  // World -> boat-local.
+  function toLocal(worldVec, out) {
+    const o = out || new THREE.Vector3();
+    if (!worldVec || !isFinite(worldVec.x) || !isFinite(worldVec.z)) return o.set(0, 0, 0);
+    frame();
+    o.set(worldVec.x - S.pos.x,
+          (isFinite(worldVec.y) ? worldVec.y : S.pos.y) - S.pos.y,
+          worldVec.z - S.pos.z).applyQuaternion(_qi);
+    return o;
+  }
+
+  // World position of the wheel/tiller station (= seat 0).
+  function helmPos(out) {
+    const o = out || new THREE.Vector3();
+    const h = (build.deck && build.deck.helm) || (build.seats && build.seats[0]);
+    if (!h) return o.copy(S.pos);
+    return toWorld(h, o);
+  }
+
+  // Walkable deck top at a world XZ, or null if that column misses the boat.
+  // `fromY` (optional) is the sampler's current height: zones more than a
+  // step above it are ignored, so standing beside the console does not yank
+  // you onto it, while jumping/falling onto it still lands correctly.
+  function deckInfo(x, z, fromY, out) {
+    if (!isFinite(x) || !isFinite(z)) return null;
+    const plan = build.deck;
+    if (!plan || !plan.zones.length) return null;
+    frame();
+    _c0.set(1, 0, 0).applyQuaternion(_q);
+    _c1.set(0, 1, 0).applyQuaternion(_q);
+    _c2.set(0, 0, 1).applyQuaternion(_q);
+    const det = _c0.x * _c2.z - _c2.x * _c0.z;
+    if (!(Math.abs(det) > 1e-5)) return null;
+    const dx = x - S.pos.x, dz = z - S.pos.z;
+    const limit = isFinite(fromY) ? fromY + 0.55 : Infinity;
+    let hiY = -Infinity, hiX = 0, hiZ = 0, hiOk = false;   // best step-up-able
+    let loY = Infinity, loX = 0, loZ = 0, loOk = false;    // lowest match
+    for (let i = 0; i < plan.zones.length; i++) {
+      const zone = plan.zones[i];
+      const D = zone.y;
+      const ax = dx - D * _c1.x, az = dz - D * _c1.z;
+      const lx = (ax * _c2.z - az * _c2.x) / det;
+      const lz = (_c0.x * az - _c0.z * ax) / det;
+      if (!zoneContains(zone, lx, lz)) continue;
+      const wy = S.pos.y + lx * _c0.y + D * _c1.y + lz * _c2.y;
+      if (!loOk || wy < loY) { loOk = true; loY = wy; loX = lx; loZ = lz; }
+      if (wy <= limit && (!hiOk || wy > hiY)) { hiOk = true; hiY = wy; hiX = lx; hiZ = lz; }
+    }
+    if (!hiOk && !loOk) return null;
+    const o = out || _deckOut;
+    if (hiOk) { o.y = hiY; o.localX = hiX; o.localZ = hiZ; }
+    else { o.y = loY; o.localX = loX; o.localZ = loZ; }
+    return o;
+  }
+
   /* ---------------- seats / driver ---------------- */
   function seatCount() { return build.seats.length; }
 
@@ -1274,12 +1501,7 @@ export function initBoat(ctx) {
     const seats = build.seats;
     if (!seats.length) return o.copy(S.pos);
     const idx = clamp(Math.round(i) || 0, 0, seats.length - 1);
-    const s = seats[idx];
-    o.set(s.x, s.y, s.z);
-    _euler.set(S.pitch, S.yaw, S.roll, 'YXZ');
-    o.applyEuler(_euler);
-    o.add(S.pos);
-    return o;
+    return toWorld(seats[idx], o);
   }
 
   function isDriver() {
@@ -1299,7 +1521,7 @@ export function initBoat(ctx) {
     const cy = Math.cos(S.yaw), sy = Math.sin(S.yaw);
     const lz = dx * sy + dz * cy;
     const lx = dx * cy - dz * sy;
-    const half = spec.len * 0.42;
+    const half = spec.len * 0.5;                 // full hull box + BOARD_RANGE
     const ez = lz > half ? lz - half : (lz < -half ? lz + half : 0);
     const hw = spec.wid * 0.5;
     const alx = Math.abs(lx);
@@ -1429,6 +1651,16 @@ export function initBoat(ctx) {
     S.fwd = S.vel.x * sy + S.vel.z * cy;
   }
 
+  // Current weather's wave multiplier (1 = clear). Guarded: old payloads
+  // have no weather field at all.
+  function weatherWaveScale() {
+    const w = ctx.state && ctx.state.world && ctx.state.world.weather;
+    const type = w && typeof w.type === 'string' ? w.type : null;
+    const def = type && WEATHER[type];
+    const s = def && typeof def.waveScale === 'number' ? def.waveScale : 1;
+    return (isFinite(s) && s > 0) ? s : 1;
+  }
+
   function applyBuoyancy(dt, t) {
     const cy = Math.cos(S.yaw), sy = Math.sin(S.yaw);
     const cx = spec.wid * 0.42, cz = spec.len * 0.45;
@@ -1447,9 +1679,11 @@ export function initBoat(ctx) {
     const spdFrac = clamp(S.speed / spec.maxSpeed, 0, 1);
     const targetY = (hFwd + hAft) * 0.5 + spec.depth * 0.03 + spdFrac * 0.22;
     const prevVy = S.vy;
-    S.vy += (targetY - S.pos.y) * 34 * dt;
-    S.vy *= Math.exp(-5.2 * dt);
-    S.vy = clamp(S.vy, -9, 9);
+    // Softer heave spring than wave 2: people stand on this deck now, so the
+    // bob has to stay gentle enough not to jitter them.
+    S.vy += (targetY - S.pos.y) * 26 * dt;
+    S.vy *= Math.exp(-6.6 * dt);
+    S.vy = clamp(S.vy, -7, 7);
     S.pos.y += S.vy * dt;
     if (S.bump <= 0 && prevVy < -3.4 && S.vy > prevVy + 0.7) {
       S.bump = 0.45;
@@ -1458,16 +1692,21 @@ export function initBoat(ctx) {
       }
       if (spdFrac > 0.25) safeSfx('splash', { size: 0.8, source: 'boat' });
     }
-    let pitchT = Math.atan2(hAft - hFwd, cz * 2);
-    let rollT = Math.atan2(hPort - hStb, cx * 2);
-    pitchT -= (S.throttle > 0 ? 0.05 : 0) + spdFrac * 0.06;
-    rollT -= S.yawRate * (0.06 + 0.05 * spdFrac);
-    S.pitchV += (pitchT - S.pitch) * 30 * dt;
-    S.pitchV *= Math.exp(-7 * dt);
-    S.pitch = clamp(S.pitch + S.pitchV * dt, -0.55, 0.55);
-    S.rollV += (rollT - S.roll) * 26 * dt;
-    S.rollV *= Math.exp(-6.5 * dt);
-    S.roll = clamp(S.roll + S.rollV * dt, -0.6, 0.6);
+    // Deck stability. In calm weather the hull barely heels, so walking the
+    // deck feels solid; storms hand the full wave-driven motion back and the
+    // deck becomes genuinely frightening. Bigger hulls are stiffer still.
+    const ws = weatherWaveScale();
+    const tiltMul = clamp((0.34 + 0.32 * (ws - 1)) * (1 - (level - 1) * 0.07), 0.22, 1.0);
+    let pitchT = Math.atan2(hAft - hFwd, cz * 2) * tiltMul;
+    let rollT = Math.atan2(hPort - hStb, cx * 2) * tiltMul;
+    pitchT -= (S.throttle > 0 ? 0.04 : 0) + spdFrac * 0.05;
+    rollT -= S.yawRate * (0.05 + 0.04 * spdFrac);
+    S.pitchV += (pitchT - S.pitch) * 24 * dt;
+    S.pitchV *= Math.exp(-9.5 * dt);
+    S.pitch = clamp(S.pitch + S.pitchV * dt, -0.42, 0.42);
+    S.rollV += (rollT - S.roll) * 21 * dt;
+    S.rollV *= Math.exp(-9.0 * dt);
+    S.roll = clamp(S.roll + S.rollV * dt, -0.45, 0.45);
   }
 
   /* ---------------- night / lamps / animated details ---------------- */
@@ -1495,6 +1734,7 @@ export function initBoat(ctx) {
     if (a.motor2) a.motor2.rotation.y = S.steerVis * 0.42;
     if (a.rudder) a.rudder.rotation.y = S.steerVis * 0.5;
     if (a.wheel) a.wheel.rotation.z = S.steerVis * 1.9;
+    if (a.tiller) a.tiller.rotation.y = -S.steerVis * 0.55;
     // oars row when the dinghy is under way
     if (a.oars.length) {
       const drive = Math.abs(S.throttleVis) > 0.05 ? 1 : Math.min(1, spdFrac * 2);
@@ -1567,10 +1807,21 @@ export function initBoat(ctx) {
   }
 
   /* ---------------- wake + foam ---------------- */
+  // 0 below WAKE_MIN_SPEED, ramping to 1 at top speed. An idle boat makes
+  // absolutely no wake at all.
+  function wakeFrac() {
+    if (S.speed < WAKE_MIN_SPEED) return 0;
+    const span = Math.max(1, spec.maxSpeed - WAKE_MIN_SPEED);
+    return clamp((S.speed - WAKE_MIN_SPEED) / span, 0, 1);
+  }
+  // Bigger hulls shove more water.
+  function wakeBulk() { return 0.78 + level * 0.15; }
+
   function emitWake(dt, t) {
-    if (S.speed < 0.6) return;
-    const frac = clamp(S.speed / spec.maxSpeed, 0, 1);
-    spawnAcc += dt * (7 + 48 * frac);
+    const frac = wakeFrac();
+    if (frac <= 0) { spawnAcc = 0; return; }
+    const bulk = wakeBulk();
+    spawnAcc += dt * (2 + 52 * frac) * bulk;
     if (spawnAcc > 6) spawnAcc = 6;
     const cy = Math.cos(S.yaw), sy = Math.sin(S.yaw);
     while (spawnAcc >= 1) {
@@ -1601,12 +1852,13 @@ export function initBoat(ctx) {
       p.vx = (Math.random() - 0.5) * 1.1 + side * 0.7 * frac + S.vel.x * 0.10;
       p.vy = up;
       p.vz = (Math.random() - 0.5) * 1.1 + S.vel.z * 0.10;
-      p.size = 0.30 + Math.random() * 0.45 + frac * 0.55;
+      p.size = (0.26 + Math.random() * 0.40 + frac * 0.60) * bulk;
+      p.a0 = clamp((0.30 + 0.58 * frac) * bulk, 0.05, 0.95);
       foam.pos[i * 3] = wx;
       foam.pos[i * 3 + 1] = waterAt(wx, wz, t) + 0.07;
       foam.pos[i * 3 + 2] = wz;
       foam.size[i] = p.size * 3.0;
-      foam.alpha[i] = 0.85;
+      foam.alpha[i] = p.a0;
       foam.live = 1;
     }
   }
@@ -1629,7 +1881,7 @@ export function initBoat(ctx) {
       P[i * 3 + 1] += p.vy * dt;
       P[i * 3 + 2] += p.vz * dt;
       foam.size[i] = p.size * (1.5 - 0.6 * k) * 3.0;
-      foam.alpha[i] = Math.pow(k, 0.6) * 0.8;
+      foam.alpha[i] = Math.pow(k, 0.6) * (p.a0 > 0 ? p.a0 : 0.8);
     }
     foam.live = live;
     foam.geo.attributes.position.needsUpdate = true;
@@ -1638,16 +1890,18 @@ export function initBoat(ctx) {
   }
 
   function updateWake(dt, t) {
-    const frac = clamp(S.speed / spec.maxSpeed, 0, 1);
-    const target = S.speed > 0.7 ? Math.min(0.9, 0.16 + frac * 0.85) : 0;
+    const frac = wakeFrac();
+    const bulk = wakeBulk();
+    // no V-lines at all until the hull is actually moving water
+    const target = frac > 0 ? Math.min(0.95, (0.05 + 0.62 * frac) * bulk) : 0;
     const u = wake.mat.uniforms.uOpacity;
-    u.value += (target - u.value) * damp(4, dt);
+    u.value += (target - u.value) * damp(5, dt);
     wake.mesh.visible = u.value > 0.006;
     if (!wake.mesh.visible) return;
     const cy = Math.cos(S.yaw), sy = Math.sin(S.yaw);
     const bowZ = spec.len * 0.34;
-    const lenW = spec.len * (1.0 + 2.9 * frac);
-    const spread = lenW * 0.30;
+    const lenW = spec.len * (0.55 + 2.9 * frac);
+    const spread = lenW * (0.20 + 0.15 * frac);
     const hullHalf = spec.wid * 0.40;
     const P = wake.pos;
     for (let arm = 0; arm < 2; arm++) {
@@ -1657,7 +1911,7 @@ export function initBoat(ctx) {
         const al = i / (WAKE_ALONG - 1);
         const lz = bowZ - al * lenW;
         const centre = s * (hullHalf + al * spread);
-        const armW = 0.35 + al * (1.0 + spec.wid * 0.4);
+        const armW = (0.30 + al * (0.9 + spec.wid * 0.38)) * (0.45 + 0.65 * frac);
         for (let j = 0; j < WAKE_ACROSS; j++) {
           const c = j / (WAKE_ACROSS - 1);
           const lx = centre + s * (c - 0.5) * armW;
@@ -1840,6 +2094,11 @@ export function initBoat(ctx) {
     velocity: S.vel,
     seatWorld: seatWorld,
     seatCount: seatCount,
+    // wave 3 contract: walkable decks
+    deckInfo: deckInfo,
+    toWorld: toWorld,
+    toLocal: toLocal,
+    helmPos: helmPos,
     // extras (safe additions, nothing in the contract depends on them)
     boatLevel: function () { return level; },
     boatName: function () { return spec.name; },

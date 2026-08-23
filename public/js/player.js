@@ -70,7 +70,7 @@ function angDelta(a, b) {
 }
 const angDamp = (cur, target, lambda, dt) => cur + angDelta(cur, target) * (1 - Math.exp(-lambda * dt));
 
-// Reused temporaries — keep per-frame allocation at zero.
+// Reused temporaries â€” keep per-frame allocation at zero.
 const _v1 = new THREE.Vector3();
 const _v2 = new THREE.Vector3();
 const _v3 = new THREE.Vector3();
@@ -135,13 +135,16 @@ function sharedGeo() {
     beanieDome: new THREE.SphereGeometry(0.205, 12, 7, 0, Math.PI * 2, 0, Math.PI * 0.56),
     beanieCuff: new THREE.CylinderGeometry(0.212, 0.212, 0.07, 14, 1),
     pom: new THREE.SphereGeometry(0.058, 8, 6),
-    strawBrim: new THREE.CylinderGeometry(0.345, 0.40, 0.022, 16, 1),
-    strawCrown: new THREE.CylinderGeometry(0.165, 0.19, 0.13, 12, 1),
     strawBand: new THREE.CylinderGeometry(0.195, 0.195, 0.038, 12, 1),
     capCrown: new THREE.CylinderGeometry(0.205, 0.185, 0.10, 14, 1),
     capTop: new THREE.CylinderGeometry(0.218, 0.218, 0.022, 14, 1),
     capVisor: roundedBoxGeometry(0.27, 0.024, 0.15, 0.012, 1),
     capBadge: roundedBoxGeometry(0.065, 0.055, 0.022, 0.012, 1),
+    // bandana
+    bandanaCap: new THREE.SphereGeometry(0.206, 12, 6, 0, Math.PI * 2, 0, Math.PI * 0.48),
+    bandanaBand: new THREE.CylinderGeometry(0.209, 0.209, 0.055, 14, 1),
+    bandanaKnot: new THREE.SphereGeometry(0.062, 8, 6),
+    bandanaTail: roundedBoxGeometry(0.075, 0.21, 0.032, 0.02, 1),
   };
   return SG;
 }
@@ -149,7 +152,20 @@ function sharedGeo() {
 // ------------------------------------------------------------
 // Canvas textures: faces & name tags
 // ------------------------------------------------------------
-const SKIN_TONES = [0xf3caa2, 0xe8b184, 0xd39a6a, 0xa9714b, 0x7d4f33, 0xf7dcbc, 0xc98d5f, 0x8d5b3c];
+// Wave 3 customisation: four selectable skin tones (0 light tan .. 3 deep).
+const SKIN_SET = [0xf3caa2, 0xdca777, 0xa9714b, 0x6f4630];
+const SKIN_MATS = [];
+function skinMaterial(idx) {
+  const k = clamp(Math.round(Number(idx)) || 0, 0, SKIN_SET.length - 1);
+  let m = SKIN_MATS[k];
+  if (!m) {
+    m = new THREE.MeshStandardMaterial({
+      color: SKIN_SET[k], roughness: 0.78, metalness: 0.0, flatShading: true,
+    });
+    SKIN_MATS[k] = m;
+  }
+  return m;
+}
 const HAIR_COLORS = [0x3a2a1e, 0x140f0c, 0x8a5a2a, 0xd8b45a, 0x6a3a24, 0x2b2b33, 0xb06a3a, 0x4a3020];
 const BOOT_COLORS = [0x54402e, 0x3a2f26, 0x6a4a2e, 0x2e3a44];
 const HAT_COLORS = [0x3d5468, 0xd9c9a2, 0x6d5a38, 0x2f4f48, 0x8c4a38, 0x4a4a5e, 0xc2a35e, 0x5c3a4a];
@@ -371,7 +387,7 @@ function palette(idx) {
     overalls: std(base.getHex()),
     trouser: std(trouserCol.getHex()),
     shirt: std(shirtCol.getHex(), 0.92),
-    skin: std(SKIN_TONES[key % SKIN_TONES.length], 0.78),
+    skin: skinMaterial(0),
     hair: std(HAIR_COLORS[key % HAIR_COLORS.length], 0.95),
     boot: std(BOOT_COLORS[key % BOOT_COLORS.length], 0.7),
     leather: std(0x4a3626, 0.75),
@@ -417,13 +433,17 @@ function resetPose(p) {
 }
 
 // =============================================================
-// createCharacter — skeleton + procedural visuals + animation
+// createCharacter â€” skeleton + procedural visuals + animation
 // =============================================================
-function buildVisual(char, colorIndex, name) {
+function buildVisual(char, colorIndex, name, opts) {
   const b = char.bones;
   const G = sharedGeo();
   const P = palette(colorIndex);
   const v = ((colorIndex | 0) % 8 + 8) % 8;
+  const o = opts || char._opts || {};
+  const hatKind = clamp(Math.round(Number(o.hat)) || 0, 0, 4);
+  const skinIdx = clamp(Math.round(Number(o.skin)) || 0, 0, SKIN_SET.length - 1);
+  const SK = skinMaterial(skinIdx);
 
   for (let i = 0; i < char._parts.length; i++) {
     const m = char._parts[i];
@@ -462,16 +482,16 @@ function buildVisual(char, colorIndex, name) {
   const creel = add(b.hips, G.creel, P.wicker, 0.0, 0.27, -0.215);
   creel.rotation.x = 0.10;
   add(b.hips, G.creelLid, P.leather, 0.0, 0.385, -0.222).rotation.x = 0.10;
-  add(b.hips, G.neck, P.skin, 0, 0.575, 0);
+  add(b.hips, G.neck, SK, 0, 0.575, 0);
 
   // ---------- head ----------
-  add(b.head, G.head, P.skin, 0, 0.17, 0);
+  add(b.head, G.head, SK, 0, 0.17, 0);
   const face = add(b.head, G.face, P.face, 0, 0.175, 0.1735);
   face.castShadow = false;
   for (const s of [-1, 1]) {
-    add(b.head, G.ear, P.skin, s * 0.178, 0.16, -0.005).scale.set(0.55, 1.0, 0.85);
+    add(b.head, G.ear, SK, s * 0.178, 0.16, -0.005).scale.set(0.55, 1.0, 0.85);
   }
-  const nose = add(b.head, G.nose, P.skin, 0, 0.148, 0.176);
+  const nose = add(b.head, G.nose, SK, 0, 0.148, 0.176);
   nose.rotation.x = Math.PI * 0.5;
   add(b.head, G.hairBack, P.hair, 0, 0.20, -0.125);
   add(b.head, G.fringe, P.hair, 0, 0.305, 0.115);
@@ -481,7 +501,6 @@ function buildVisual(char, colorIndex, name) {
   }
 
   // ---------- hat ----------
-  const hatKind = v % 4;
   const hat = new THREE.Group();
   hat.rotation.set(-0.04, 0.12, 0.05);
   b.head.add(hat);
@@ -493,27 +512,31 @@ function buildVisual(char, colorIndex, name) {
     hat.add(m);
     return m;
   };
-  if (hatKind === 0) {          // bucket hat
+  if (hatKind === 0) {          // 0 - bucket hat
     hadd(G.bucketCrown, P.hat, 0, 0.375, 0);
     const brim = hadd(G.bucketBrim, P.hat, 0, 0.305, 0.005);
     brim.rotation.x = -0.07;
     hadd(G.strawBand, P.accent, 0, 0.325, 0).scale.set(0.94, 0.8, 0.94);
-  } else if (hatKind === 1) {   // beanie
+  } else if (hatKind === 1) {   // 1 - beanie
     hadd(G.beanieDome, P.hat, 0, 0.245, 0);
     hadd(G.beanieCuff, P.accent, 0, 0.285, 0);
     hadd(G.pom, P.accent, 0, 0.455, 0);
-  } else if (hatKind === 2) {   // wide straw hat
-    const brim = hadd(G.strawBrim, P.accent, 0, 0.325, 0.01);
-    brim.rotation.x = -0.05;
-    hadd(G.strawCrown, P.accent, 0, 0.395, 0);
-    hadd(G.strawBand, P.hat, 0, 0.355, 0);
-  } else {                      // captain's cap
+  } else if (hatKind === 2) {   // 2 - captain's peaked cap, gold band
     hadd(G.capCrown, P.hat, 0, 0.375, 0);
     hadd(G.capTop, P.hat, 0, 0.432, 0);
-    const visor = hadd(G.capVisor, P.leather, 0, 0.335, 0.185);
+    hadd(G.strawBand, P.metal, 0, 0.335, 0).scale.set(1.07, 0.52, 1.07);
+    const visor = hadd(G.capVisor, P.leather, 0, 0.316, 0.190);
     visor.rotation.x = -0.16;
-    hadd(G.capBadge, P.metal, 0, 0.385, 0.196);
-  }
+    hadd(G.capBadge, P.metal, 0, 0.392, 0.196);
+  } else if (hatKind === 3) {   // 3 - bandana with a knot and two tails
+    hadd(G.bandanaCap, P.hat, 0, 0.245, 0);
+    hadd(G.bandanaBand, P.accent, 0, 0.268, 0);
+    hadd(G.bandanaKnot, P.hat, 0, 0.258, -0.188);
+    const t1 = hadd(G.bandanaTail, P.hat, -0.048, 0.150, -0.212);
+    t1.rotation.set(0.34, 0, 0.24);
+    const t2 = hadd(G.bandanaTail, P.hat, 0.048, 0.138, -0.212);
+    t2.rotation.set(0.44, 0, -0.30);
+  }                             // 4 - bareheaded
 
   // ---------- arms ----------
   for (const side of [-1, 1]) {
@@ -521,9 +544,9 @@ function buildVisual(char, colorIndex, name) {
     const fore = side < 0 ? b.foreL : b.foreR;
     const hand = side < 0 ? b.handL : b.handR;
     add(arm, G.sleeve, P.shirt, 0, -0.055, 0);
-    add(arm, G.upperArm, P.skin, 0, -0.15, 0);
-    add(fore, G.foreArm, P.skin, 0, -0.13, 0);
-    add(hand, G.hand, P.skin, 0, -0.048, 0.008);
+    add(arm, G.upperArm, SK, 0, -0.15, 0);
+    add(fore, G.foreArm, SK, 0, -0.13, 0);
+    add(hand, G.hand, SK, 0, -0.048, 0.008);
   }
 
   // ---------- legs ----------
@@ -557,9 +580,12 @@ function buildVisual(char, colorIndex, name) {
 
   char.colorIndex = colorIndex | 0;
   char.name = name;
+  char.hat = hatKind;
+  char.skin = skinIdx;
+  char._opts = { hat: hatKind, skin: skinIdx };
 }
 
-export function createCharacter(colorIndex, name) {
+export function createCharacter(colorIndex, name, opts = { hat: 0, skin: 0 }) {
   const group = new THREE.Group();
   group.name = 'fisherfolk';
 
@@ -632,6 +658,9 @@ export function createCharacter(colorIndex, name) {
     nameTag: null,
     colorIndex: colorIndex | 0,
     name,
+    hat: 0,
+    skin: 0,
+    _opts: null,
     _parts: [],
     _tagVisible: true,
     _s: state,
@@ -655,8 +684,8 @@ export function createCharacter(colorIndex, name) {
       char._tagVisible = !!on;
       if (char.nameTag) char.nameTag.visible = !!on;
     },
-    setLook(ci, nm) {
-      buildVisual(char, ci, nm === undefined ? char.name : nm);
+    setLook(ci, nm, o) {
+      buildVisual(char, ci, nm === undefined ? char.name : nm, o === undefined ? char._opts : o);
     },
     update(dt, t) { animate(char, pose, state, dt, t); },
     dispose() {
@@ -670,7 +699,7 @@ export function createCharacter(colorIndex, name) {
     },
   };
 
-  buildVisual(char, colorIndex, name);
+  buildVisual(char, colorIndex, name, opts);
   return char;
 }
 
@@ -944,13 +973,17 @@ export function initPlayer(ctx) {
     swimming: false,
     underwater: false,
     onBoat: false,
+    onDeck: false,
     seat: -1,
+    anchor: new THREE.Vector3(),   // boat-local anchor while standing on deck
+    deckY: 0,
     ko: false,
     anim: 'idle',
     speed: 0,
     spawned: false,
   };
   const remotes = new Map();
+  const _deckA = { y: 0, localX: 0, localZ: 0 };
 
   const cam = {
     dist: 5.5,
@@ -974,6 +1007,7 @@ export function initPlayer(ctx) {
   let boardCooldown = 0;
   let wasKo = false;
   let netTime = 0;           // frame-driven clock used for remote interpolation
+  let deckPrevYaw = null;    // boat yaw last frame, so the hull turns you with it
 
   const keys = (ctx.input && ctx.input.keys) ? ctx.input.keys : new Set();
   if (ctx.input && !ctx.input.keys) ctx.input.keys = keys;
@@ -991,6 +1025,32 @@ export function initPlayer(ctx) {
       return Number.isFinite(h) ? h : 0;
     }
     return 0;
+  }
+  // Ground height INCLUDING walkable structures (dock decking, steps).
+  // world.js owns it; yRef is our own height so decking far ABOVE us stays
+  // transparent (that is what lets you swim under the dock). Falls back to
+  // raw terrain until world.js exposes it.
+  function surfaceH(x, z, yRef) {
+    const w = ctx.world;
+    if (w && typeof w.surfaceHeight === 'function') {
+      const h = w.surfaceHeight(x, z, yRef);
+      if (Number.isFinite(h)) return h;
+    }
+    return terrainH(x, z);
+  }
+  // Push out of solid props (palms, rocks, hut walls, stones, dock posts).
+  function resolveCollide(pos) {
+    const w = ctx.world;
+    if (!w || typeof w.resolveCollide !== 'function') return;
+    try { w.resolveCollide(pos, 0.45); } catch (e) { /* world not ready */ }
+  }
+  // boat.js handle, only once it exposes the wave-3 deck API.
+  function boatApi() {
+    const b = ctx.boat;
+    if (!b) return null;
+    if (typeof b.deckInfo !== 'function' || typeof b.toWorld !== 'function' ||
+        typeof b.toLocal !== 'function') return null;
+    return b;
   }
   function waterH(x, z, t) {
     if (typeof ctx.getWaterHeight === 'function') {
@@ -1057,6 +1117,135 @@ export function initPlayer(ctx) {
     return 0;
   }
 
+  // ---------- boat: boarding, the wheel, stepping off ----------
+  const _helmW = new THREE.Vector3();
+
+  function nearHelm() {
+    const b = ctx.boat;
+    if (!b || typeof b.helmPos !== 'function') return false;
+    b.helmPos(_helmW);
+    if (!Number.isFinite(_helmW.x)) return false;
+    const dx = local.pos.x - _helmW.x, dz = local.pos.z - _helmW.z;
+    const dy = local.pos.y - _helmW.y;
+    return (dx * dx + dz * dz) <= 4 && dy > -3 && dy < 3;   // within 2 m
+  }
+
+  function setAboard(onDeck, seat) {
+    local.onDeck = onDeck;
+    local.onBoat = onDeck || seat >= 0;
+    local.seat = seat;
+    ctx.state.onDeck = local.onDeck;
+    ctx.state.onBoat = local.onBoat;
+    ctx.state.seat = seat;
+  }
+
+  // Snap to seat 0 and start driving.
+  function takeWheel() {
+    setAboard(false, 0);
+    local.vel.set(0, 0, 0);
+    local.swimming = false;
+    local.grounded = true;
+    setUnderwater(false);
+    boardCooldown = 0.45;
+    deckPrevYaw = boatYaw();
+    send(MSG.BOARD_BOAT, { seat: 0 });
+    if (ctx.bus) ctx.bus.emit('boardBoat', { seat: 0 });
+  }
+
+  // Let go of the wheel â€” you keep standing on the deck beside it.
+  function releaseWheel() {
+    const B = boatApi();
+    send(MSG.LEAVE_BOAT, {});
+    boardCooldown = 0.45;
+    if (B && typeof B.helmPos === 'function') {
+      B.helmPos(_v1);
+      if (Number.isFinite(_v1.x)) local.pos.copy(_v1);
+      const di = B.deckInfo(local.pos.x, local.pos.z, local.pos.y + 0.4, _deckA);
+      if (di) local.pos.y = di.y;
+      local.deckY = local.pos.y;
+      B.toLocal(local.pos, local.anchor);
+      setAboard(true, -1);
+      local.grounded = true;
+      local.vel.set(0, 0, 0);
+    } else {
+      setAboard(false, -1);
+    }
+    if (ctx.bus) ctx.bus.emit('leaveBoat', {});
+  }
+
+  // Hop onto the nearest deck point of the hull we are standing next to.
+  function boardDeck() {
+    const B = boatApi();
+    if (!B) return false;
+    const g = ctx.boat.group;
+    const cx = (g && g.position && Number.isFinite(g.position.x)) ? g.position.x : local.pos.x;
+    const cz = (g && g.position && Number.isFinite(g.position.z)) ? g.position.z : local.pos.z;
+    let bx = local.pos.x, bz = local.pos.z;
+    let di = B.deckInfo(bx, bz, local.pos.y, _deckA);
+    if (!di) {
+      // walk the sample inward toward the hull centre until the deck appears
+      const dx = cx - bx, dz = cz - bz;
+      const len = Math.hypot(dx, dz);
+      if (len > 1e-3) {
+        const ux = dx / len, uz = dz / len;
+        for (let i = 1; i <= 14; i++) {
+          const nx = bx + ux * (len * i / 14);
+          const nz = bz + uz * (len * i / 14);
+          const hit = B.deckInfo(nx, nz, local.pos.y, _deckA);
+          if (hit) { bx = nx; bz = nz; di = hit; break; }
+        }
+      }
+    }
+    if (!di) return false;
+    local.pos.set(bx, di.y, bz);
+    local.deckY = di.y;
+    B.toLocal(local.pos, local.anchor);
+    setAboard(true, -1);
+    local.vel.set(0, 0, 0);
+    local.swimming = false;
+    local.grounded = true;
+    setUnderwater(false);
+    boardCooldown = 0.45;
+    deckPrevYaw = boatYaw();
+    if (ctx.bus) ctx.bus.emit('boardBoat', { seat: -1 });
+    return true;
+  }
+
+  // Deliberate dismount: shove clear of the hull and drop.
+  function hopOff(t) {
+    const by = boatYaw();
+    let rx = -Math.cos(by), rz = Math.sin(by);
+    const g = ctx.boat && ctx.boat.group;
+    if (g && g.position && Number.isFinite(g.position.x)) {
+      const dx = local.pos.x - g.position.x, dz = local.pos.z - g.position.z;
+      if (dx * rx + dz * rz < 0) { rx = -rx; rz = -rz; }
+    }
+    const B = boatApi();
+    for (let i = 0; i < 10; i++) {
+      if (!B || !B.deckInfo(local.pos.x + rx, local.pos.z + rz, local.pos.y, _deckA)) break;
+      local.pos.x += rx; local.pos.z += rz;
+    }
+    local.pos.x += rx * 1.8;
+    local.pos.z += rz * 1.8;
+    const gy = surfaceH(local.pos.x, local.pos.z, local.pos.y);
+    const wy = waterH(local.pos.x, local.pos.z, t);
+    local.pos.y = Math.max(gy, wy - 0.9);
+    local.vel.set(rx * 2.0, 2.4, rz * 2.0);
+    stepOffDeck();
+  }
+
+  // Leave the deck frame entirely (walked off the edge, or hopped off).
+  function stepOffDeck() {
+    setAboard(false, -1);
+    const bv = ctx.boat && ctx.boat.velocity;
+    if (bv && Number.isFinite(bv.x)) { local.vel.x += bv.x; local.vel.z += bv.z; }
+    local.grounded = false;
+    deckPrevYaw = null;
+    if (boardCooldown < 0.35) boardCooldown = 0.35;
+    send(MSG.LEAVE_BOAT, {});
+    if (ctx.bus) ctx.bus.emit('leaveBoat', {});
+  }
+
   // ---------- spawn ----------
   function findLand(x, z, out) {
     let bx = x, bz = z;
@@ -1089,9 +1278,12 @@ export function initPlayer(ctx) {
     local.swimming = false;
     local.grounded = true;
     local.onBoat = false;
+    local.onDeck = false;
     local.seat = -1;
     ctx.state.onBoat = false;
+    ctx.state.onDeck = false;
     ctx.state.seat = -1;
+    deckPrevYaw = null;
     ctx.state.air = 1;
     drownAccum = 0;
     setUnderwater(false);
@@ -1125,18 +1317,42 @@ export function initPlayer(ctx) {
     }
     return 'You';
   }
+  // ui.js writes ctx.state.myHat / myMySkin; the world player list is the
+  // fallback so a rejoin still shows the right look. Default 0.
+  function myLook() {
+    const s = ctx.state;
+    let hat = s && Number.isFinite(s.myHat) ? s.myHat : null;
+    let skin = s && Number.isFinite(s.mySkin) ? s.mySkin : null;
+    if (hat === null || skin === null) {
+      const w = s && s.world;
+      if (w && Array.isArray(w.players) && s.myId) {
+        for (const pl of w.players) {
+          if (pl.id !== s.myId) continue;
+          if (hat === null && Number.isFinite(pl.hat)) hat = pl.hat;
+          if (skin === null && Number.isFinite(pl.skin)) skin = pl.skin;
+          break;
+        }
+      }
+    }
+    return {
+      hat: clamp(Math.round(Number(hat)) || 0, 0, 4),
+      skin: clamp(Math.round(Number(skin)) || 0, 0, 3),
+    };
+  }
   function ensureLocalChar() {
+    const look = myLook();
     if (!local.char) {
-      local.char = createCharacter(myColor(), myName());
+      local.char = createCharacter(myColor(), myName(), look);
       local.char.setNameVisible(false);
       local.char.group.visible = false;
       scene.add(local.char.group);
     }
     const c = myColor(), n = myName();
-    if (local.char.colorIndex !== (c | 0) || local.char.name !== n) {
-      // Rebuild only the meshes — bone objects (and any rod parented to
+    if (local.char.colorIndex !== (c | 0) || local.char.name !== n ||
+        local.char.hat !== look.hat || local.char.skin !== look.skin) {
+      // Rebuild only the meshes â€” bone objects (and any rod parented to
       // handR by fishing.js) survive untouched.
-      local.char.setLook(c, n);
+      local.char.setLook(c, n, look);
       local.char.setNameVisible(false);
     }
   }
@@ -1149,27 +1365,41 @@ export function initPlayer(ctx) {
     }
     return null;
   }
+  // Normalised the same way createCharacter does, so change detection never
+  // ping-pongs on out-of-range values.
+  function lookOf(info) {
+    return {
+      hat: clamp(Math.round(Number(info && info.hat)) || 0, 0, 4),
+      skin: clamp(Math.round(Number(info && info.skin)) || 0, 0, 3),
+    };
+  }
   function ensureRemote(id) {
     let r = remotes.get(id);
     const info = playerInfo(id);
     const color = info && Number.isFinite(info.color) ? info.color : 0;
     const name = (info && info.name) ? info.name : 'Angler';
+    const look = lookOf(info);
     if (!r) {
-      const char = createCharacter(color, name);
+      const char = createCharacter(color, name, look);
       char.group.visible = ctx.state.phase === 'playing' || ctx.state.phase === 'over';
       scene.add(char.group);
       r = {
         id, char, group: char.group, colorIndex: color, name,
+        hat: char.hat, skin: char.skin,
         pos: new THREE.Vector3(), from: new THREE.Vector3(), to: new THREE.Vector3(),
+        blFrom: new THREE.Vector3(), blTo: new THREE.Vector3(), blPos: new THREE.Vector3(),
+        hasBl: false,
         yaw: 0, yawFrom: 0, yawTo: 0,
         lerpStart: 0, lerpDur: REMOTE_LERP,
         anim: 'idle', swimming: false, onBoat: false, seat: -1, speed: 0,
       };
       remotes.set(id, r);
-    } else if (r.colorIndex !== color || r.name !== name) {
+    } else if (r.colorIndex !== color || r.name !== name || r.hat !== look.hat || r.skin !== look.skin) {
       r.colorIndex = color;
       r.name = name;
-      r.char.setLook(color, name);
+      r.hat = look.hat;
+      r.skin = look.skin;
+      r.char.setLook(color, name, look);
     }
     return r;
   }
@@ -1196,6 +1426,18 @@ export function initPlayer(ctx) {
       r.from.copy(r.pos);
       r.to.set(p[0], p[1], p[2]);
       if (r.lerpDur <= 0 || r.from.lengthSq() === 0) r.from.copy(r.to);
+      // boat-local anchor: they are standing on the deck, not at an
+      // absolute world position (the server relays this field untouched)
+      const bl = e.bl;
+      if (Array.isArray(bl) && bl.length >= 3 && Number.isFinite(bl[0]) &&
+          Number.isFinite(bl[1]) && Number.isFinite(bl[2])) {
+        if (r.hasBl) r.blFrom.copy(r.blPos);
+        else { r.blFrom.set(bl[0], bl[1], bl[2]); r.blPos.set(bl[0], bl[1], bl[2]); }
+        r.blTo.set(bl[0], bl[1], bl[2]);
+        r.hasBl = true;
+      } else {
+        r.hasBl = false;
+      }
       r.lerpStart = now;
       r.lerpDur = REMOTE_LERP;
       r.yawFrom = r.yaw;
@@ -1219,9 +1461,10 @@ export function initPlayer(ctx) {
         found = true;
         const c = Number.isFinite(pl.color) ? pl.color : r.colorIndex;
         const n = pl.name || r.name;
-        if (c !== r.colorIndex || n !== r.name) {
-          r.colorIndex = c; r.name = n;
-          r.char.setLook(c, n);
+        const lk = lookOf(pl);
+        if (c !== r.colorIndex || n !== r.name || lk.hat !== r.hat || lk.skin !== r.skin) {
+          r.colorIndex = c; r.name = n; r.hat = lk.hat; r.skin = lk.skin;
+          r.char.setLook(c, n, lk);
         }
         break;
       }
@@ -1237,14 +1480,17 @@ export function initPlayer(ctx) {
       if (mine >= 0) {
         if (!local.onBoat || local.seat !== mine) {
           const wasAboard = local.onBoat;
+          local.onDeck = false;
           local.onBoat = true;
           local.seat = mine;
+          ctx.state.onDeck = false;
           ctx.state.onBoat = true;
           ctx.state.seat = mine;
           if (!wasAboard && ctx.bus) ctx.bus.emit('boardBoat', { seat: mine });
         }
-      } else if (local.onBoat && boardCooldown <= 0) {
-        // server says we are not seated — step off
+      } else if (local.onBoat && !local.onDeck && boardCooldown <= 0) {
+        // server says we are not seated â€” step off. Deck-standers hold no
+        // seat by design, so they are exempt.
         local.onBoat = false;
         local.seat = -1;
         ctx.state.onBoat = false;
@@ -1348,6 +1594,88 @@ export function initPlayer(ctx) {
     return out;
   }
 
+  // ---------- walking a boat deck ----------
+  // The boat frame carries us: every frame the boat-local anchor is converted
+  // back to world (so the hull's travel, turn, pitch and roll move us with it),
+  // then the NORMAL walk controller adds its world-space displacement on top and
+  // the anchor is rewritten. Camera-relative WASD is untouched.
+  function updateDeckWalk(dt, t, fwd, str, running, ko, hasInput) {
+    const B = boatApi();
+    const char = local.char;
+    const st = ctx.state;
+
+    // 1. ride the hull
+    B.toWorld(local.anchor, _v3);
+    if (Number.isFinite(_v3.x)) local.pos.copy(_v3);
+    const by = boatYaw();
+    if (deckPrevYaw !== null && !ko) local.faceYaw += angDelta(deckPrevYaw, by);
+    deckPrevYaw = by;
+
+    // 2. the ordinary walk controller
+    const wantSpeed = ko ? 0 : (running ? RUN_SPEED : WALK_SPEED);
+    wishDir(_v2, local.yaw, fwd, str);
+    const accel = local.grounded ? GROUND_ACCEL : AIR_ACCEL;
+    const ka = 1 - Math.exp(-accel * dt);
+    local.vel.x += (_v2.x * wantSpeed - local.vel.x) * ka;
+    local.vel.z += (_v2.z * wantSpeed - local.vel.z) * ka;
+
+    if (!ko && local.grounded && justDown('Space')) {
+      local.vel.y = JUMP_VEL;
+      local.grounded = false;
+    }
+    local.vel.y += GRAVITY * dt;
+    if (local.vel.y < -45) local.vel.y = -45;
+
+    // 3. our own displacement, in world space
+    local.pos.x += local.vel.x * dt;
+    local.pos.z += local.vel.z * dt;
+    local.pos.y += local.vel.y * dt;
+
+    // 4. ground on the deck under us
+    const di = B.deckInfo(local.pos.x, local.pos.z, local.pos.y, _deckA);
+    if (di) {
+      local.deckY = di.y;
+      if (local.pos.y <= di.y + 0.02) {
+        local.pos.y = di.y;
+        if (local.vel.y < 0) local.vel.y = 0;
+        local.grounded = true;
+      } else {
+        local.grounded = false;
+      }
+      B.toLocal(local.pos, local.anchor);
+    } else if (!local.grounded && local.pos.y > local.deckY + 0.15 &&
+               typeof B.nearBoat === 'function' && B.nearBoat(local.pos)) {
+      // airborne across a gap (hopping up to the cabin roof) â€” stay attached
+      B.toLocal(local.pos, local.anchor);
+    } else {
+      stepOffDeck();                          // walked off the edge: into the drink
+      return;
+    }
+
+    // 5. everything else behaves exactly like walking on land
+    local.swimming = false;
+    setUnderwater(false);
+    st.air = Math.min(1, (st.air === undefined ? 1 : st.air) + dt / 1.2);
+    drownAccum = 0;
+    local.speed = Math.hypot(local.vel.x, local.vel.z);
+    if (ko) local.anim = 'ko';
+    else if (local.speed > RUN_SPEED * 0.62) local.anim = 'run';
+    else if (local.speed > 0.35) local.anim = 'walk';
+    else local.anim = 'idle';
+    if (char) {
+      char.setLean(0);
+      char.setAirborne(!ko && !local.grounded);
+    }
+    if (!ko) {
+      let faceTarget = local.faceYaw;
+      if (hasInput && local.speed > 0.3) faceTarget = Math.atan2(local.vel.x, local.vel.z);
+      else if (castFlash > 0 || isCasting()) faceTarget = local.yaw;
+      else if (Math.abs(angDelta(local.faceYaw, local.yaw)) > 1.9) faceTarget = local.yaw;
+      local.faceYaw = angDamp(local.faceYaw, faceTarget, hasInput ? 13 : 6, dt);
+    }
+    updateArea(local.pos.x, local.pos.z);
+  }
+
   function updateLocal(dt, t) {
     const st = ctx.state;
     ensureLocalChar();
@@ -1358,8 +1686,9 @@ export function initPlayer(ctx) {
 
     const ko = st.hp <= 0;
     if (ko && !wasKo && local.onBoat) {
-      local.onBoat = false; local.seat = -1;
-      st.onBoat = false; st.seat = -1;
+      local.onBoat = false; local.onDeck = false; local.seat = -1;
+      st.onBoat = false; st.onDeck = false; st.seat = -1;
+      deckPrevYaw = null;
       send(MSG.LEAVE_BOAT, {});
       if (ctx.bus) ctx.bus.emit('leaveBoat', {});
     }
@@ -1372,48 +1701,40 @@ export function initPlayer(ctx) {
     const running = isDown('ShiftLeft') || isDown('ShiftRight');
     const hasInput = !ko && (fwd !== 0 || str !== 0);
 
-    // ---------------- boarding ----------------
+    // ---------------- boarding / the wheel / dismount ----------------
     if (!ko && justDown('KeyE') && boardCooldown <= 0) {
-      if (local.onBoat) {
-        // hop off to the side of the boat
-        const by = boatYaw();
-        const rx = -Math.cos(by), rz = Math.sin(by);
-        local.pos.x += rx * 2.3;
-        local.pos.z += rz * 2.3;
-        const gy = terrainH(local.pos.x, local.pos.z);
-        const wy = waterH(local.pos.x, local.pos.z, t);
-        local.pos.y = Math.max(gy, wy - 0.9);
-        local.vel.set(rx * 2.0, 2.4, rz * 2.0);
-        local.onBoat = false;
-        local.seat = -1;
-        st.onBoat = false;
-        st.seat = -1;
-        boardCooldown = 0.45;
-        send(MSG.LEAVE_BOAT, {});
-        if (ctx.bus) ctx.bus.emit('leaveBoat', {});
+      if (local.seat === 0) {
+        releaseWheel();                       // E again lets go of the wheel
+      } else if (local.onDeck) {
+        if (nearHelm()) takeWheel();          // step up and take the helm
+        else hopOff(t);                       // hop over the side
+      } else if (local.onBoat) {
+        hopOff(t);                            // legacy seated rider
       } else if (ctx.boat && typeof ctx.boat.nearBoat === 'function' && ctx.boat.nearBoat(local.pos)) {
-        const n = boatSeatCount();
-        let seat = -1;
-        for (let i = 0; i < n; i++) {
-          if (!boatSeats || boatSeats[i] == null || boatSeats[i] === st.myId) { seat = i; break; }
-        }
-        if (seat >= 0) {
-          local.onBoat = true;
-          local.seat = seat;
-          st.onBoat = true;
-          st.seat = seat;
-          local.vel.set(0, 0, 0);
-          local.swimming = false;
-          setUnderwater(false);
-          boardCooldown = 0.45;
-          send(MSG.BOARD_BOAT, { seat });
-          if (ctx.bus) ctx.bus.emit('boardBoat', { seat });
+        if (nearHelm()) {
+          takeWheel();
+        } else if (!boardDeck()) {
+          // boat.js has no deck API yet â€” fall back to the old seat flow
+          const n = boatSeatCount();
+          let seat = -1;
+          for (let i = 0; i < n; i++) {
+            if (!boatSeats || boatSeats[i] == null || boatSeats[i] === st.myId) { seat = i; break; }
+          }
+          if (seat >= 0) {
+            setAboard(false, seat);
+            local.vel.set(0, 0, 0);
+            local.swimming = false;
+            setUnderwater(false);
+            boardCooldown = 0.45;
+            send(MSG.BOARD_BOAT, { seat });
+            if (ctx.bus) ctx.bus.emit('boardBoat', { seat });
+          }
         }
       }
     }
 
-    // ---------------- aboard the boat ----------------
-    if (local.onBoat) {
+    // ---------------- seated / at the helm ----------------
+    if (local.onBoat && local.seat >= 0) {
       if (seatPos(local.seat, _v1, dt)) local.pos.copy(_v1);
       local.vel.set(0, 0, 0);
       local.swimming = false;
@@ -1423,17 +1744,30 @@ export function initPlayer(ctx) {
       drownAccum = 0;
 
       const by = boatYaw();
+      deckPrevYaw = by;
       local.faceYaw = local.seat === 0 ? angDamp(local.faceYaw, by, 12, dt) : angDamp(local.faceYaw, local.yaw, 10, dt);
       char.setAirborne(false);
       char.setLean(0);
       local.speed = 0;
       local.anim = ko ? 'ko' : (local.seat === 0 ? 'drive' : 'sit');
+      const Bh = boatApi();
+      if (Bh) Bh.toLocal(local.pos, local.anchor); else local.anchor.set(0, 0, 0);
       updateArea(local.pos.x, local.pos.z);
       return;
     }
 
+    // ---------------- standing on the deck ----------------
+    if (local.onDeck) {
+      if (boatApi()) {
+        updateDeckWalk(dt, t, fwd, str, running, ko, hasInput);
+        return;
+      }
+      setAboard(false, -1);        // boat module vanished; fall back to swimming
+      deckPrevYaw = null;
+    }
+
     // ---------------- water sampling ----------------
-    const groundY = terrainH(local.pos.x, local.pos.z);
+    const groundY = surfaceH(local.pos.x, local.pos.z, local.pos.y);
     const waterY = waterH(local.pos.x, local.pos.z, t);
     const depth = waterY - groundY;
 
@@ -1490,7 +1824,8 @@ export function initPlayer(ctx) {
         }
       }
       local.pos.addScaledVector(local.vel, dt);
-      const gy2 = terrainH(local.pos.x, local.pos.z);
+      resolveCollide(local.pos);
+      const gy2 = surfaceH(local.pos.x, local.pos.z, local.pos.y);
       if (local.pos.y < gy2 + 0.05) { local.pos.y = gy2 + 0.05; if (local.vel.y < 0) local.vel.y = 0; }
       if (local.pos.y > waterY + 0.2) local.pos.y = waterY + 0.2;
 
@@ -1532,8 +1867,10 @@ export function initPlayer(ctx) {
       if (local.vel.y < -45) local.vel.y = -45;
 
       local.pos.addScaledVector(local.vel, dt);
+      // props (palms, rocks, hut, stones, dock posts) actually block you now
+      resolveCollide(local.pos);
 
-      const gy2 = terrainH(local.pos.x, local.pos.z);
+      const gy2 = surfaceH(local.pos.x, local.pos.z, local.pos.y);
       if (local.pos.y <= gy2 + 0.02) {
         if (!local.grounded && local.vel.y < -6) {
           const wy2 = waterH(local.pos.x, local.pos.z, t);
@@ -1617,7 +1954,7 @@ export function initPlayer(ctx) {
     for (let i = 1; i <= steps; i++) {
       const f = cam.dist * (i / steps);
       _v4.copy(_v1).addScaledVector(_v3, f);
-      if (_v4.y < terrainH(_v4.x, _v4.z) + 0.45) {
+      if (_v4.y < surfaceH(_v4.x, _v4.z, _v4.y) + 0.45) {
         d = Math.max(1.25, cam.dist * ((i - 1) / steps));
         break;
       }
@@ -1626,7 +1963,7 @@ export function initPlayer(ctx) {
     _v4.copy(_v1).addScaledVector(_v3, d);
     _v4.y += 0.12;
 
-    const gy = terrainH(_v4.x, _v4.z) + 0.35;
+    const gy = surfaceH(_v4.x, _v4.z, _v4.y) + 0.35;
     if (_v4.y < gy) _v4.y = gy;
     if (!local.underwater) {
       const wy = waterH(_v4.x, _v4.z, t) + 0.25;
@@ -1668,23 +2005,33 @@ export function initPlayer(ctx) {
     if (remotes.size === 0) return;
     const now = netTime;
     const camPos = camera ? camera.position : null;
+    const B = boatApi();
     for (const r of remotes.values()) {
       _v1.copy(r.pos);
+      const a = r.lerpDur > 0 ? clamp((now - r.lerpStart) / r.lerpDur, 0, 1) : 1;
       let seat = -1;
       if (r.onBoat) {
         seat = boatSeatOf(r.id);
         if (seat < 0) seat = r.seat;
       }
-      if (r.onBoat && seat >= 0 && seatPos(seat, _v2, dt)) {
+      let localMoved = -1;
+      if (r.hasBl && B) {
+        // Anchored to the hull: lerp the LOCAL position and re-project every
+        // frame, so they ride the boat smoothly between 12 Hz updates.
+        _v5.copy(r.blPos);
+        r.blPos.lerpVectors(r.blFrom, r.blTo, a);
+        localMoved = _v5.distanceTo(r.blPos);
+        B.toWorld(r.blPos, _v2);
+        if (Number.isFinite(_v2.x)) r.pos.copy(_v2);
+      } else if (r.onBoat && seat >= 0 && seatPos(seat, _v2, dt)) {
         r.pos.copy(_v2);
       } else {
-        const a = r.lerpDur > 0 ? clamp((now - r.lerpStart) / r.lerpDur, 0, 1) : 1;
         r.pos.lerpVectors(r.from, r.to, a);
       }
-      const moved = _v1.distanceTo(r.pos);
+      const moved = localMoved >= 0 ? localMoved : _v1.distanceTo(r.pos);
       r.speed = damp(r.speed, dt > 0 ? moved / dt : 0, 10, dt);
 
-      const a2 = r.lerpDur > 0 ? clamp((now - r.lerpStart) / r.lerpDur, 0, 1) : 1;
+      const a2 = a;
       r.yaw = r.yawFrom + angDelta(r.yawFrom, r.yawTo) * a2;
 
       const g = r.char.group;
@@ -1704,6 +2051,9 @@ export function initPlayer(ctx) {
   // ---------- outgoing MOVE ----------
   function sendMove(anim) {
     if (!ctx.state.myId) return;
+    // Anchored to the hull? Ship the boat-local position so remotes can ride
+    // the deck between updates instead of lagging behind it.
+    const anchored = local.onBoat && (local.onDeck || local.seat >= 0) && !!boatApi();
     send(MSG.MOVE, {
       p: [Math.round(local.pos.x * 100) / 100, Math.round(local.pos.y * 100) / 100, Math.round(local.pos.z * 100) / 100],
       r: Math.round(local.faceYaw * 1000) / 1000,
@@ -1711,6 +2061,9 @@ export function initPlayer(ctx) {
       swimming: local.swimming,
       onBoat: local.onBoat,
       seat: local.seat,
+      bl: anchored
+        ? [Math.round(local.anchor.x * 100) / 100, Math.round(local.anchor.y * 100) / 100, Math.round(local.anchor.z * 100) / 100]
+        : null,
     });
   }
 
@@ -1726,6 +2079,7 @@ export function initPlayer(ctx) {
       cam.inited = false;
       cam.distWant = 5.5;
       ctx.state.air = 1;
+      ctx.state.onDeck = false;
       drownAccum = 0;
     } else {
       setUnderwater(false);
@@ -1734,7 +2088,10 @@ export function initPlayer(ctx) {
         for (const id of Array.from(remotes.keys())) removeRemote(id);
         boatSeats = null;
         local.onBoat = false;
+        local.onDeck = false;
         local.seat = -1;
+        ctx.state.onDeck = false;
+        deckPrevYaw = null;
       }
     }
   }

@@ -34,6 +34,8 @@ import('./fish.js').then((m) => {
 // ---------------------------------------------------------------
 const LS_NAME = 'tidewreck.name';
 const LS_COLOR = 'tidewreck.color';
+const LS_HAT = 'tidewreck.hat';
+const LS_SKIN = 'tidewreck.skin';
 const TAU = Math.PI * 2;
 
 function hex(c) { return '#' + ((c >>> 0) & 0xffffff).toString(16).padStart(6, '0'); }
@@ -47,6 +49,11 @@ function setText(node, s) { if (node && node.textContent !== s) node.textContent
 function setHTML(node, s) { if (node && node._h !== s) { node._h = s; node.innerHTML = s; } }
 function clamp01(v) { return v < 0 ? 0 : v > 1 ? 1 : v; }
 function num(v, d) { return (typeof v === 'number' && isFinite(v)) ? v : d; }
+// clamp anything (string from localStorage, stray payload field) into 0..n-1
+function idx(v, n) {
+  const i = Math.floor(num(typeof v === 'string' ? parseInt(v, 10) : v, 0));
+  return i < 0 ? 0 : i >= n ? n - 1 : i;
+}
 function money(n) { return Math.round(num(n, 0)).toLocaleString('en-US'); }
 function prettyKey(k) {
   return String(k).replace(/([a-z0-9])([A-Z])/g, '$1 $2').replace(/[_-]+/g, ' ')
@@ -65,6 +72,46 @@ const SVG_BAG = '<svg viewBox="0 0 24 24" class="ico"><path d="M4.5 8h15l-1.2 12
 const SVG_CROWN = '<svg viewBox="0 0 24 24" class="ico"><path d="M3 18h18l-1.4-9-4.4 3.4L12 6l-3.2 6.4L4.4 9z" fill="#ffca4a" stroke="#c98b18" stroke-width="1.1" stroke-linejoin="round"/></svg>';
 const SVG_CHECK = '<svg viewBox="0 0 24 24" class="ico"><path d="M5 12.6l4.6 4.6L19 7.4" fill="none" stroke="currentColor" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round"/></svg>';
 const SVG_WAVE = '<svg viewBox="0 0 120 24" class="ico wave-ico" preserveAspectRatio="none"><path d="M0 16 q15 -12 30 0 t30 0 t30 0 t30 0 V24 H0z" fill="currentColor" opacity=".55"/><path d="M0 20 q15 -10 30 0 t30 0 t30 0 t30 0 V24 H0z" fill="currentColor"/></svg>';
+
+// ---------------------------------------------------------------
+// Character customization — hat 0..4 / skin 0..3. The indices are the
+// contract shared with player.js: createCharacter(color, name, {hat, skin}).
+// Glyphs are drawn in currentColor so chips and lobby rows can tint them.
+// ---------------------------------------------------------------
+const HATS = [
+  { id: 'bucket', name: 'Bucket' },
+  { id: 'beanie', name: 'Beanie' },
+  { id: 'captain', name: 'Captain' },
+  { id: 'bandana', name: 'Bandana' },
+  { id: 'none', name: 'None' },
+];
+const SKINS = [0xf5d0a9, 0xd9a273, 0x9c6644, 0x5c3a24];
+const SKIN_NAMES = ['Light', 'Tan', 'Brown', 'Deep'];
+
+const HAT_SVG = [
+  // bucket — soft crown, wide floppy brim
+  '<svg viewBox="0 0 24 24" class="ico"><path d="M6.2 14.6q0-8 5.8-8t5.8 8z" fill="currentColor"/>' +
+  '<path d="M3.2 14.6h17.6q1.1 0 .7 1.7-.3 1.3-2 1.8-7.3 2-14.9 0-1.7-.5-2-1.8-.4-1.7.6-1.7z" fill="currentColor" opacity=".72"/></svg>',
+  // beanie — dome, ribbed cuff, pom
+  '<svg viewBox="0 0 24 24" class="ico"><circle cx="12" cy="4.6" r="1.8" fill="currentColor"/>' +
+  '<path d="M5.6 15q0-8.4 6.4-8.4T18.4 15z" fill="currentColor"/>' +
+  '<rect x="4.7" y="15" width="14.6" height="3.6" rx="1.8" fill="currentColor" opacity=".72"/></svg>',
+  // captain — peaked cap, band, visor
+  '<svg viewBox="0 0 24 24" class="ico"><path d="M6.2 12.6q0-6.4 5.8-6.4t5.8 6.4z" fill="currentColor"/>' +
+  '<rect x="5.4" y="12.6" width="13.2" height="2.9" rx="1.3" fill="currentColor" opacity=".62"/>' +
+  '<path d="M3.6 15.6h16.8q1.7 0 1.2 1.7-.5 1.5-2.4 1.5H4.8q-1.9 0-2.4-1.5-.5-1.7 1.2-1.7z" fill="currentColor" opacity=".9"/></svg>',
+  // bandana — knotted wrap with tail
+  '<svg viewBox="0 0 24 24" class="ico"><path d="M4.4 12.2q7.6-6.2 15.2 0-1.5 3.2-7.6 3.2t-7.6-3.2z" fill="currentColor"/>' +
+  '<path d="M18.9 12.6l3.6 1.3-2.7 2-1-2.6z" fill="currentColor" opacity=".8"/>' +
+  '<g fill="rgba(0,0,0,.34)"><circle cx="8.2" cy="11.2" r=".95"/><circle cx="12" cy="10.3" r=".95"/><circle cx="15.8" cy="11.2" r=".95"/></g></svg>',
+  // none — bare head
+  '<svg viewBox="0 0 24 24" class="ico"><circle cx="12" cy="9.6" r="5" fill="currentColor" opacity=".55"/>' +
+  '<path d="M4.8 20.4q1.7-4.8 7.2-4.8t7.2 4.8z" fill="currentColor" opacity=".26"/></svg>',
+];
+function hatGlyph(i) { return HAT_SVG[i] || HAT_SVG[HAT_SVG.length - 1]; }
+function hatName(i) { return (HATS[i] && HATS[i].name) || 'None'; }
+function skinName(i) { return SKIN_NAMES[i] || SKIN_NAMES[0]; }
+function skinHex(i) { return hex(SKINS[i] != null ? SKINS[i] : SKINS[0]); }
 
 // ---------------------------------------------------------------
 // Weather glyphs — pure inline SVG, coloured through currentColor so
@@ -386,6 +433,8 @@ export function initUI(ctx) {
     menuPanel: 'none',          // 'none' | 'create' | 'join'
     name: (localStorage.getItem(LS_NAME) || '').slice(0, 16),
     color: Math.max(0, Math.min(PLAYER_COLORS.length - 1, parseInt(localStorage.getItem(LS_COLOR) || '0', 10) || 0)),
+    hat: idx(localStorage.getItem(LS_HAT), HATS.length),
+    skin: idx(localStorage.getItem(LS_SKIN), SKINS.length),
     ready: false,
     shopOpen: false,
     shopTab: 'rod',
@@ -487,6 +536,14 @@ export function initUI(ctx) {
             <label class="field-label">Crew colour</label>
             <div class="swatches" id="swatches"></div>
           </div>
+          <div class="field field-pick">
+            <label class="field-label">Hat <span class="field-val" id="hatVal">Bucket</span></label>
+            <div class="pick-row row-hat" id="hatRow"></div>
+          </div>
+          <div class="field field-pick">
+            <label class="field-label">Skin <span class="field-val" id="skinVal">Light</span></label>
+            <div class="pick-row row-skin" id="skinRow"></div>
+          </div>
         </div>
 
         <div class="menu-actions" id="menuActions">
@@ -586,8 +643,53 @@ export function initUI(ctx) {
     for (const s of swatches.children) s.classList.toggle('is-on', +s.dataset.i === ui.color);
   }
   refreshSwatches();
+
+  // ---- hat + skin pickers (character customization) ----
+  const hatRow = menu.querySelector('#hatRow');
+  const skinRow = menu.querySelector('#skinRow');
+  const hatVal = menu.querySelector('#hatVal');
+  const skinVal = menu.querySelector('#skinVal');
+
+  HATS.forEach((h, i) => {
+    const b = el('button', 'pick-chip');
+    b.dataset.i = String(i);
+    b.title = h.name === 'None' ? 'No hat' : (h.name + ' hat');
+    b.innerHTML = `<span class="pick-ico hat-ico">${hatGlyph(i)}</span><i>${escapeHTML(h.name)}</i>`;
+    b.addEventListener('click', () => setHat(i));
+    hatRow.appendChild(b);
+  });
+  SKINS.forEach((c, i) => {
+    const b = el('button', 'pick-chip');
+    b.dataset.i = String(i);
+    b.title = skinName(i) + ' skin';
+    b.innerHTML = `<span class="pick-ico skin-disc" style="--c:${hex(c)}"></span><i>${escapeHTML(skinName(i))}</i>`;
+    b.addEventListener('click', () => setSkin(i));
+    skinRow.appendChild(b);
+  });
+  function refreshLook() {
+    for (const b of hatRow.children) b.classList.toggle('is-on', +b.dataset.i === ui.hat);
+    for (const b of skinRow.children) b.classList.toggle('is-on', +b.dataset.i === ui.skin);
+    setText(hatVal, hatName(ui.hat));
+    setText(skinVal, skinName(ui.skin));
+  }
+  function setHat(i) {
+    ui.hat = idx(i, HATS.length);
+    state.myHat = ui.hat;
+    localStorage.setItem(LS_HAT, String(ui.hat));
+    refreshLook();
+  }
+  function setSkin(i) {
+    ui.skin = idx(i, SKINS.length);
+    state.mySkin = ui.skin;
+    localStorage.setItem(LS_SKIN, String(ui.skin));
+    refreshLook();
+  }
+  refreshLook();
+
   state.myColor = ui.color;
   state.myName = ui.name;
+  state.myHat = ui.hat;
+  state.mySkin = ui.skin;
 
   nameInput.addEventListener('input', () => {
     ui.name = nameInput.value.slice(0, 16);
@@ -625,13 +727,24 @@ export function initUI(ctx) {
     const n = (nameInput.value || '').trim();
     return n || 'Deckhand';
   }
+  // name + colour + look are all committed the moment we hand them to the server
+  function commitIdentity(nm) {
+    state.myName = nm;
+    state.myColor = ui.color;
+    state.myHat = ui.hat;
+    state.mySkin = ui.skin;
+    localStorage.setItem(LS_NAME, nm);
+    localStorage.setItem(LS_HAT, String(ui.hat));
+    localStorage.setItem(LS_SKIN, String(ui.skin));
+  }
   function doCreate() {
     const nm = playerName();
-    state.myName = nm; state.myColor = ui.color;
-    localStorage.setItem(LS_NAME, nm);
+    commitIdentity(nm);
     send(MSG.CREATE_ROOM, {
       playerName: nm,
       color: ui.color,
+      hat: ui.hat,
+      skin: ui.skin,
       roomName: (roomNameInput.value || '').trim() || 'Tidewreck',
       maxPlayers: parseInt(maxPlayersInput.value, 10) || 4,
       difficulty,
@@ -641,9 +754,8 @@ export function initUI(ctx) {
     const code = (codeInput.value || '').toUpperCase().replace(/[^A-Z]/g, '');
     if (code.length !== 4) { toast('Island codes are 4 letters', 'bad'); codeInput.focus(); return; }
     const nm = playerName();
-    state.myName = nm; state.myColor = ui.color;
-    localStorage.setItem(LS_NAME, nm);
-    send(MSG.JOIN_ROOM, { playerName: nm, color: ui.color, code });
+    commitIdentity(nm);
+    send(MSG.JOIN_ROOM, { playerName: nm, color: ui.color, hat: ui.hat, skin: ui.skin, code });
   }
   menu.querySelector('#btnCreate').addEventListener('click', doCreate);
   menu.querySelector('#btnJoin').addEventListener('click', doJoin);
@@ -725,8 +837,15 @@ export function initUI(ctx) {
       if (isMe && typeof p.ready === 'boolean') ui.ready = p.ready;
       const row = el('div', 'player-row' + (isMe ? ' is-me' : '') + (p.ready ? ' is-ready' : ''));
       const ci = Math.max(0, Math.min(PLAYER_COLORS.length - 1, num(p.color, 0)));
+      // hat/skin ride along on ROOM_STATE now — absent on older payloads, so default to 0
+      const hi = idx(p.hat, HATS.length);
+      const si = idx(p.skin, SKINS.length);
       row.innerHTML =
         `<span class="pdot" style="--c:${hex(PLAYER_COLORS[ci])}"></span>` +
+        `<span class="plook" title="${escapeHTML(hatName(hi) + ' · ' + skinName(si) + ' skin')}">` +
+        `<span class="pskin" style="--c:${skinHex(si)}"></span>` +
+        `<span class="phat">${hatGlyph(hi)}</span>` +
+        `</span>` +
         `<span class="pname">${escapeHTML(p.name || 'Deckhand')}${isMe ? '<i class="you">you</i>' : ''}</span>` +
         (p.id === hostId ? `<span class="pcrown" title="host">${SVG_CROWN}</span>` : '') +
         `<span class="pready">${p.ready ? SVG_CHECK + '<b>ready</b>' : '<b class="dim">waiting…</b>'}</span>`;
@@ -2050,6 +2169,10 @@ export function initUI(ctx) {
     return null;
   }
   const TMP2 = { x: 0, y: 0, z: 0 };
+  // scratch for the boat helm lookup — a real Vector3 where possible, since
+  // boat.helmPos(out) writes into whatever it is handed.
+  const TMP3 = (ctx.THREE && ctx.THREE.Vector3) ? new ctx.THREE.Vector3() : { x: 0, y: 0, z: 0 };
+  const TMP4 = { x: 0, y: 0, z: 0 };
   function playerPos(out) {
     const pm = ctx.playerMod;
     const l = pm && pm.local;
@@ -2076,14 +2199,52 @@ export function initUI(ctx) {
     return { n, arts, built, ready };
   }
 
+  // ---- boat prompts -------------------------------------------
+  // The boat is a walkable platform: you can be driving (seat 0), standing on
+  // the deck by the wheel, or standing on the deck anywhere else. Older boat
+  // handles expose none of that — those fall back to the plain leave prompt.
+  function isDrivingBoat() {
+    if (Math.floor(num(state.seat, -1)) === 0) return true;
+    const b = ctx.boat;
+    if (b && typeof b.isDriver === 'function') {
+      try { return !!b.isDriver(); } catch (e) { /* boat not ready */ }
+    }
+    return false;
+  }
+  function helmDist(p) {
+    const b = ctx.boat;
+    if (!b || typeof b.helmPos !== 'function') return null;
+    let hp = null;
+    try { hp = b.helmPos(TMP3); } catch (e) { return null; }
+    const v = vecOf(hp, TMP4);
+    if (!v) return null;
+    return distXZ(p, v);
+  }
+  function onDeckNow(p) {
+    if (state.onDeck === true) return true;
+    if (state.onDeck === false) return false;
+    const b = ctx.boat;
+    if (b && typeof b.deckInfo === 'function') {
+      try { return !!b.deckInfo(p.x, p.z); } catch (e) { /* older boat handle */ }
+    }
+    return false;
+  }
+  function boatPrompt(p) {
+    if (isDrivingBoat()) return { kind: 'boat', d: 0, label: 'Release the wheel', act: null };
+    const hd = helmDist(p);
+    if (hd != null && hd <= 2) return { kind: 'boat', d: hd, label: 'Take the wheel', act: null };
+    if (onDeckNow(p)) return { kind: 'boat', d: 0, label: 'Hop off', act: null };
+    return { kind: 'boat', d: 0, label: 'Leave boat', act: null };
+  }
+
   function computeInteract() {
     if (effectivePhase() !== 'playing') return null;
     if (ui.shopOpen || ui.invOpen || ui.chatOpen) return null;
     if (num(state.hp, 100) <= 0) return null;
 
-    if (state.onBoat) return { kind: 'boat', label: 'Leave boat', act: null };
-
     const p = playerPos(TMP);
+    if (state.onBoat) return boatPrompt(p);
+
     const world = ctx.world;
     const cands = [];
 
@@ -2489,7 +2650,9 @@ export function initUI(ctx) {
 
     if (ui.phase === 'lobby') {
       const r = state.room;
-      const rev = r ? (String(r.code) + '|' + (Array.isArray(r.players) ? r.players.map((p) => p.id + ':' + (p.ready ? 1 : 0) + ':' + p.name).join(',') : '') + '|' + r.hostId) : '';
+      const rev = r ? (String(r.code) + '|' + (Array.isArray(r.players)
+        ? r.players.map((p) => p.id + ':' + (p.ready ? 1 : 0) + ':' + p.name + ':' + p.hat + ':' + p.skin).join(',')
+        : '') + '|' + r.hostId) : '';
       if (rev !== ui.roomRev) { ui.roomRev = rev; renderLobby(); }
       return;
     }
