@@ -30,6 +30,9 @@ export const MSG = {
   BONK_FISH: 'bonkFish',          // {flopperId, dmg} whack your landed catch to finish it
   PICKUP_FLOPPER: 'pickupFlopper',// {flopperId} grab your killed catch off the deck
   PICKUP_LOOT: 'pickupLoot',      // {lootId} grab an underwater treasure you are next to
+  REVIVE_TEAMMATE: 'reviveTeammate', // {targetId} finish a hold-E revive on a downed teammate (consumes Sea Salts)
+  USE_REVIVAL_KIT: 'useRevivalKit',  // {} self-revive while downed (consumes your Revival Kit)
+  TOW_BODY: 'towBody',            // {targetId|null} Rescue Claw: start/stop towing a downed teammate's body
 
   // server -> client
   ROOM_STATE: 'roomState',        // full lobby state {code, name, players:[], hostId, settings, started}
@@ -62,6 +65,35 @@ export const MSG = {
   LIGHTNING: 'lightning',         // {p:[x,y,z], targetId|null} a strike lands (storm hazard)
   LOOT_STATE: 'lootState',        // {areaId, list:[{id, type, p:[x,z]}]} live treasure nodes for your area
   LOOT_RESULT: 'lootResult',      // {ok, lootId, name, kind, value?, itemId?, uniqueId?, message}
+  REVIVED: 'revived',             // {id, by|null, hp} a downed player is back up ('by' null = self/sunrise)
+  BODY_TOWED: 'bodyTowed',        // {id, by|null} a downed body is being towed by the Rescue Claw (null = released)
+};
+
+// ---------------- Perfect cast ----------------
+// The cast power meter gets a marked sweet band near the top. Release inside
+// it = PERFECT THROW: bonus luck + faster bite for that one cast. The client
+// detects the timing (it owns the meter) and sends perfect:true in CAST_START;
+// the server caps the benefit to exactly these numbers.
+export const CAST_PERFECT = {
+  BAND: [0.78, 0.92],   // power fraction window (the two lines on the meter)
+  LUCK_BONUS: 0.45,     // added to total luck for that cast
+  BITE_SPEED_MULT: 1.35 // bite delay divided by this
+};
+
+// ---------------- Reviving ----------------
+// A downed player stays down where they fell (bodies sink underwater).
+// Sea Salts: hold E next to a downed teammate (not underwater) to revive them.
+// Revival Kit: expensive self-revive, press when downed. Rescue Claw: E on an
+// underwater body grabs it; it follows you until you surface/release.
+// Sunrise still revives everyone as the mercy backstop — but if the WHOLE crew
+// is down at once, the island gives up on you: instant doomsday tsunami.
+export const REVIVE = {
+  SALTS_HOLD_SECONDS: 3,   // hold-E channel time
+  SALTS_RANGE: 3,          // metres from the body
+  SALTS_HP: 0.5,           // revived at 50% hp
+  KIT_HP: 0.4,             // self-revive at 40% hp
+  CLAW_RANGE: 3.5,         // grab range for the Rescue Claw
+  NO_SALTS_UNDERWATER: true // bodies must be brought to air first (that's the claw's job)
 };
 
 // ---------------- Underwater loot (dive to find it) ----------------
@@ -274,6 +306,10 @@ export const SHOP = [
   { id: 'charm1', kind: 'charm', name: 'Bronze Talisman', price: 600,   luck: 0.10, desc: '+10% luck. A warm feeling.' },
   { id: 'charm2', kind: 'charm', name: 'Silver Talisman', price: 2500,  luck: 0.25, desc: '+25% luck. The sea winks at you.' },
   { id: 'charm3', kind: 'charm', name: 'Golden Talisman', price: 8000,  luck: 0.50, desc: '+50% luck. Mutations seek you out.' },
+  // revival gear (see REVIVE) - salts/kit are consumable, the claw is permanent
+  { id: 'salts',      kind: 'revive', name: 'Sea Salts',        price: 450,  pack: 1, desc: 'Hold E over a downed crewmate. Smells like regret; works like magic.' },
+  { id: 'rescueclaw', kind: 'revive', name: 'Rescue Claw',      price: 2500,          desc: 'Grab a sunken crewmate and tow them up. The sea does not keep what you can reach.' },
+  { id: 'revivalkit', kind: 'revive', name: 'Revival Kit',      price: 7500, pack: 1, desc: 'Adrenaline, bandages, and sheer spite. Gets YOU back up. Once.' },
   // diving gear (underwater time in seconds)
   { id: 'snorkel',  kind: 'diving', level: 2, name: 'Snorkel',    price: 200,  air: 40,  desc: 'Stay under 40s.' },
   { id: 'scuba',    kind: 'diving', level: 3, name: 'Scuba Tank', price: 1500, air: 120, desc: 'Stay under 2 minutes.' },
@@ -302,13 +338,15 @@ export const ECON = {
 // Server schedules one per night with rising odds; guaranteed by pityDay.
 // On EVENT_START every client: hard-cut the music, snap day->night, fog in.
 // Survive = keep the boat alive / reach the shallows before the timer ends.
+// bodyLength: the creature's rough visual length/height in metres — these
+// things are meant to dwarf the boat the way the Titanic dwarfs a dinghy.
 export const EVENTS = {
   serpent: { name: 'The Serpent',  firstDay: 3, pityDay: 6,  duration: 90,  unlocksFish: 'serpenthatchling',
-             desc: 'Something long is circling the boat.' },
+             bodyLength: 110, desc: 'Something long is circling the boat.' },
   kraken:  { name: 'The Kraken',   firstDay: 6, pityDay: 10, duration: 100, unlocksFish: 'krakenspawnling',
-             desc: 'Arms. So many arms. Break its grip and run.' },
+             bodyLength: 95,  desc: 'Arms. So many arms. Break its grip and run.' },
   bloop:   { name: 'The Bloop',    firstDay: 9, pityDay: 14, duration: 110, unlocksFish: 'bloopcalf',
-             desc: 'The sound arrives before it does. Nothing that big should exist.' },
+             bodyLength: 260, desc: 'The sound arrives before it does. Nothing that big should exist.' },
 };
 
 // ---------------- Enemies ----------------

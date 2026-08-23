@@ -284,3 +284,49 @@ then lunge). ui.js: loot pickup toasts, a special card for unique charms (name, 
 'ONE OF A KIND'), charm list somewhere visible (inventory panel), 'E — <loot name>' prompt,
 found-bait toasts. audio.js: chestOpen, pearlPop, coinScoop, relicHum, geodeChime,
 uniqueFanfare, jellySting, morayLunge, vault splash, pickup pop.
+
+## Wave 5 addendum — colossal events, faster Bloop, perfect cast, reviving, doomsday tsunami
+
+See constants: CAST_PERFECT, REVIVE, the new 'revive' SHOP items (salts / rescueclaw /
+revivalkit), EVENTS[].bodyLength, and MSG REVIVE_TEAMMATE / USE_REVIVAL_KIT / TOW_BODY /
+REVIVED / BODY_TOWED.
+
+**Events, colossal:** every event creature is rebuilt to its EVENTS[].bodyLength (serpent
+110 m, kraken 95 m of reach, bloop 260 m). The BLOOP is REMADE from scratch in events.js —
+no more scaled blob fish: a custom horror silhouette (colossal wrong-whale mass, a maw that
+splits half the head and opens to a glowing red throat, rows of dim red eyes down the flanks,
+barnacle-crusted ridges, tattered fins, red bio-glow veins, mist clinging to it) — and it is
+MUCH FASTER: it closes from the horizon in a fraction of the event, then carves fast passes
+around/under the boat (wake, displacement swell) instead of creeping. Serpent arcs breach
+higher than the island hills; kraken tentacles tower over any boat.
+
+**Perfect cast:** the power meter shows a marked sweet band at CAST_PERFECT.BAND (two lines).
+Release inside it = PERFECT THROW: golden flash + "PERFECT!" + distinct sfx, and CAST_START
+gains perfect:true. Server (fishing roll) grants exactly LUCK_BONUS extra luck and divides
+bite delay by BITE_SPEED_MULT for that cast only. fishing.js includes band info in its bus
+'castPower' payload ({p, band:[a,b]}) so ui draws the lines; the perfect determination happens
+in fishing.js at release.
+
+**Reviving (server-authoritative):** downed players stay where they fell (bodies keep their
+position; underwater bodies rest on the seabed). Living players see a downed marker. Revive
+paths: (1) Sea Salts — hold E within SALTS_RANGE of a downed teammate for SALTS_HOLD_SECONDS
+(client channels, then sends REVIVE_TEAMMATE; server validates range/salts count/not-underwater
+per REVIVE.NO_SALTS_UNDERWATER, consumes one, revives at SALTS_HP, broadcasts REVIVED);
+(2) Revival Kit — while downed, the owner presses the prompted key -> USE_REVIVAL_KIT (server
+consumes, revives at KIT_HP); (3) Rescue Claw (permanent tool) — E within CLAW_RANGE of a
+downed body underwater sends TOW_BODY {targetId}; the server marks towedBy and moves the body
+with the carrier (~1.5 m behind) until TOW_BODY {targetId:null}, the carrier goes down, or the
+body reaches air (auto-release). BODY_TOWED broadcasts state; clients render the towed body
+following the carrier. Buying: consumables stack (count in gear payload), claw is a one-time
+tool. Sunrise revive stays as the mercy backstop. Event-end mass-revive stays.
+
+**TEAM WIPE = DOOMSDAY:** whenever a death (any cause) leaves zero alive players, the server
+immediately broadcasts TSUNAMI {reason:'wipe'} and ends the run (GAME_OVER reason 'wipe' after
+the cinematic grace). No pity, no sunrise — the island takes its due.
+
+**Doomsday tsunami presentation:** on MSG.TSUNAMI the ui HIDES THE ENTIRE HUD (every chip,
+bar, hotbar, prompt — a css class on the hud root; only the cinematic and then the game-over
+screen remain; restore the hud on phase changes back to menu/lobby). events.js rebuilds the
+wave as a true doomsday: a curling water wall reaching HUNDREDS of metres up ("to the sky"),
+sky gone black-green, lightning flickering inside the wave face, glowing foam crest, the sea
+visibly drawn back first, building ground-shake, deep quake audio — then white-out.
