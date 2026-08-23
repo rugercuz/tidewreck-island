@@ -355,6 +355,21 @@ export class RoomManager {
 
     const text = sanitizeText(data.text, MAX_CHAT_LEN, '');
     if (!text) return;
+
+    // Host-only debug command: "/event serpent|kraken|bloop" force-starts a
+    // horror event (for playtesting — events otherwise wait for nightfall).
+    if (text.startsWith('/event ') && socket.id === room.hostId && room.game) {
+      const type = text.slice(7).trim().toLowerCase();
+      if (Array.isArray(room.game.eventsSurvived) && room.game.eventsSurvived.indexOf(type) !== -1) {
+        this.io.to(room.code).emit(MSG.CHAT_MSG, { fromName: 'ISLAND', text: `Already survived ${type}.` });
+        return;
+      }
+      if (typeof room.game.startEvent === 'function' && !room.game.eventActive) {
+        room.game.startEvent(type);
+      }
+      return;
+    }
+
     this.io.to(room.code).emit(MSG.CHAT_MSG, { fromName: member.name, text });
   }
 
