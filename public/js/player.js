@@ -33,6 +33,16 @@ const SWIM_ACCEL = 9;
 const SWIM_DEPTH_ENTER = 1.30;   // water depth needed to start swimming
 const SWIM_DEPTH_EXIT = 1.10;    // below this we stand up again
 const SURFACE_OFFSET = -1.15;    // feet offset from wave surface while floating
+
+// Water-exit vault: Space at the surface next to a climbable edge mantles you
+// out of the sea onto shore, dock decking or a boat hull.
+const VAULT_REACH = 0.9;         // how far ahead we probe for a ledge
+const VAULT_MIN_RISE = 0.2;      // ledge must stand at least this far out
+const VAULT_MAX_RISE = 1.6;      // ...and no higher than this to be grabbable
+const VAULT_UP = 6.5;
+const VAULT_FWD = 2.2;
+const VAULT_CD = 0.6;            // cooldown between vaults
+const VAULT_HOLD = 0.55;         // swimming stays suppressed this long after one
 const HEAD_STAND = 1.52;         // head height above feet, standing
 const HEAD_SWIM = 1.30;          // head height above "feet" anchor, swimming
 
@@ -1005,6 +1015,8 @@ export function initPlayer(ctx) {
   let lastMoveMsg = null;    // dedupe bus vs net delivery
   let lastWorldMsg = null;
   let boardCooldown = 0;
+  let vaultT = 0;            // swimming stays off while a vault is in the air
+  let vaultCd = 0;
   let wasKo = false;
   let netTime = 0;           // frame-driven clock used for remote interpolation
   let deckPrevYaw = null;    // boat yaw last frame, so the hull turns you with it
@@ -1064,14 +1076,17 @@ export function initPlayer(ctx) {
       try { ctx.net.send(type, data); } catch (e) { /* transport not ready */ }
     }
   }
+  function sfxSafe(name, opts) {
+    if (ctx.audio && typeof ctx.audio.sfx === 'function') {
+      try { ctx.audio.sfx(name, opts); } catch (e) { /* audio not ready */ }
+    }
+  }
   function splash(x, y, z, size) {
     if (ctx.water && typeof ctx.water.splash === 'function') {
       _v5.set(x, y, z);
       try { ctx.water.splash(_v5, size); } catch (e) { /* ignore */ }
     }
-    if (ctx.audio && typeof ctx.audio.sfx === 'function') {
-      try { ctx.audio.sfx('splash', { volume: clamp(size * 0.5, 0.15, 1) }); } catch (e) { /* ignore */ }
-    }
+    sfxSafe('splash', { volume: clamp(size * 0.5, 0.15, 1) });
   }
   function airCapacity() {
     const lvl = (ctx.state.gear && ctx.state.gear.diving) || 1;

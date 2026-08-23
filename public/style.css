@@ -1395,6 +1395,14 @@ kbd.wide { min-width: 54px; }
 .toast-bad .toast-dot { background: var(--coral); }
 .toast-warn { border-color: rgba(255, 202, 74, 0.55); }
 .toast-warn .toast-dot { background: var(--gold); }
+/* treasure: gold rim, faint glow, the text may wrap (loot names are long) */
+.toast-loot {
+  border-color: rgba(255, 202, 74, 0.6);
+  background: linear-gradient(180deg, rgba(255, 202, 74, 0.14), var(--panel));
+  box-shadow: var(--shadow-md), 0 0 22px rgba(255, 202, 74, 0.22);
+}
+.toast-loot .toast-dot { background: var(--gold); }
+.toast-loot .toast-text { color: #ffe9b4; white-space: normal; line-height: 1.35; }
 
 /* =================================================================
    END SCREENS
@@ -1677,7 +1685,8 @@ kbd.wide { min-width: 54px; }
   animation: bonkpulse 900ms ease-in-out infinite;
   white-space: nowrap;
 }
-.flopper-strip.has-live .fl-prompt { display: flex; }
+.flopper-strip.has-live .fl-prompt-bonk { display: flex; }
+.flopper-strip.has-pickup .fl-prompt-grab { display: flex; }
 .fl-prompt b { font-size: 14px; font-weight: 900; letter-spacing: 0.14em; color: var(--gold); }
 .fl-prompt span { font-size: 12px; font-weight: 800; letter-spacing: 0.05em; color: var(--text); }
 .fl-prompt kbd { min-width: 40px; height: 22px; font-size: 11px; }
@@ -1686,6 +1695,45 @@ kbd.wide { min-width: 54px; }
   0%, 100% { box-shadow: 0 0 0 2px rgba(255, 202, 74, 0.14), var(--shadow-md); }
   50% { box-shadow: 0 0 0 3px rgba(255, 202, 74, 0.3), 0 0 26px rgba(255, 202, 74, 0.4), var(--shadow-md); }
 }
+
+/* ---- wave 4: the finishing bonk leaves a pickup, not a stow ---- */
+.fl-grab {
+  display: none; margin-left: auto; flex: none;
+  font-size: 11px; font-weight: 900; letter-spacing: 0.18em;
+  color: #2c1c00;
+  padding: 3px 9px; border-radius: 999px;
+  background: linear-gradient(180deg, #fff0bb, var(--gold));
+  box-shadow: 0 0 14px rgba(255, 202, 74, 0.6);
+  animation: grabpulse 900ms ease-in-out infinite;
+}
+@keyframes grabpulse {
+  0%, 100% { box-shadow: 0 0 10px rgba(255, 202, 74, 0.45); transform: scale(1); }
+  50% { box-shadow: 0 0 22px rgba(255, 202, 74, 0.9); transform: scale(1.05); }
+}
+.flopper.is-dead .fl-pips { display: none; }
+.flopper.is-dead .fl-grab { display: block; }
+.flopper.is-dead {
+  border-color: var(--gold);
+  background: linear-gradient(180deg, rgba(255, 202, 74, 0.18), var(--panel));
+  box-shadow: var(--shadow-md), 0 0 26px rgba(255, 202, 74, 0.38);
+  animation: deadglow 1.6s ease-in-out infinite;
+}
+@keyframes deadglow {
+  0%, 100% { box-shadow: var(--shadow-md), 0 0 20px rgba(255, 202, 74, 0.28); }
+  50% { box-shadow: var(--shadow-md), 0 0 34px rgba(255, 202, 74, 0.55); }
+}
+.flopper.is-dead .fl-timer-fill { background: linear-gradient(90deg, #ffe08a, var(--gold)); box-shadow: 0 0 10px rgba(255, 202, 74, 0.55); }
+/* it stopped flopping — it bobs instead */
+.flopper.is-dead .fl-icon {
+  animation: flbob 1.5s ease-in-out infinite alternate;
+  filter: drop-shadow(0 4px 6px rgba(0, 0, 0, 0.55)) drop-shadow(0 0 10px rgba(255, 202, 74, 0.8));
+}
+@keyframes flbob {
+  from { transform: translateY(1px) rotate(-2deg); }
+  to { transform: translateY(-3px) rotate(2deg); }
+}
+.fl-prompt-grab { border-color: var(--gold); }
+.fl-prompt-grab b { color: var(--gold); }
 
 /* three at once still has to read — shrink the stack */
 .flopper-strip.is-crowd .flopper { padding: 6px 10px 6px 6px; }
@@ -1729,6 +1777,144 @@ kbd.wide { min-width: 54px; }
 }
 
 /* =================================================================
+   WAVE 4 — DIVING LOOT, UNIQUE CHARMS
+   ================================================================= */
+
+/* ---- "E — Pry open the Pearl Clam" ---- */
+.hud-prompt.is-loot {
+  border-color: var(--gold);
+  background: linear-gradient(180deg, rgba(255, 202, 74, 0.16), var(--panel));
+  box-shadow: 0 0 0 2px rgba(255, 202, 74, 0.2), 0 0 30px rgba(255, 202, 74, 0.35), var(--shadow-md);
+}
+.hud-prompt.is-loot span { color: #ffe9b4; }
+
+/* ---- ONE OF A KIND — the unique-charm card ----
+   Deliberately unlike the catch card: portrait gem, gold/violet rays,
+   no tier pill, no weight/value row. You get five of these per run, ever. */
+.unique-card {
+  position: absolute; left: 50%; top: 44%; transform: translate(-50%, -50%) scale(0.86);
+  width: 330px; padding: 24px 22px 20px;
+  border-radius: var(--r-xl);
+  text-align: center;
+  background:
+    radial-gradient(120% 80% at 50% 0%, rgba(255, 202, 74, 0.24), rgba(0, 0, 0, 0) 62%),
+    linear-gradient(180deg, rgba(46, 26, 74, 0.95), rgba(12, 6, 26, 0.96));
+  border: 2px solid var(--gold);
+  box-shadow: var(--shadow-lg), 0 0 70px rgba(255, 202, 74, 0.45), 0 0 120px rgba(169, 123, 255, 0.35);
+  -webkit-backdrop-filter: var(--blur); backdrop-filter: var(--blur);
+  opacity: 0; visibility: hidden; pointer-events: none;
+  overflow: hidden;
+  transition: opacity 260ms ease, visibility 260ms;
+}
+.unique-card.show { opacity: 1; visibility: visible; animation: uqIn 520ms cubic-bezier(.16, .9, .3, 1.4) forwards; }
+@keyframes uqIn {
+  0% { opacity: 0; transform: translate(-50%, -50%) scale(0.7); }
+  55% { opacity: 1; transform: translate(-50%, -50%) scale(1.06); }
+  100% { opacity: 1; transform: translate(-50%, -50%) scale(1); }
+}
+.uq-rays {
+  position: absolute; inset: -60%;
+  background: conic-gradient(from 0deg,
+    rgba(255, 202, 74, 0.30) 0deg, rgba(255, 202, 74, 0) 14deg,
+    rgba(169, 123, 255, 0.26) 40deg, rgba(255, 202, 74, 0) 62deg,
+    rgba(255, 202, 74, 0.30) 96deg, rgba(255, 202, 74, 0) 120deg,
+    rgba(169, 123, 255, 0.24) 168deg, rgba(255, 202, 74, 0) 200deg,
+    rgba(255, 202, 74, 0.28) 250deg, rgba(255, 202, 74, 0) 280deg,
+    rgba(169, 123, 255, 0.26) 320deg, rgba(255, 202, 74, 0) 356deg);
+  animation: spin 16s linear infinite;
+  pointer-events: none;
+}
+.uq-badge {
+  position: relative;
+  display: inline-block; padding: 4px 14px; border-radius: 999px;
+  font-size: 10px; font-weight: 900; letter-spacing: 0.34em;
+  color: #2c1c00;
+  background: linear-gradient(90deg, #fff1bd, var(--gold) 45%, #ffd97a);
+  box-shadow: 0 0 18px rgba(255, 202, 74, 0.7);
+}
+.uq-gem {
+  position: relative;
+  width: 92px; height: 92px; margin: 12px auto 6px;
+  filter: drop-shadow(0 0 18px rgba(255, 202, 74, 0.8));
+  animation: uqfloat 3.2s ease-in-out infinite;
+}
+@keyframes uqfloat {
+  0%, 100% { transform: translateY(0) rotate(-3deg); }
+  50% { transform: translateY(-8px) rotate(3deg); }
+}
+.uq-name {
+  position: relative;
+  font-size: 23px; font-weight: 900; line-height: 1.15; letter-spacing: 0.02em;
+  background: linear-gradient(100deg, #fff6dd 0%, var(--gold) 34%, #fff6dd 52%, #c79bff 100%);
+  background-size: 240% 100%;
+  -webkit-background-clip: text; background-clip: text; color: transparent;
+  animation: shimmer 3.4s linear infinite;
+}
+.uq-eff {
+  position: relative; margin-top: 8px;
+  font-size: 13px; font-weight: 900; letter-spacing: 0.06em;
+  color: #ffe9b4;
+}
+.uq-desc {
+  position: relative; margin-top: 6px;
+  font-size: 12px; line-height: 1.45; color: rgba(226, 214, 255, 0.82);
+  font-style: italic;
+}
+
+/* ---- charms strip in the catch bag ---- */
+.charm-strip { padding: 12px 18px 0; flex: none; }
+.cs-head {
+  font-size: 10px; font-weight: 900; letter-spacing: 0.3em; text-transform: uppercase;
+  color: var(--foam-dim); margin-bottom: 7px;
+}
+/* flex-start so a hovered chip grows on its own instead of stretching the row */
+.cs-list { display: flex; gap: 8px; flex-wrap: wrap; align-items: flex-start; }
+.cs-none { font-size: 12px; color: var(--text-faint); font-weight: 600; padding: 2px 0 4px; }
+.charm-chip {
+  display: flex; align-items: center; gap: 8px; min-height: 38px;
+  padding: 6px 12px 6px 8px; border-radius: 999px;
+  background: rgba(2, 16, 27, 0.55); border: 1.5px solid rgba(255, 255, 255, 0.09);
+  color: var(--text); font-family: inherit; text-align: left;
+  cursor: pointer; pointer-events: auto;
+  transition: border-color 140ms ease, box-shadow 140ms ease, background 140ms ease;
+}
+.charm-chip .ch-ico { width: 24px; height: 24px; flex: none; display: block; }
+.charm-chip .ch-body { display: flex; flex-direction: column; line-height: 1.15; min-width: 0; }
+.charm-chip .ch-body b { font-size: 12px; font-weight: 800; }
+.charm-chip .ch-body i {
+  font-style: normal; font-size: 10px; font-weight: 700; letter-spacing: 0.04em;
+  color: var(--foam-dim);
+  max-height: 0; opacity: 0; overflow: hidden;
+  transition: max-height 160ms ease, opacity 160ms ease, margin-top 160ms ease;
+}
+.charm-chip:hover .ch-body i,
+.charm-chip:focus-visible .ch-body i,
+.charm-chip.is-open .ch-body i { max-height: 22px; opacity: 1; margin-top: 2px; }
+.charm-chip:hover { border-color: var(--stroke-hot); background: rgba(142, 230, 242, 0.10); }
+.charm-chip .ch-tag {
+  flex: none; font-size: 8.5px; font-weight: 900; letter-spacing: 0.14em;
+  padding: 3px 7px; border-radius: 999px; line-height: 1;
+  color: #2c1c00; background: linear-gradient(180deg, #fff1bd, var(--gold));
+}
+.charm-chip.is-unique {
+  border-color: rgba(255, 202, 74, 0.6);
+  background: linear-gradient(180deg, rgba(255, 202, 74, 0.14), rgba(2, 16, 27, 0.55));
+  box-shadow: 0 0 16px rgba(255, 202, 74, 0.22);
+}
+.charm-chip.is-unique .ch-body b {
+  background: linear-gradient(100deg, #fff6dd, var(--gold) 40%, #c79bff);
+  -webkit-background-clip: text; background-clip: text; color: transparent;
+}
+.charm-chip.is-unique .ch-body i { color: #ffd98a; }
+
+/* found-only baits read as treasure, not stock */
+.bait-chip.is-found {
+  border-color: rgba(255, 202, 74, 0.5);
+  background: linear-gradient(180deg, rgba(255, 202, 74, 0.12), rgba(2, 16, 27, 0.55));
+}
+.bait-chip.is-found .bc-name { color: #ffe9b4; }
+
+/* =================================================================
    RESPONSIVE — comfortable down to 1280x720, usable below
    ================================================================= */
 @media (max-width: 1440px) {
@@ -1763,6 +1949,11 @@ kbd.wide { min-width: 54px; }
   .slot-sub { display: none; }
   .fish-grid { grid-template-columns: repeat(auto-fill, minmax(126px, 1fr)); }
   .sell-bar { flex-wrap: wrap; gap: 10px; }
+  .fl-prompt-grab span { display: none; }
+  .unique-card { width: min(300px, 88vw); padding: 20px 16px 16px; }
+  .uq-gem { width: 74px; height: 74px; }
+  .uq-name { font-size: 20px; }
+  .charm-chip .ch-body i { max-height: 22px; opacity: 1; margin-top: 2px; }
 }
 @media (max-height: 720px) {
   .title-block { margin-top: 0; }
@@ -1778,6 +1969,8 @@ kbd.wide { min-width: 54px; }
   .cast-power { bottom: 176px; }
   .reel-widget { bottom: 130px; }
   .flopper-strip { bottom: 172px; }
+  .unique-card { padding: 18px 18px 14px; }
+  .uq-gem { width: 72px; height: 72px; margin: 8px auto 4px; }
 }
 
 /* reduce motion */

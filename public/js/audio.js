@@ -1659,6 +1659,155 @@ export function initAudio(ctx) {
       noise(t + 0.1, 0.4, 0.1, sfxBus, { type: 'bandpass', f0: 1200, f1: 460, sweep: 0.35, Q: 1.1, atk: 0.01 });
     },
 
+    // ---------- wave 4: diving loot, ambushers, water exit ----------
+    // Everything down here is heard through water most of the time (uwFilter
+    // is already lowpassing the master), so the cues lean on low bodies and
+    // let the sparkle sit high enough to survive the muffling.
+    //
+    // a clam: wet suck, shell knock, then the pearl's tiny halo
+    pearlPop(t, o) {
+      noise(t, 0.18, 0.14, sfxBus, { type: 'bandpass', f0: 620, f1: 1500, sweep: 0.14, Q: 2.4, atk: 0.02 });
+      tone('sine', 320, t + 0.1, 0.09, 0.2, sfxBus, { f1: 1150, glide: 0.045, atk: 0.001, rev: revS });
+      noise(t + 0.1, 0.05, 0.12, sfxBus, { type: 'highpass', f0: 3800, atk: 0.001 });
+      bell(t + 0.14, mtof(93), 0.1, 1.1, sfxBus, revL);
+      bell(t + 0.27, mtof(100), 0.06, 1.5, sfxBus, revL);
+      SFX.bubble(t + 0.05, EMPTY);
+      SFX.bubble(t + 0.14, EMPTY);
+    },
+    // a strapped chest: latch, long hinge creak, lid thump, then gold
+    chestOpen(t, o) {
+      noise(t, 0.05, 0.22, sfxBus, { type: 'bandpass', f0: 2200, Q: 4, atk: 0.001 });
+      tone('square', 380, t, 0.06, 0.1, sfxBus, { f1: 190, atk: 0.001, filter: 'lowpass', ff0: 2200 });
+      tone('sawtooth', 88, t + 0.08, 0.95, 0.06, sfxBus, {
+        f1: 168, glide: 0.85, filter: 'bandpass', ff0: 620, fq: 9, atk: 0.12, rev: revM,
+      });
+      noise(t + 0.1, 0.8, 0.05, sfxBus, { type: 'bandpass', f0: 900, f1: 1500, sweep: 0.7, Q: 7, atk: 0.15 });
+      tone('sine', 120, t + 0.92, 0.26, 0.16, sfxBus, { f1: 54, glide: 0.18, atk: 0.003 });
+      noise(t + 0.92, 0.12, 0.12, sfxBus, { type: 'lowpass', f0: 900, Q: 1.2, atk: 0.002 });
+      // soft gold shimmer off the hoard inside
+      for (let i = 0; i < 5; i++) {
+        bell(t + 1.0 + i * 0.07, mtof(84 + (i % 3) * 4 + (i > 2 ? 12 : 0)), 0.055, 1.4, sfxBus, revL);
+      }
+      noise(t + 1.02, 0.9, 0.035, sfxBus, { type: 'highpass', f0: 7000, atk: 0.08, rev: revL });
+      for (let i = 0; i < 3; i++) SFX.bubble(t + 0.12 + i * 0.09, EMPTY);
+    },
+    // a coin stash: a cascade, not a jingle
+    coinScoop(t, o) {
+      for (let i = 0; i < 13; i++) {
+        const tt = t + i * 0.026 + Math.random() * 0.02;
+        const f = mtof(88 + Math.floor(Math.random() * 12));
+        tone('triangle', f, tt, 0.14, 0.07, sfxBus, { atk: 0.001, pan: (Math.random() - 0.5) * 1.1, rev: revS });
+        if (i % 3 === 0) noise(tt, 0.03, 0.05, sfxBus, { type: 'highpass', f0: 5200, atk: 0.001 });
+      }
+      noise(t, 0.5, 0.06, sfxBus, { type: 'bandpass', f0: 2600, Q: 1.4, atk: 0.02, rev: revM });
+      tone('sine', 150, t, 0.3, 0.08, sfxBus, { f1: 80, atk: 0.006 });
+    },
+    // a bottle: twist, hollow pop, air into the neck
+    bottleUncork(t, o) {
+      noise(t, 0.22, 0.09, sfxBus, { type: 'bandpass', f0: 700, f1: 1800, sweep: 0.2, Q: 3, atk: 0.03 });
+      tone('sine', 900, t + 0.22, 0.09, 0.3, sfxBus, { f1: 180, glide: 0.05, atk: 0.001, rev: revS });
+      noise(t + 0.22, 0.04, 0.14, sfxBus, { type: 'bandpass', f0: 1800, Q: 6, atk: 0.001 });
+      noise(t + 0.26, 0.5, 0.06, sfxBus, { type: 'bandpass', f0: 1400, f1: 3200, sweep: 0.4, Q: 2.2, atk: 0.04, rev: revS });
+      for (let i = 0; i < 3; i++) SFX.bubble(t + 0.3 + i * 0.08, EMPTY);
+    },
+    // a relic: stone grinding free, then something older humming
+    relicHum(t, o) {
+      const root = 41;
+      tone('sine', mtof(root), t, 3.0, 0.22, sfxBus, { atk: 0.35, hold: 1.4, rev: revL });
+      tone('sine', mtof(root + 12), t + 0.1, 2.6, 0.1, sfxBus, { atk: 0.5, hold: 1.1, rev: revL });
+      tone('triangle', mtof(root + 19), t + 0.2, 2.2, 0.05, sfxBus, { atk: 0.6, hold: 0.9, rev: revL });
+      noise(t, 0.7, 0.1, sfxBus, { type: 'bandpass', f0: 420, f1: 190, sweep: 0.6, Q: 2.6, atk: 0.02 });
+      tone('sawtooth', 62, t, 2.4, 0.05, sfxBus, {
+        f1: 47, glide: 2.0, filter: 'lowpass', ff0: 380, fq: 3, atk: 0.4, shape: 'soft',
+      });
+    },
+    // a geode: the shell cracks, the inside rings
+    geodeChime(t, o) {
+      noise(t, 0.09, 0.2, sfxBus, { type: 'bandpass', f0: 2000, Q: 3, atk: 0.001 });
+      tone('sine', 210, t, 0.18, 0.12, sfxBus, { f1: 90, glide: 0.12, atk: 0.002 });
+      const notes = [79, 84, 88, 91, 96];
+      for (let i = 0; i < notes.length; i++) {
+        bell(t + 0.06 + i * 0.075, mtof(notes[i]), 0.12 - i * 0.008, 2.2 - i * 0.14, sfxBus, revL);
+        tone('sine', mtof(notes[i] + 12), t + 0.06 + i * 0.075, 0.5, 0.03, sfxBus, {
+          atk: 0.002, pan: Math.sin(i * 1.9) * 0.7,
+        });
+      }
+      noise(t + 0.1, 1.4, 0.04, sfxBus, { type: 'highpass', f0: 8000, atk: 0.1, rev: revL });
+    },
+    // ONE OF A KIND. Deliberately not the catch fanfare: no rising arpeggio,
+    // just an indrawn breath, a held chord and the moment it opens.
+    // o.delay lets a caller slide it past a chest lid that is still creaking.
+    uniqueFanfare(t, o) {
+      const t0 = t + cl(o && o.delay, 0, 3, 0);
+      noise(t0, 0.9, 0.06, sfxBus, {
+        type: 'bandpass', f0: 900, f1: 4200, sweep: 0.8, Q: 1.6, atk: 0.25, rev: revL, prio: true,
+      });
+      const sus = [57, 64, 69, 76];          // held, unresolved
+      for (let i = 0; i < sus.length; i++) {
+        tone('triangle', mtof(sus[i]), t0 + 0.25, 1.5, 0.085, sfxBus, {
+          atk: 0.25, hold: 0.7, rev: revL, prio: true,
+        });
+      }
+      const open = [60, 67, 72, 79, 84];     // and it lands
+      for (let i = 0; i < open.length; i++) {
+        bell(t0 + 1.15 + i * 0.05, mtof(open[i]), 0.15, 3.2, sfxBus, revL);
+      }
+      tone('sine', mtof(36), t0 + 1.1, 3.4, 0.24, sfxBus, { atk: 0.06, hold: 1.6, prio: true });
+      for (let i = 0; i < 8; i++) {
+        tone('sine', mtof(96 + Math.floor(Math.random() * 12)), t0 + 1.2 + i * 0.09, 0.7, 0.035, sfxBus, {
+          atk: 0.004, pan: (Math.random() - 0.5) * 1.4, rev: revL,
+        });
+      }
+      duckAmbience(0.35, 2.4);
+    },
+    // dagger jelly: a wet slap of the bell, then the venom goes in
+    jellySting(t, o) {
+      noise(t, 0.12, 0.18, sfxBus, { type: 'bandpass', f0: 900, f1: 380, sweep: 0.1, Q: 1.6, atk: 0.002 });
+      for (let i = 0; i < 6; i++) {
+        noise(t + 0.02 + i * 0.014, 0.05, 0.1, sfxBus, {
+          type: 'bandpass', f0: 2400 + Math.random() * 3000, Q: 18, atk: 0.001, pan: (Math.random() - 0.5) * 1.1,
+        });
+      }
+      tone('sawtooth', 1400, t + 0.02, 0.4, 0.09, sfxBus, {
+        f1: 260, glide: 0.34, filter: 'bandpass', ff0: 1800, ff1: 500, fsweep: 0.34, fq: 8,
+        atk: 0.002, shape: 'hard', rev: revS,
+      });
+      tone('sine', 190, t, 0.45, 0.16, sfxBus, { f1: 70, glide: 0.35, atk: 0.003 });
+      for (let i = 0; i < 3; i++) SFX.bubble(t + 0.06 + i * 0.06, EMPTY);
+    },
+    // an ambusher uncoiling out of the seabed: shoved water, hiss, bubble cloud
+    morayLunge(t, o) {
+      noise(t, 0.5, 0.26, sfxBus, {
+        type: 'lowpass', f0: 500, f1: 2400, sweep: 0.22, Q: 1.1, atk: 0.006, brown: true, rev: revM, prio: true,
+      });
+      noise(t + 0.04, 0.6, 0.14, sfxBus, { type: 'highpass', f0: 3400, atk: 0.02 });
+      tone('sine', 60, t, 0.7, 0.24, sfxBus, { f1: 140, glide: 0.5, atk: 0.004 });
+      tone('sawtooth', 240, t + 0.05, 0.5, 0.08, sfxBus, {
+        f1: 90, glide: 0.42, filter: 'bandpass', ff0: 700, fq: 6, atk: 0.01, shape: 'soft',
+      });
+      for (let i = 0; i < 9; i++) SFX.bubble(t + 0.02 + i * 0.045, EMPTY);
+    },
+    // hauling yourself out of the water: effort, water letting go, a knee landing
+    vault(t, o) {
+      tone('sawtooth', 168, t, 0.3, 0.09, sfxBus, {
+        f1: 116, glide: 0.26, filter: 'bandpass', ff0: 700, fq: 6, atk: 0.012, shape: 'soft',
+      });
+      tone('sawtooth', 168, t, 0.24, 0.045, sfxBus, {
+        f1: 116, glide: 0.22, filter: 'bandpass', ff0: 1240, fq: 9, atk: 0.012,
+      });
+      SFX.splash(t, { size: 1.1 });
+      noise(t + 0.04, 0.45, 0.12, sfxBus, { type: 'bandpass', f0: 1600, f1: 520, sweep: 0.36, Q: 1.1, atk: 0.01, rev: revS });
+      tone('sine', 140, t + 0.3, 0.22, 0.14, sfxBus, { f1: 62, glide: 0.16, atk: 0.003 });
+      noise(t + 0.3, 0.13, 0.12, sfxBus, { type: 'lowpass', f0: 950, Q: 1.3, atk: 0.002 });
+    },
+    // scooping up a glowing pickup — bright, short, immediately over
+    pickupPop(t, o) {
+      tone('sine', 520, t, 0.1, 0.2, sfxBus, { f1: 1180, glide: 0.06, atk: 0.002, rev: revS });
+      tone('triangle', 780, t + 0.04, 0.13, 0.09, sfxBus, { f1: 1560, glide: 0.08, atk: 0.002 });
+      noise(t, 0.09, 0.07, sfxBus, { type: 'bandpass', f0: 3200, f1: 6000, sweep: 0.07, Q: 2, atk: 0.002 });
+      bell(t + 0.07, mtof(93), 0.08, 0.7, sfxBus, revS);
+    },
+
     // ---------- shop / progression (boat.js, ui.js) ----------
     upgrade(t, o) {
       const lv = clamp(Math.round(o.level || 2), 1, 6);
@@ -1799,6 +1948,19 @@ export function initAudio(ctx) {
     win: 'gameWon', victory: 'gameWon', lose: 'gameOver', defeat: 'gameOver', gameLost: 'gameOver',
     tsunamiWarning: 'warning', deadline: 'warning',
     cutMusic: 'musicCut', stopMusic: 'musicStop', musicFade: 'musicStop',
+    // wave 4: diving loot, ambushers, water exit
+    lootChest: 'chestOpen', chest: 'chestOpen', openChest: 'chestOpen',
+    clam: 'pearlPop', pearl: 'pearlPop', lootClam: 'pearlPop',
+    coins: 'coinScoop', coinPile: 'coinScoop', lootCoins: 'coinScoop', goldScoop: 'coinScoop',
+    bottle: 'bottleUncork', uncork: 'bottleUncork', lootBottle: 'bottleUncork',
+    relic: 'relicHum', lootRelic: 'relicHum', artifactHum: 'relicHum',
+    geode: 'geodeChime', lootGeode: 'geodeChime', crystal: 'geodeChime',
+    unique: 'uniqueFanfare', uniqueCharm: 'uniqueFanfare', charmFound: 'uniqueFanfare',
+    jelly: 'jellySting', sting: 'jellySting', daggerjelly: 'jellySting', venom: 'jellySting',
+    moray: 'morayLunge', ambush: 'morayLunge', lunge: 'morayLunge', depthmaw: 'morayLunge',
+    climbOut: 'vault', vaultOut: 'vault', waterExit: 'vault', haulOut: 'vault',
+    pickup: 'pickupPop', grab: 'pickupPop', pickupFlopper: 'pickupPop',
+    collect: 'pickupPop', lootPickup: 'pickupPop',
     // ui
     blip: 'uiBlip', click: 'uiBlip', uiClick: 'uiBlip', select: 'uiBlip', tick: 'uiBlip',
     open: 'uiOpen', menuOpen: 'uiOpen', shopOpen: 'uiOpen',
@@ -1822,6 +1984,10 @@ export function initAudio(ctx) {
     gameWon: 2.0, gameOver: 2.0,
     eventDrone: 1.0, eventDepart: 1.5,
     jump: 0.12, jumpThud: 0.1,
+    // wave 4 — LOOT_RESULT arrives over net AND (usually) over the bus
+    chestOpen: 0.6, pearlPop: 0.25, coinScoop: 0.45, bottleUncork: 0.4,
+    relicHum: 0.7, geodeChime: 0.5, uniqueFanfare: 2.5,
+    jellySting: 0.12, morayLunge: 0.3, vault: 0.25, pickupPop: 0.12,
   };
 
   let tickCount = 0;
@@ -2194,6 +2360,7 @@ export function initAudio(ctx) {
     bus.on('phase', (p) => onPhase(p));
     bus.on('quotaDone', () => sfxDedup('quotaDone', EMPTY, 1.0));
     bus.on('flopper', (d) => onFlopper(d));
+    bus.on('lootResult', (d) => onLootResult(d));
     bus.on('weather', (d) => setWeatherType(d && d.type ? d.type : d));
     bus.on('lightning', (d) => onLightning(d));
     bus.on('tsunami', () => { cutMusic(); sfxDedup('tsunamiRoar', EMPTY, 3); });
@@ -2307,12 +2474,35 @@ export function initAudio(ctx) {
     }
   }
 
+  // wave 4: 'dead' no longer means banked — the fish stops flopping and turns
+  // into a pickup, and 'stowed' is the moment it actually reaches the bag.
   function onFlopper(d) {
     if (!d) return;
     const st = d.state;
     if (st === 'hit') sfxDedup('bonk', EMPTY, 0.2);
-    else if (st === 'dead') sfxDedup('stow', EMPTY, 0.35);
+    else if (st === 'dead') sfxDedup('stow', EMPTY, 0.35);        // the finishing whack
+    else if (st === 'stowed') sfxDedup('pickupPop', EMPTY, 0.25); // scooped off the deck
     else if (st === 'escaped') sfxDedup('flopperEscape', EMPTY, 0.5);
+  }
+
+  // --- wave 4: underwater loot ------------------------------------------
+  // LOOT_RESULT.kind is the LOOT_TYPES id the node was rolled from.
+  const LOOT_CUE = {
+    clam: 'pearlPop', coins: 'coinScoop', bottle: 'bottleUncork',
+    chest: 'chestOpen', relic: 'relicHum', geode: 'geodeChime',
+  };
+  function onLootResult(d) {
+    if (!d) return;
+    if (d.ok === false) { sfxDedup('error', EMPTY, 0.3); return; }
+    const kind = typeof d.kind === 'string' ? d.kind : (typeof d.type === 'string' ? d.type : '');
+    const cue = LOOT_CUE[kind] || 'pickupPop';
+    sfxDedup(cue, EMPTY, 0.3);
+    // a found bait stack gets its own little scoop; a unique charm outranks it
+    if (d.itemId && !d.uniqueId) sfxDedup('pickupPop', EMPTY, 0.25);
+    if (d.uniqueId) {
+      // hold the motif until the chest lid has finished creaking open
+      sfxDedup('uniqueFanfare', { delay: cue === 'chestOpen' ? 0.95 : 0.2 }, 2.5);
+    }
   }
 
   function onPhase(p) {
@@ -2355,6 +2545,7 @@ export function initAudio(ctx) {
       net.on(MSG.WEATHER, (d) => { if (d && typeof d.type === 'string') setWeatherType(d.type); });
       net.on(MSG.LIGHTNING, (d) => onLightning(d));
       net.on(MSG.FLOPPER, (d) => onFlopper(d));
+      net.on(MSG.LOOT_RESULT, (d) => onLootResult(d));
       net.on(MSG.WALLET, (d) => onWallet(d));
       net.on(MSG.PORTAL_STATE, (d) => onPortal(d));
       net.on(MSG.TSUNAMI_WARNING, (d) => sfxDedup('warning', d || EMPTY, 5));

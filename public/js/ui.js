@@ -8,6 +8,7 @@
 import {
   MSG, MUTATIONS, FISH, ARTIFACTS, AREAS, SHOP, ECON, EVENTS,
   PLAYER_COLORS, PLAYER_MAX_HP, WEATHER, FLOPPER,
+  LOOT_TYPES, FOUND_BAITS, UNIQUE_CHARMS,
   fishById, shopById, quotaTarget, wardPrice,
 } from '/shared/constants.js';
 
@@ -36,6 +37,7 @@ const LS_NAME = 'tidewreck.name';
 const LS_COLOR = 'tidewreck.color';
 const LS_HAT = 'tidewreck.hat';
 const LS_SKIN = 'tidewreck.skin';
+const LS_DIVEHINT = 'tidewreck.divehint';
 const TAU = Math.PI * 2;
 
 function hex(c) { return '#' + ((c >>> 0) & 0xffffff).toString(16).padStart(6, '0'); }
@@ -177,9 +179,13 @@ function weaponIcon(id) {
   return '<svg viewBox="0 0 32 32" class="ico"><path d="M6 26 L24 8" stroke="#8a5c3a" stroke-width="2.8" stroke-linecap="round"/><path d="M24 8 l4 -4 -1.5 6.5z" fill="#cfe2f0"/><path d="M22 10 l-4 -1 2 4z" fill="#cfe2f0"/></svg>';
 }
 function baitIcon(id) {
-  const cols = { worms: '#d08a6a', shrimp: '#f2a06a', squidbait: '#c86a86', glowbait: '#6ef0d0', voidbait: '#9a5cff' };
+  const cols = {
+    worms: '#d08a6a', shrimp: '#f2a06a', squidbait: '#c86a86', glowbait: '#6ef0d0', voidbait: '#9a5cff',
+    glowgrub: '#b6f05a', abyssleech: '#ff5c9a',
+  };
   const c = cols[id] || '#9fd8ff';
-  const glow = (id === 'glowbait' || id === 'voidbait') ? `<circle cx="16" cy="16" r="11" fill="${c}" opacity=".18"/>` : '';
+  const glow = (id === 'glowbait' || id === 'voidbait' || id === 'glowgrub' || id === 'abyssleech')
+    ? `<circle cx="16" cy="16" r="11" fill="${c}" opacity=".18"/>` : '';
   return `<svg viewBox="0 0 32 32" class="ico">${glow}<path d="M10 20 q2 -8 7 -9 q6 -1 5 5 q-1 5 -6 6 q-5 1 -6 -2z" fill="${c}" stroke="rgba(0,0,0,.35)" stroke-width="1"/><circle cx="19" cy="14" r="1.4" fill="#101820"/></svg>`;
 }
 function shopKindIcon(kind, item) {
@@ -407,6 +413,74 @@ function fishIcon(fishId, mutation, size = 128) {
   return url;
 }
 
+// ---------------------------------------------------------------
+// Wave 4 — diving loot, found baits, unique charms
+// ---------------------------------------------------------------
+// The E prompt reads as a verb: "E — Pry open the Pearl Clam".
+const LOOT_VERB = {
+  clam: 'Pry open the', coins: 'Scoop up the', bottle: 'Uncork the',
+  chest: 'Crack open the', relic: 'Lift the', geode: 'Chip out the',
+};
+// payloads may name the type as `type` or `kind`; some only carry the name
+function lootTypeOf(d) {
+  if (!d) return '';
+  const k = d.type || d.kind || d.lootType;
+  if (typeof k === 'string' && LOOT_TYPES[k]) return k;
+  const n = d.name;
+  if (typeof n === 'string') {
+    for (const id in LOOT_TYPES) { if (LOOT_TYPES[id].name === n) return id; }
+  }
+  return '';
+}
+function lootName(d) {
+  const k = lootTypeOf(d);
+  const n = d && typeof d.name === 'string' ? d.name : '';
+  return n || (k ? LOOT_TYPES[k].name : 'Something down there');
+}
+function lootPromptLabel(d) {
+  const k = lootTypeOf(d);
+  return (LOOT_VERB[k] || 'Take the') + ' ' + lootName(d);
+}
+// cut gem, gold crown into a violet pavilion — no gradient defs, because this
+// glyph is rendered in several places at once and duplicate ids are a trap
+const SVG_LOOT_GEM =
+  '<svg viewBox="0 0 32 32" class="ico">' +
+  '<path d="M11 4h10l6 8-11 16L5 12z" fill="#ffca4a" stroke="#fff3cf" stroke-width="1.2" stroke-linejoin="round"/>' +
+  '<path d="M11 4l5 8 5-8z" fill="#ffe9a8" opacity=".9"/>' +
+  '<path d="M16 12L5 12l11 16z" fill="#e0a52c" opacity=".8"/>' +
+  '<path d="M16 12h11l-11 16z" fill="#a97bff" opacity=".55"/>' +
+  '<path d="M5 12h22" fill="none" stroke="rgba(255,255,255,.6)" stroke-width="1"/></svg>';
+
+// one readable line per unique effect (the server applies the real maths)
+function uniqueEffect(def) {
+  if (!def) return '';
+  const pct = (m) => Math.round((num(m, 1) - 1) * 100);
+  switch (def.effect) {
+    case 'airMult': return '+' + pct(def.mult) + '% air underwater';
+    case 'biteSpeed': return 'bites ' + pct(def.mult) + '% faster';
+    case 'meleeMult': return '+' + pct(def.mult) + '% melee damage';
+    case 'luckAdd': return '+' + Math.round(num(def.add, 0) * 100) + '% luck';
+    case 'sellMult': return 'fish sell for +' + pct(def.mult) + '%';
+    default: return def.desc || '';
+  }
+}
+
+// Baits you can hold = the shop's list PLUS the found-only ones out of chests.
+// Found baits are never purchasable, so they only ever show up once you own some.
+const BAIT_DEFS = SHOP.filter((s) => s.kind === 'bait').concat(
+  FOUND_BAITS.map((b) => ({
+    kind: 'bait', found: true, id: b.id, name: b.name, pack: b.pack,
+    tierBias: b.tierBias, luck: b.luck, desc: b.desc, price: 0,
+  })));
+function baitById(id) {
+  for (let i = 0; i < BAIT_DEFS.length; i++) if (BAIT_DEFS[i].id === id) return BAIT_DEFS[i];
+  return null;
+}
+function foundBaitById(id) {
+  for (let i = 0; i < FOUND_BAITS.length; i++) if (FOUND_BAITS[i].id === id) return FOUND_BAITS[i];
+  return null;
+}
+
 function mutName(fishName, mutation) {
   if (mutation && MUTATIONS[mutation]) return MUTATIONS[mutation].name.toUpperCase() + ' ' + fishName;
   return fishName;
@@ -450,6 +524,11 @@ export function initUI(ctx) {
     catchTimer: 0,
     dedupe: new Map(),
     interact: null,
+    lootNear: null,        // {lootId, name, type} from bus 'lootNear'
+    lootKnown: false,      // any LOOT_STATE seen -> the seabed hint is worth showing
+    diveHinted: false,
+    uniques: [],           // unique charm ids claimed by ME this run
+    uqTimer: 0,
     castPowerT: -99,
     reelT: -99,
     reelOn: false,
@@ -1012,9 +1091,19 @@ export function initUI(ctx) {
       <div class="cc-record" id="ccRecord">PERSONAL BEST</div>
     </div>
 
+    <div class="unique-card" id="uniqueCard">
+      <div class="uq-rays"></div>
+      <div class="uq-badge">ONE OF A KIND</div>
+      <div class="uq-gem" id="uqGem">${SVG_LOOT_GEM}</div>
+      <div class="uq-name" id="uqName">Charm</div>
+      <div class="uq-eff" id="uqEff"></div>
+      <div class="uq-desc" id="uqDesc"></div>
+    </div>
+
     <div class="flopper-strip" id="flopperStrip">
       <div class="flopper-rows" id="flopperRows"></div>
-      <div class="fl-prompt"><b>BONK IT</b><span>before it escapes!</span><kbd>LMB</kbd><i>up close</i></div>
+      <div class="fl-prompt fl-prompt-bonk"><b>BONK IT</b><span>before it escapes!</span><kbd>LMB</kbd><i>up close</i></div>
+      <div class="fl-prompt fl-prompt-grab"><b>GRAB IT</b><span>it stopped moving — pick it up</span><kbd>E</kbd><i>or walk over it</i></div>
     </div>
 
     <div class="lightning-flash" id="lightningFlash"></div>
@@ -1047,6 +1136,7 @@ export function initUI(ctx) {
   const elSlotRod = $('slotRod'), elSlotWeapon = $('slotWeapon'), elInvSub = $('invSub');
   const elWeatherChip = $('weatherChip'), elWxIco = $('wxIco'), elWxName = $('wxName'), elWxHint = $('wxHint');
   const elFlopStrip = $('flopperStrip'), elFlopRows = $('flopperRows'), elLightning = $('lightningFlash');
+  const elUnique = $('uniqueCard'), elUqName = $('uqName'), elUqEff = $('uqEff'), elUqDesc = $('uqDesc');
 
   const RING_LEN = TAU * 26;
   elReelRing.style.strokeDasharray = RING_LEN.toFixed(2);
@@ -1097,6 +1187,7 @@ export function initUI(ctx) {
         <button class="btn btn-ghost btn-x" id="invClose">✕</button>
       </div>
       <div class="bait-strip" id="baitStrip"></div>
+      <div class="charm-strip" id="charmStrip"></div>
       <div class="inv-body" id="invBody"></div>
     </div>`;
   root.appendChild(modalLayer);
@@ -1114,6 +1205,7 @@ export function initUI(ctx) {
   const elSqTxt = modalLayer.querySelector('#sqTxt');
   const elInvBody = modalLayer.querySelector('#invBody');
   const elBaitStrip = modalLayer.querySelector('#baitStrip');
+  const elCharmStrip = modalLayer.querySelector('#charmStrip');
   const elInvSummary = modalLayer.querySelector('#invSummary');
 
   modalLayer.querySelector('#modalScrim').addEventListener('click', () => closeAll());
@@ -1241,7 +1333,7 @@ export function initUI(ctx) {
     if (!force && p === ui.phase) return;
     ui.phase = p;
     root.dataset.phase = p;
-    if (p !== 'playing') { closeShop(); closeInventory(); closeChat(false); clearFloppers(); }
+    if (p !== 'playing') { closeShop(); closeInventory(); closeChat(false); clearFloppers(); ui.lootNear = null; }
     if (p === 'lobby') renderLobby();
     if (p === 'playing') { refreshHUDFromState(); refreshHotbar(); }
   }
@@ -1312,7 +1404,7 @@ export function initUI(ctx) {
     // weather rides along on WORLD_STATE (may be absent on older payloads)
     if (w.weather && typeof w.weather.type === 'string') setWeather(w.weather.type);
 
-    // gear may ride along on world.players
+    // gear (and now unique charms) may ride along on world.players
     if (Array.isArray(w.players)) {
       const me = myId();
       const mine = w.players.find((p) => p && p.id === me);
@@ -1321,6 +1413,7 @@ export function initUI(ctx) {
         refreshHotbar();
       }
     }
+    if (ui.invOpen) renderCharmStrip();
   }
 
   function showArtifactBanner(id) {
@@ -1392,7 +1485,7 @@ export function initUI(ctx) {
         : '<span class="fl-icon fl-icon-blank"></span>') +
       `<div class="fl-main">` +
       `<div class="fl-top"><b class="fl-name${fish && fish.mutation ? ' mut-' + fish.mutation : ''}">${escapeHTML(name)}</b>` +
-      `<span class="fl-pips"></span></div>` +
+      `<span class="fl-pips"></span><b class="fl-grab">GRAB IT!</b></div>` +
       `<div class="fl-timer"><div class="fl-timer-fill"></div><span class="fl-timer-txt"></span></div>` +
       `</div>` +
       `<div class="fl-verdict"></div>`;
@@ -1408,6 +1501,8 @@ export function initUI(ctx) {
       // the server may state its own window; fall back to the shared constant
       escapeS: Math.max(3, num(d && d.escapeSeconds, ESCAPE_S)),
       spawn: performance.now(), done: false, removeAt: 0,
+      // 'alive' = bonk it · 'dead' = it is a pickup now · done = stowed/lost
+      state: 'alive', deadAt: 0,
     };
     floppers.set(id, rec);
     paintPips(rec);
@@ -1424,9 +1519,26 @@ export function initUI(ctx) {
     rec.el.classList.toggle('is-hurt', frac <= 0.34);
   }
 
+  // wave 4: the killing bonk does NOT bank the fish any more. It stops
+  // flopping and becomes a glowing pickup — the row switches from hp pips to
+  // "grab it" and only leaves on 'stowed' (or the server's auto-bank).
+  function pickupFlopper(id, d) {
+    const rec = floppers.get(id) || addFlopper(id, d);
+    if (!rec || rec.done || rec.state === 'dead') return;
+    rec.state = 'dead';
+    rec.hp = 0;
+    rec.deadAt = performance.now();
+    paintPips(rec);
+    rec.el.classList.remove('is-warn', 'is-crit', 'is-hurt');
+    rec.el.classList.add('is-dead');
+    rec.fill.style.width = '100%';
+    setText(rec.timeTxt, 'yours');
+    refreshFlopperStrip();
+  }
+
   function hitFlopper(id, d) {
     const rec = floppers.get(id) || addFlopper(id, d);
-    if (!rec || rec.done) return;
+    if (!rec || rec.done || rec.state === 'dead') return;
     if (typeof (d && d.maxHp) === 'number' && d.maxHp > 0) rec.maxHp = d.maxHp;
     if (typeof (d && d.hp) === 'number') rec.hp = Math.max(0, d.hp);
     paintPips(rec);
@@ -1438,8 +1550,10 @@ export function initUI(ctx) {
     const rec = floppers.get(id);
     if (!rec || rec.done) return;
     rec.done = true;
+    rec.state = 'done';
     rec.hp = kept ? 0 : rec.hp;
     if (kept) paintPips(rec);
+    rec.el.classList.remove('is-dead');
     rec.el.classList.add(kept ? 'is-stowed' : 'is-lost');
     setText(rec.verdict, kept ? 'STOWED!' : 'IT GOT AWAY!');
     rec.removeAt = performance.now() + (kept ? 950 : 1250);
@@ -1454,10 +1568,14 @@ export function initUI(ctx) {
   }
 
   function refreshFlopperStrip() {
-    let live = 0;
-    for (const rec of floppers.values()) if (!rec.done) live++;
+    let live = 0, grab = 0;
+    for (const rec of floppers.values()) {
+      if (rec.done) continue;
+      if (rec.state === 'dead') grab++; else live++;
+    }
     elFlopStrip.classList.toggle('show', floppers.size > 0);
     elFlopStrip.classList.toggle('has-live', live > 0);
+    elFlopStrip.classList.toggle('has-pickup', grab > 0);
     elFlopStrip.classList.toggle('is-crowd', floppers.size > 2);
   }
 
@@ -1469,11 +1587,14 @@ export function initUI(ctx) {
     if (!fresh('flp:' + id + ':' + st + ':' + (d.hp != null ? d.hp : ''), 250)) return;
     if (st === 'spawn') addFlopper(id, d);
     else if (st === 'hit') hitFlopper(id, d);
-    else if (st === 'dead') endFlopper(id, true);
+    else if (st === 'dead') pickupFlopper(id, d);
+    else if (st === 'stowed') endFlopper(id, true);
     else if (st === 'escaped') endFlopper(id, false);
   }
 
   const ESCAPE_S = Math.max(3, num(FLOPPER.ESCAPE_SECONDS, 25));
+  // the server banks an unclaimed kill after ~20 s, so a catch is never lost
+  const BANK_S = 20;
   function tickFloppers() {
     if (!floppers.size) return;
     const now = performance.now();
@@ -1481,6 +1602,15 @@ export function initUI(ctx) {
     for (const [id, rec] of floppers) {
       if (rec.done) {
         if (now >= rec.removeAt) { dropFlopper(id); dirty = true; }
+        continue;
+      }
+      if (rec.state === 'dead') {
+        const left = BANK_S - (now - rec.deadAt) / 1000;
+        const f = clamp01(left / BANK_S);
+        rec.fill.style.width = (f * 100).toFixed(1) + '%';
+        setText(rec.timeTxt, left > 9 ? 'yours' : (Math.max(0, left).toFixed(1) + 's'));
+        // the server hands it over on its own; never leave a ghost row up
+        if (left < -6) { dropFlopper(id); dirty = true; }
         continue;
       }
       const span = rec.escapeS || ESCAPE_S;
@@ -1498,6 +1628,97 @@ export function initUI(ctx) {
 
   function clearFloppers() {
     for (const id of Array.from(floppers.keys())) dropFlopper(id);
+  }
+
+  // =============================================================
+  // DIVING LOOT — prompts, toasts, the one-of-a-kind card
+  // =============================================================
+  function onLootNear(d) {
+    const near = (d && d.lootId != null) ? d : null;
+    const prev = ui.lootNear;
+    ui.lootNear = near;
+    if (near) ui.lootKnown = true;
+    const a = prev ? String(prev.lootId) : '';
+    const b = near ? String(near.lootId) : '';
+    if (a !== b) refreshPrompt();
+  }
+
+  function noteLootState(d) {
+    const n = (d && Array.isArray(d.list)) ? d.list.length : 0;
+    if (n <= 0) return;
+    ui.lootKnown = true;
+    if (state.underwater) maybeDiveHint();
+  }
+
+  // First dive over a seabed that actually has something on it: say so, once
+  // ever (per browser) — after that the glow speaks for itself.
+  function maybeDiveHint() {
+    if (ui.diveHinted || !ui.lootKnown) return;
+    if (effectivePhase() !== 'playing') return;
+    ui.diveHinted = true;
+    try { if (localStorage.getItem(LS_DIVEHINT)) return; } catch (e) { /* private mode */ }
+    try { localStorage.setItem(LS_DIVEHINT, '1'); } catch (e) { /* private mode */ }
+    toast('Something glints on the seabed…', 'loot');
+  }
+
+  // uniques[] rides along on WORLD_STATE players; keep a local copy too so the
+  // card and the charm strip are right the instant the chest opens.
+  function myUniques() {
+    const out = [];
+    const w = state.world;
+    const me = myId();
+    if (w && Array.isArray(w.players) && me) {
+      const mine = w.players.find((p) => p && p.id === me);
+      const list = mine && Array.isArray(mine.uniques) ? mine.uniques : [];
+      for (const id of list) if (UNIQUE_CHARMS[id] && out.indexOf(id) < 0) out.push(id);
+    }
+    for (const id of ui.uniques) if (UNIQUE_CHARMS[id] && out.indexOf(id) < 0) out.push(id);
+    return out;
+  }
+
+  function showUniqueCard(id) {
+    const def = UNIQUE_CHARMS[id];
+    if (ui.uniques.indexOf(id) < 0) ui.uniques.push(id);
+    if (ui.invOpen) renderCharmStrip();
+    if (!fresh('uq:' + id, 4000)) return;
+    setText(elUqName, def ? def.name : 'Unclaimed Charm');
+    setText(elUqEff, uniqueEffect(def));
+    setText(elUqDesc, def ? (def.desc || '') : 'Nobody else will ever hold this one.');
+    elUnique.classList.remove('show'); void elUnique.offsetWidth;
+    elUnique.classList.add('show');
+    clearTimeout(ui.uqTimer);
+    ui.uqTimer = setTimeout(() => elUnique.classList.remove('show'), 3200);
+  }
+
+  function onLootResult(d) {
+    if (!d || typeof d !== 'object') return;
+    const key = 'loot:' + (d.lootId != null ? d.lootId : '?') + '|' + (d.ok ? 1 : 0)
+      + '|' + (d.itemId || '') + '|' + (d.uniqueId || '');
+    if (!fresh(key, 600)) return;
+    ui.lootKnown = true;
+    if (d.ok === false) {
+      toast(d.message || 'You cannot reach that', 'bad');
+      return;
+    }
+    if (ui.lootNear && d.lootId != null && String(ui.lootNear.lootId) === String(d.lootId)) {
+      ui.lootNear = null;
+      refreshPrompt();
+    }
+    const name = lootName(d);
+    const val = Math.max(0, Math.round(num(d.value, 0)));
+    toast(val > 0 ? (name + ' — +' + money(val) + ' to the purse') : (name + ' recovered'), 'loot');
+
+    if (d.itemId) {
+      const bait = foundBaitById(d.itemId);
+      if (bait) {
+        toast(bait.name + ' ×' + Math.max(1, Math.floor(num(bait.pack, 1))) + ' — found-only bait', 'loot');
+      } else {
+        const shopItem = shopById(d.itemId);
+        toast('Also inside: ' + (shopItem ? shopItem.name : prettyKey(d.itemId)), 'loot');
+      }
+    }
+    if (d.uniqueId) showUniqueCard(d.uniqueId);
+    if (ui.invOpen) renderInventory();
   }
 
   // =============================================================
@@ -1524,9 +1745,11 @@ export function initUI(ctx) {
     const owned = Array.isArray(g.weapons) ? g.weapons : [];
     return SHOP.filter((s) => s.kind === 'weapon' && owned.indexOf(s.id) >= 0);
   }
+  // found-only baits live in the same baits map as the shop ones, so they have
+  // to be cycleable too — you cannot buy another Abyss Leech
   function ownedBaits() {
     const b = state.baits || {};
-    return SHOP.filter((s) => s.kind === 'bait' && num(b[s.id], 0) > 0);
+    return BAIT_DEFS.filter((s) => num(b[s.id], 0) > 0);
   }
 
   function refreshHotbar() {
@@ -1556,11 +1779,11 @@ export function initUI(ctx) {
     }
 
     const bId = g.activeBait;
-    const bDef = bId ? shopById(bId) : null;
+    const bDef = bId ? baitById(bId) : null;
     const count = bId ? num((state.baits || {})[bId], 0) : 0;
     setHTML(elBaitIco, baitIcon(bId || 'worms'));
     setText(elBaitName, bDef ? bDef.name : 'No bait');
-    setText(elBaitSub, bDef ? ('×' + count) : 'press B');
+    setText(elBaitSub, bDef ? ('×' + count + (bDef.found ? ' · found' : '')) : 'press B');
     $('slotBait').classList.toggle('is-empty', !bDef || count <= 0);
 
     const tool = state.activeTool || 'rod';
@@ -1599,7 +1822,7 @@ export function initUI(ctx) {
     const i = order.indexOf(g.activeBait != null ? g.activeBait : null);
     g.activeBait = order[(i + 1 + order.length) % order.length];
     refreshHotbar();
-    const def = g.activeBait ? shopById(g.activeBait) : null;
+    const def = g.activeBait ? baitById(g.activeBait) : null;
     toast(def ? (def.name + ' · ×' + num((state.baits || {})[def.id], 0)) : 'Bait removed', 'info');
   }
 
@@ -1884,14 +2107,59 @@ export function initUI(ctx) {
       elInvBody.appendChild(grid);
     }
     elBaitStrip.innerHTML = '';
-    const baits = SHOP.filter((s) => s.kind === 'bait');
     const g = state.gear || {};
-    baits.forEach((b) => {
+    BAIT_DEFS.forEach((b) => {
       const c = num((state.baits || {})[b.id], 0);
-      const chip = el('div', 'bait-chip' + (c > 0 ? '' : ' is-zero') + (g.activeBait === b.id ? ' is-on' : ''));
+      // found-only baits are not on any shelf — only show them once you have some
+      if (b.found && c <= 0) return;
+      const chip = el('div', 'bait-chip' + (c > 0 ? '' : ' is-zero')
+        + (g.activeBait === b.id ? ' is-on' : '') + (b.found ? ' is-found' : ''));
+      chip.title = b.desc || '';
       chip.innerHTML = `<span class="bc-ico">${baitIcon(b.id)}</span><span class="bc-name">${escapeHTML(b.name)}</span><b>×${c}</b>`;
       elBaitStrip.appendChild(chip);
     });
+    renderCharmStrip();
+  }
+
+  // ---- charms: shop talismans + the one-of-a-kind ones you dived up ----
+  function charmChip(cls, iconHTML, name, effect, tag, tip) {
+    const chip = el('button', 'charm-chip' + (cls ? ' ' + cls : ''));
+    chip.type = 'button';
+    chip.title = name + ' — ' + (tip || effect);
+    chip.innerHTML =
+      `<span class="ch-ico">${iconHTML}</span>` +
+      `<span class="ch-body"><b>${escapeHTML(name)}</b><i>${escapeHTML(effect)}</i></span>` +
+      (tag ? `<span class="ch-tag">${escapeHTML(tag)}</span>` : '');
+    // hover shows the effect line on desktop; a tap pins it open on touch
+    chip.addEventListener('click', () => chip.classList.toggle('is-open'));
+    return chip;
+  }
+
+  function renderCharmStrip() {
+    if (!elCharmStrip) return;
+    elCharmStrip.innerHTML = '';
+    elCharmStrip.appendChild(el('div', 'cs-head', 'Charms'));
+    const list = el('div', 'cs-list');
+    let n = 0;
+    const g = state.gear || {};
+    const owned = Array.isArray(g.charms) ? g.charms : [];
+    owned.forEach((id) => {
+      const it = shopById(id);
+      if (!it || it.kind !== 'charm') return;
+      n++;
+      list.appendChild(charmChip('', shopKindIcon('charm', it),
+        it.name, '+' + Math.round(num(it.luck, 0) * 100) + '% luck', '', it.desc));
+    });
+    myUniques().forEach((id) => {
+      const def = UNIQUE_CHARMS[id];
+      if (!def) return;
+      n++;
+      list.appendChild(charmChip('is-unique', SVG_LOOT_GEM, def.name, uniqueEffect(def), '1 of 1', def.desc));
+    });
+    if (!n) {
+      list.appendChild(el('div', 'cs-none', 'No charms yet — the shop sells talismans, the seabed hides the unique ones.'));
+    }
+    elCharmStrip.appendChild(list);
   }
   function openInventory() {
     if (ui.shopOpen) closeShop();
@@ -2242,6 +2510,16 @@ export function initUI(ctx) {
     if (ui.shopOpen || ui.invOpen || ui.chatOpen) return null;
     if (num(state.hp, 100) <= 0) return null;
 
+    // Treasure wins every other prompt: you are only ever "near loot" while
+    // hanging over the seabed, where nothing else is competing for E.
+    const ln = ui.lootNear;
+    if (ln) {
+      return {
+        kind: 'loot', d: 0, label: lootPromptLabel(ln), lootId: ln.lootId,
+        act: () => { try { bus && bus.emit && bus.emit('lootInteract', { lootId: ln.lootId }); } catch (e) { /* no bus */ } },
+      };
+    }
+
     const p = playerPos(TMP);
     if (state.onBoat) return boatPrompt(p);
 
@@ -2295,6 +2573,7 @@ export function initUI(ctx) {
     elPrompt.classList.add('show');
     elPrompt.classList.toggle('is-locked', !!it.locked);
     elPrompt.classList.toggle('is-hot', !!it.hot);
+    elPrompt.classList.toggle('is-loot', it.kind === 'loot');
     setText(elPromptTxt, it.label);
     elPromptKey.style.display = it.locked ? 'none' : '';
   }
@@ -2402,7 +2681,11 @@ export function initUI(ctx) {
     endEventBanner(d && typeof d === 'object' ? d : null);
   });
   onBus('localDamaged', (d) => { flashDamage(d && d.dmg); });
-  onBus('underwater', () => { refreshVitals(); });
+  onBus('underwater', (on) => {
+    refreshVitals();
+    const under = (on && typeof on === 'object') ? !!on.on : !!on;
+    if (under) maybeDiveHint();
+  });
   onBus('boardBoat', () => { refreshPrompt(); });
   onBus('leaveBoat', () => { refreshPrompt(); });
   onBus('shopResult', (d) => handleShopResult(d));
@@ -2411,6 +2694,10 @@ export function initUI(ctx) {
   // fishing.js re-emits the server's flopper beats for us
   onBus('flopper', (d) => onFlopper(d));
   onBus('weather', (d) => { const t = (d && d.type) || d; if (typeof t === 'string') setWeather(t); });
+  // loot.js owns the nodes and the PICKUP_LOOT send; we own the prompt + the noise
+  onBus('lootNear', (d) => onLootNear(d));
+  onBus('lootResult', (d) => onLootResult(d));
+  onBus('lootState', (d) => noteLootState(d));
 
   function handleChatMsg(from, text) {
     const sys = !from || from === 'ISLAND' || from === 'system' || from === 'System';
@@ -2570,6 +2857,10 @@ export function initUI(ctx) {
     if (typeof t === 'string') setWeather(t);
   });
   onNet(MSG.FLOPPER, (d) => onFlopper(d));
+
+  // ---- wave 4: underwater loot ----
+  onNet(MSG.LOOT_STATE, (d) => noteLootState(d));
+  onNet(MSG.LOOT_RESULT, (d) => onLootResult(d));
   onNet(MSG.LIGHTNING, (d) => {
     if (!d) return;
     const me = myId();
@@ -2703,6 +2994,7 @@ export function initUI(ctx) {
     closeChat(false);
     setMenuPanel('none');
     elCatch.classList.remove('show');
+    elUnique.classList.remove('show');
     hideReel();
     hideCastPower();
   }
