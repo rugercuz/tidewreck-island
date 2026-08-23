@@ -1,0 +1,193 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#050b12">
+  <meta name="color-scheme" content="dark">
+  <meta name="description" content="Tidewreck Island - a co-op fishing party game. Meet the quota together, or the tsunami takes the island.">
+  <title>Tidewreck Island</title>
+
+  <!-- Inline SVG favicon (no external asset) -->
+  <link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2064%2064'%3E%3Crect%20width='64'%20height='64'%20rx='14'%20fill='%2308202e'/%3E%3Ctext%20x='32'%20y='47'%20font-size='38'%20text-anchor='middle'%3E%F0%9F%8E%A3%3C/text%3E%3C/svg%3E">
+
+  <!--
+    Critical boot styling only. Declared BEFORE style.css on purpose so that
+    ui.js's stylesheet always wins on any shared selector. Nothing here styles
+    #ui or its children - that DOM and its CSS belong entirely to ui.js.
+  -->
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #050b12;
+      overscroll-behavior: none;
+      -webkit-text-size-adjust: 100%;
+    }
+    body {
+      color: #dceaf3;
+      font-family: "Trebuchet MS", "Segoe UI", system-ui, -apple-system, sans-serif;
+      -webkit-font-smoothing: antialiased;
+      -webkit-tap-highlight-color: transparent;
+    }
+    #game {
+      position: fixed;
+      top: 0;
+      left: 0;
+      display: block;
+      width: 100%;
+      height: 100%;
+      z-index: 0;
+      touch-action: none;
+      outline: none;
+      background: #050b12;
+    }
+
+    /* ---- boot splash (removed by main.js once modules are up) ---- */
+    #boot {
+      position: fixed;
+      top: 0; left: 0; right: 0; bottom: 0;
+      z-index: 120;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      text-align: center;
+      pointer-events: none;
+      opacity: 1;
+      transition: opacity .65s ease;
+      background:
+        radial-gradient(130% 95% at 50% 8%, #17455f 0%, #0a2436 40%, #040b12 100%);
+    }
+    #boot-inner { transform: translateY(-4vh); }
+    #boot-bob {
+      position: relative;
+      width: 34px;
+      height: 34px;
+      margin: 0 auto 30px;
+      border-radius: 50%;
+      background: linear-gradient(#e05a4a 0 50%, #f1f6f8 50% 100%);
+      box-shadow: 0 0 0 3px rgba(4, 12, 20, .45), 0 8px 22px rgba(0, 0, 0, .5);
+      animation: tw-bob 2.4s ease-in-out infinite;
+    }
+    #boot-bob::before,
+    #boot-bob::after {
+      content: '';
+      position: absolute;
+      left: 50%;
+      top: 70%;
+      width: 130px;
+      height: 34px;
+      margin-left: -65px;
+      border: 2px solid rgba(140, 214, 255, .34);
+      border-radius: 50%;
+      animation: tw-ripple 2.4s ease-out infinite;
+    }
+    #boot-bob::after { animation-delay: 1.2s; }
+    #boot-title {
+      margin: 0;
+      font-size: clamp(26px, 5.2vw, 52px);
+      font-weight: 700;
+      letter-spacing: .22em;
+      text-indent: .22em;
+      color: #f2f8fb;
+      text-shadow: 0 2px 0 rgba(0, 0, 0, .35), 0 0 28px rgba(90, 190, 240, .35);
+    }
+    #boot-sub {
+      margin: 10px 0 0;
+      font-size: clamp(11px, 1.6vw, 14px);
+      letter-spacing: .34em;
+      text-indent: .34em;
+      text-transform: uppercase;
+      color: rgba(160, 205, 228, .75);
+    }
+    #boot-msg {
+      margin: 26px 0 0;
+      min-height: 1.4em;
+      font-size: 13px;
+      letter-spacing: .05em;
+      color: rgba(150, 196, 220, .8);
+    }
+    #boot.boot-error {
+      pointer-events: auto;
+      background: radial-gradient(130% 95% at 50% 8%, #4a1420 0%, #24090f 45%, #0a0305 100%);
+    }
+    #boot.boot-error #boot-bob { animation: none; opacity: .3; }
+    #boot.boot-error #boot-msg {
+      color: #ffb3a8;
+      max-width: 80vw;
+      margin-left: auto;
+      margin-right: auto;
+      word-break: break-word;
+      font-family: ui-monospace, "Consolas", monospace;
+    }
+    @keyframes tw-bob {
+      0%, 100% { transform: translateY(-6px) rotate(-4deg); }
+      50%      { transform: translateY(6px)  rotate(4deg); }
+    }
+    @keyframes tw-ripple {
+      0%   { transform: scale(.28); opacity: .85; }
+      100% { transform: scale(1.55); opacity: 0; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      #boot-bob, #boot-bob::before, #boot-bob::after { animation: none; }
+    }
+  </style>
+
+  <link rel="stylesheet" href="style.css">
+
+  <script type="importmap">
+    { "imports": { "three": "./lib/three.module.js" } }
+  </script>
+</head>
+<body>
+  <canvas id="game"></canvas>
+  <div id="ui"></div>
+
+  <div id="boot" aria-hidden="true">
+    <div id="boot-inner">
+      <div id="boot-bob"></div>
+      <h1 id="boot-title">TIDEWRECK ISLAND</h1>
+      <p id="boot-sub">Fish together. Or sink together.</p>
+      <p id="boot-msg">Casting off...</p>
+    </div>
+  </div>
+
+  <script src="/socket.io/socket.io.js"></script>
+  <script>
+    // Surface fatal boot errors on the splash instead of a silent black screen.
+    (function () {
+      function show(text) {
+        var boot = document.getElementById('boot');
+        if (!boot) return;
+        boot.className = 'boot-error';
+        boot.style.opacity = '1';
+        var title = document.getElementById('boot-title');
+        if (title) title.textContent = 'THE LINE SNAPPED';
+        var sub = document.getElementById('boot-sub');
+        if (sub) sub.textContent = 'Startup failed - check the console';
+        var msg = document.getElementById('boot-msg');
+        if (msg) msg.textContent = text;
+      }
+      window.addEventListener('error', function (e) {
+        if (!e || (e.target && e.target !== window)) return;
+        var where = e.filename ? ' (' + String(e.filename).split('/').pop() + ':' + e.lineno + ')' : '';
+        show((e.message || 'Script error') + where);
+      });
+      window.addEventListener('unhandledrejection', function (e) {
+        var r = e && e.reason;
+        show('Unhandled: ' + ((r && r.message) ? r.message : String(r)));
+      });
+      // Watchdog: if the module graph never came up, say so instead of
+      // leaving the player staring at a bobber forever.
+      window.setTimeout(function () {
+        if (window.TIDEWRECK || !document.getElementById('boot')) return;
+        show('js/main.js never finished loading. Check the console - a module import failed.');
+      }, 15000);
+    })();
+  </script>
+  <script type="module" src="js/main.js"></script>
+</body>
+</html>
