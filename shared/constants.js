@@ -22,7 +22,8 @@ export const MSG = {
   CANCEL_CAST: 'cancelCast',      // {}
   SELL_FISH: 'sellFish',          // {invIds:[...]} sell from personal inventory -> team wallet + quota
   BUY_ITEM: 'buyItem',            // {itemId}
-  DAMAGE_ENEMY: 'damageEnemy',    // {enemyId, dmg, weaponId}
+  DAMAGE_ENEMY: 'damageEnemy',    // {enemyId, dmg, weaponId, headshot?} head hits stun + bonus dmg (see COMBAT)
+  EVENT_HIT: 'eventHit',          // {headshot, weaponId} you struck the event creature; head hit = daze
   PLAYER_HIT: 'playerHit',        // {dmg, cause} client reports taking damage
   BUILD_PORTAL: 'buildPortal',    // {}
   ENTER_PORTAL: 'enterPortal',    // {}
@@ -65,6 +66,7 @@ export const MSG = {
   LIGHTNING: 'lightning',         // {p:[x,y,z], targetId|null} a strike lands (storm hazard)
   LOOT_STATE: 'lootState',        // {areaId, list:[{id, type, p:[x,z]}]} live treasure nodes for your area
   LOOT_RESULT: 'lootResult',      // {ok, lootId, name, kind, value?, itemId?, uniqueId?, message}
+  AMBUSH: 'ambush',               // {targetId, phase:'warn'|'start'|'end', count?} deep-water frenzy (see AMBUSH)
   REVIVED: 'revived',             // {id, by|null, hp} a downed player is back up ('by' null = self/sunrise)
   BODY_TOWED: 'bodyTowed',        // {id, by|null} a downed body is being towed by the Rescue Claw (null = released)
 };
@@ -381,6 +383,42 @@ export const ENEMIES = {
   daggerjelly:   { name: 'Dagger Jelly',   hp: 30,  dmg: 9,  speed: 2.2, aggroRange: 9,  size: 0.9, count: 4, behavior: 'drift' },
   moray:         { name: 'Moray Ambusher', hp: 180, dmg: 20, speed: 13,  aggroRange: 12, size: 2.4, count: 2, behavior: 'ambush' },
   depthmaw:      { name: 'Depthmaw',       hp: 420, dmg: 34, speed: 11,  aggroRange: 16, size: 3.6, count: 1, behavior: 'ambush' },
+  // ambush-pack only (count 0 = never area-spawned): fast, vicious, fragile
+  razorfin:      { name: 'Razorfin',       hp: 25,  dmg: 12, speed: 14,  aggroRange: 60, size: 0.7, count: 0, behavior: 'swarm' },
+};
+
+// ---------------- Combat: stuns & headshots ----------------
+// Every landed weapon hit staggers a regular enemy briefly. A well-timed hit
+// on the HEAD stuns it properly and deals bonus damage. The colossal event
+// creatures can't be hurt, but a head hit DAZES them long enough to escape.
+export const COMBAT = {
+  HIT_FLINCH_SECONDS: 0.35,    // every landed hit interrupts a regular enemy
+  HEADSHOT_STUN_SECONDS: 2.5,  // head hit: full stun (AI frozen)
+  HEADSHOT_DMG_MULT: 1.5,      // head hits also hit harder
+  STUN_IMMUNE_SECONDS: 6,      // per-enemy immunity after a stun ends (no stunlock)
+  EVENT_STUN_SECONDS: 4,       // head hit on an event creature freezes it
+  EVENT_STUN_COOLDOWN: 15,     // the giants shrug off repeat stuns for this long
+};
+
+// ---------------- Deep-water ambushes ----------------
+// Swimming far from land is pushing your luck. Every second a player swims
+// (in the water, not on a boat/deck, outside SAFE_DIST) the server rolls
+// against a risk that grows with distance from the island AND depth below —
+// alone doubles down. On a hit: a WARN_SECONDS telegraph, then a pack of
+// Razorfins erupts around the swimmer and mauls them until they reach safety
+// or the frenzy expires. Razorfins are real enemies — you can fight back.
+export const AMBUSH = {
+  SAFE_DIST: 150,       // no ambushes nearer the island than this
+  DIST_FULL: 700,       // distance factor maxes out here
+  DEPTH_FULL: 120,      // depth-below-player factor maxes out here
+  BASE_RISK: 0.012,     // per-second trigger chance just past SAFE_DIST
+  MAX_RISK: 0.14,       // per-second chance at full distance+depth
+  ALONE_MULT: 1.5,      // no living crewmate within 30 m
+  PACK_MIN: 5,
+  PACK_MAX: 12,         // pack size scales with risk
+  WARN_SECONDS: 1.8,    // "something is circling beneath you"
+  DURATION: 22,         // frenzy length before the pack disperses
+  COOLDOWN: 60,         // per-player breather between ambushes
 };
 
 export const PLAYER_MAX_HP = 100;

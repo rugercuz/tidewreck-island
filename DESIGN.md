@@ -368,3 +368,56 @@ active it continues (the crew is back on the island, which is safe anyway). Zero
 doomsday exactly as before. ui: token count visible in the HUD (next to wards/purse area),
 celebratory toast on token save, shop card renders via the generic path (verify kind 'token'
 is handled and shows the team-owned count).
+
+## Wave 7 addendum — deep-water ambushes, stun/headshot combat rework
+
+See constants: COMBAT, AMBUSH, the 'razorfin' ENEMIES entry (behavior 'swarm', count 0 =
+never area-spawned), MSG.AMBUSH, MSG.EVENT_HIT, and DAMAGE_ENEMY's new headshot flag.
+
+**Ambushes (server-authoritative):** each tick, for every ALIVE player who is SWIMMING (in
+the water; not on the island, not onBoat/onDeck) and farther than AMBUSH.SAFE_DIST from the
+origin: risk/sec = lerp(BASE_RISK, MAX_RISK, 0.6*distF + 0.4*depthF) where
+distF = clamp01((dist - SAFE_DIST)/(DIST_FULL - SAFE_DIST)) and depthF =
+clamp01(waterDepthBelowPlayer/DEPTH_FULL) (use the area depth wells / -terrain as proxy);
+multiply by ALONE_MULT when no other living player is within 30 m. Roll per second; on
+trigger (respect per-player COOLDOWN, one ambush per player at a time, none while an event
+retreat/ tsunami is active): broadcast MSG.AMBUSH {targetId, phase:'warn'}, wait WARN_SECONDS,
+then spawn packSize = round(lerp(PACK_MIN, PACK_MAX, risk/MAX_RISK)) razorfins in a ring
+~10-16 m around the target at their depth, broadcast AMBUSH {targetId, phase:'start', count}.
+'swarm' AI: razorfins ignore aggroRange gating — they relentlessly chase THEIR target player
+(hit-and-run: dart in, bite (normal contact damage path), dart out ~4 m, repeat), switch to
+the nearest player only if the target dies or leaves the water/zone. The frenzy ends after
+AMBUSH.DURATION, or early when the target reaches the safe zone / dry land / a boat deck:
+despawn survivors (they dive away), broadcast AMBUSH {targetId, phase:'end'}. Razorfins are
+normal enemies in ENEMY_STATE (they take damage, die, count for nothing special).
+
+**Stuns (server rules, enemy AI):** DAMAGE_ENEMY gains headshot (boolean, sanitize literal
+true). Every landed hit sets a flinch (AI paused HIT_FLINCH_SECONDS — interrupt lunges).
+headshot: damage * HEADSHOT_DMG_MULT and, if the enemy is not stun-immune, a full stun for
+HEADSHOT_STUN_SECONDS (AI frozen, state 'stunned' in ENEMY_STATE) followed by
+STUN_IMMUNE_SECONDS of immunity (flinches still apply). MSG.EVENT_HIT {headshot}: if an
+event is active, the sender is alive, headshot is true, and the event's stun cooldown
+(EVENT_STUN_COOLDOWN) has passed: broadcast EVENT_PHASE {type, phase:'stunned',
+data:{seconds: EVENT_STUN_SECONDS}} and suppress the creature's server-side phases/damage for
+that long. Body (non-head) EVENT_HITs are acknowledged with nothing — the giants don't care.
+
+**Client combat (enemies.js owns hit detection, events.js owns the giant's reaction —
+one author owns both):** every enemy gets a HEAD ZONE: a sphere at the head position derived
+from its facing and size (radius ~0.35 * size, centred ~0.45 * size forward of the enemy
+origin at its height). Melee arcs and projectiles/beams test the head sphere FIRST; a head
+connection sends DAMAGE_ENEMY {... headshot:true} + a crisp hitmarker (distinct crit visual
++ ctx.audio sfx 'headshot'). Stunned enemies (state 'stunned'): frozen pose with orbiting
+dazed-stars sprite; flinch = brief recoil. Event creatures: events.js exposes on its handle
+`headWorld(outVec3) -> bool` (false when no event/creature); enemies.js tests weapon hits
+against a generous head sphere (radius scaled to the creature) and sends MSG.EVENT_HIT
+{headshot:true, weaponId} on connection (body hits send {headshot:false} at most 1/s —
+cosmetic thud only). events.js reacts to EVENT_PHASE 'stunned': creature freezes mid-motion
+with a big dazed effect (stars/rings at the head, eyes flicker), all menace suppressed for
+data.seconds, then resumes cleanly. Works with the wave-6 retreat states.
+
+**ui/audio:** AMBUSH warn: urgent banner "SOMETHING'S CIRCLING BENEATH YOU" (target only) +
+low dread sting; start: red frenzy vignette pulse while it lasts; end: "they scatter" toast.
+A subtle "DEEP WATER" danger chip while swimming beyond SAFE_DIST (client-side estimate from
+the same formula, intensity scales). Stun feedback: "STUNNED!" popover on headshots,
+"IT'S DAZED — GO!" banner for event stuns. audio: 'headshot' (crisp crit ding), 'razorFrenzy'
+({on:bool} chittering bite loop), 'ambushSting', 'eventStunned' (huge dazed gong + warble).
