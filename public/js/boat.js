@@ -5,7 +5,7 @@
 // Owner module: exports initBoat(ctx).
 // =============================================================
 import * as THREE from 'three';
-import { MSG, ECON, WEATHER } from '/shared/constants.js';
+import { MSG, ECON, WEATHER, SAFE_ZONE } from '/shared/constants.js';
 
 /* ------------------------------------------------------------------ *
  * Tuning tables
@@ -1589,19 +1589,33 @@ export function initBoat(ctx) {
     }
   }
 
+  // Wave 6 - BLOOP ADRENALINE. While that thing is hunting, the whole crew
+  // (hull included) finds a little extra, so the Bloop can actually be outrun.
+  // Client feel only: the server never sees it. Guarded against a missing or
+  // nonsense constant so a bad payload can never stall the boat.
+  function adrenalineMult() {
+    const st = ctx.state;
+    if (!st || st.eventActive !== 'bloop') return 1;
+    const m = SAFE_ZONE ? Number(SAFE_ZONE.BLOOP_ADRENALINE) : 1;
+    return (isFinite(m) && m > 0) ? m : 1;
+  }
+
   function simulateDriver(dt) {
     readInput();
     const cy = Math.cos(S.yaw), sy = Math.sin(S.yaw);
     let fwd = S.vel.x * sy + S.vel.z * cy;
     let lat = S.vel.x * cy - S.vel.z * sy;
-    if (S.throttle > 0) fwd += spec.accel * dt;
-    else if (S.throttle < 0) fwd -= spec.accel * 0.45 * dt;
+    const adr = adrenalineMult();
+    const accel = spec.accel * adr;
+    const topSpeed = spec.maxSpeed * adr;
+    if (S.throttle > 0) fwd += accel * dt;
+    else if (S.throttle < 0) fwd -= accel * 0.45 * dt;
     fwd -= (spec.drag * fwd + spec.quad * fwd * Math.abs(fwd)) * dt;
-    const maxF = spec.maxSpeed * 1.02, maxR = spec.maxSpeed * 0.42;
+    const maxF = topSpeed * 1.02, maxR = topSpeed * 0.42;
     if (fwd > maxF) fwd = maxF;
     if (fwd < -maxR) fwd = -maxR;
     lat *= Math.exp(-4.5 * dt);
-    const spdFrac = clamp(Math.abs(fwd) / (spec.maxSpeed * 0.42), 0, 1);
+    const spdFrac = clamp(Math.abs(fwd) / (topSpeed * 0.42), 0, 1);
     S.yawRate = S.steer * spec.turn * (0.22 + 0.78 * spdFrac) * (fwd < -0.25 ? -1 : 1);
     S.yaw += S.yawRate * dt;
     const ncy = Math.cos(S.yaw), nsy = Math.sin(S.yaw);

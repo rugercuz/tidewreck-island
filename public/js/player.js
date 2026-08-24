@@ -16,6 +16,7 @@ import {
   BASE_AIR_SECONDS,
   PLAYER_MAX_HP,
   REVIVE,
+  SAFE_ZONE,
 } from '/shared/constants.js';
 
 // ------------------------------------------------------------
@@ -62,6 +63,14 @@ const REVIVE_SEND_CD = 1.6;      // debounce between REVIVE_TEAMMATE sends
 const TOW_SEND_CD = 0.4;         // debounce between TOW_BODY sends
 const KIT_SEND_CD = 1.5;         // debounce between USE_REVIVAL_KIT sends
 const REVIVE_INPLACE_WINDOW = 6; // seconds a REVIVED message keeps you off the campfire
+
+// Wave 6 - BLOOP ADRENALINE. While the Bloop hunts, a living player's run /
+// walk / swim speeds are multiplied by SAFE_ZONE.BLOOP_ADRENALINE so the thing
+// can actually be outrun. Pure client feel; the server is never told.
+const ADRENALINE_MULT = (() => {
+  const m = SAFE_ZONE ? Number(SAFE_ZONE.BLOOP_ADRENALINE) : 1;
+  return (Number.isFinite(m) && m > 0) ? m : 1;
+})();
 
 // Skeleton metrics (metres, feet at y = 0, ~1.72 m tall with hat)
 const HIP_Y = 0.76;
@@ -1048,6 +1057,23 @@ export function initPlayer(ctx) {
   let wasKo = false;
   let netTime = 0;           // frame-driven clock used for remote interpolation
   let deckPrevYaw = null;    // boat yaw last frame, so the hull turns you with it
+  let adrenaline = false;    // wave 6: the Bloop is hunting and we are still up
+
+  // Multiplier folded into every "how fast do we want to go" number. Exactly 1
+  // whenever the surge is off, so normal movement stays bit-for-bit unchanged.
+  function speedScale() { return adrenaline ? ADRENALINE_MULT : 1; }
+
+  // Cheap once-a-frame edge detector; ui listens for the chip.
+  function updateAdrenaline() {
+    const st = ctx.state;
+    const on = !!(st && st.phase === 'playing' && st.eventActive === 'bloop' &&
+                  (st.hp === undefined || st.hp > 0));
+    if (on === adrenaline) return;
+    adrenaline = on;
+    if (ctx.bus && typeof ctx.bus.emit === 'function') {
+      try { ctx.bus.emit('adrenaline', on); } catch (e) { /* no listener */ }
+    }
+  }
 
   const keys = (ctx.input && ctx.input.keys) ? ctx.input.keys : new Set();
   if (ctx.input && !ctx.input.keys) ctx.input.keys = keys;
@@ -1916,7 +1942,7 @@ export function initPlayer(ctx) {
     deckPrevYaw = by;
 
     // 2. the ordinary walk controller
-    const wantSpeed = ko ? 0 : (running ? RUN_SPEED : WALK_SPEED);
+    const wantSpeed = ko ? 0 : (running ? RUN_SPEED : WALK_SPEED) * speedScale();
     wishDir(_v2, local.yaw, fwd, str);
     const accel = local.grounded ? GROUND_ACCEL : AIR_ACCEL;
     const ka = 1 - Math.exp(-accel * dt);
@@ -1963,7 +1989,7 @@ export function initPlayer(ctx) {
     drownAccum = 0;
     local.speed = Math.hypot(local.vel.x, local.vel.z);
     if (ko) local.anim = 'ko';
-    else if (local.speed > RUN_SPEED * 0.62) local.anim = 'run';
+    else if (local.speed > RUN_SPEED * 0.62 * speedScale()) local.anim = 'run';
     else if (local.speed > 0.35) local.anim = 'walk';
     else local.anim = 'idle';
     if (char) {
@@ -2136,7 +2162,7 @@ export function initPlayer(ctx) {
 
       const diveDown = isDown('KeyC');
       const goUp = isDown('Space');
-      const spd = running ? SWIM_SPRINT : SWIM_SPEED;
+      const spd = (running ? SWIM_SPRINT : SWIM_SPEED) * speedScale();
 
       // Water-exit vault: Space at the surface next to a climbable edge
       // (shore, dock decking, a boat hull) mantles you out of the sea.
@@ -2230,7 +2256,7 @@ export function initPlayer(ctx) {
       // ---------------- on foot ----------------
       setUnderwater(local.pos.y + HEAD_STAND < waterY - 0.05);
 
-      const wantSpeed = ko ? 0 : (running ? RUN_SPEED : WALK_SPEED);
+      const wantSpeed = ko ? 0 : (running ? RUN_SPEED : WALK_SPEED) * speedScale();
       wishDir(_v2, local.yaw, fwd, str);
       const accel = local.grounded ? GROUND_ACCEL : AIR_ACCEL;
       const ka = 1 - Math.exp(-accel * dt);
@@ -2264,7 +2290,7 @@ export function initPlayer(ctx) {
 
       local.speed = Math.hypot(local.vel.x, local.vel.z);
       if (ko) local.anim = 'ko';
-      else if (local.speed > RUN_SPEED * 0.62) local.anim = 'run';
+      else if (local.speed > RUN_SPEED * 0.62 * speedScale()) local.anim = 'run';
       else if (local.speed > 0.35) local.anim = 'walk';
       else local.anim = 'idle';
       char.setLean(0);
@@ -2516,6 +2542,7 @@ export function initPlayer(ctx) {
       lastPhase = ctx.state.phase;
       setPhase(lastPhase);
     }
+    updateAdrenaline();
 
     if (lastPhase === 'playing') {
       refreshDowned(t);         // ui reads ctx.playerMod.downed for its markers

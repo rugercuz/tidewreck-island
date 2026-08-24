@@ -8,7 +8,7 @@
 import {
   MSG, MUTATIONS, FISH, ARTIFACTS, AREAS, SHOP, ECON, EVENTS,
   PLAYER_COLORS, PLAYER_MAX_HP, WEATHER, FLOPPER,
-  LOOT_TYPES, FOUND_BAITS, UNIQUE_CHARMS, CAST_PERFECT, REVIVE,
+  LOOT_TYPES, FOUND_BAITS, UNIQUE_CHARMS, CAST_PERFECT, REVIVE, SAFE_ZONE,
   fishById, shopById, quotaTarget, wardPrice,
 } from '/shared/constants.js';
 
@@ -198,6 +198,7 @@ function shopKindIcon(kind, item) {
     case 'revive': return reviveIcon(item.id);
     case 'diving': return '<svg viewBox="0 0 32 32" class="ico"><path d="M7 11 h18 a3 3 0 0 1 3 3 v3 a5 5 0 0 1 -5 5 h-2 l-2 3 h-4 l-2 -3 h-2 a5 5 0 0 1 -5 -5 v-3 a3 3 0 0 1 3 -3z" fill="#2c4a5e" stroke="#8fd8f0" stroke-width="1.4" stroke-linejoin="round"/><rect x="9" y="13" width="14" height="6" rx="2" fill="#9fe8ff" opacity=".75"/></svg>';
     case 'ward': return '<svg viewBox="0 0 32 32" class="ico"><path d="M16 3 l11 4 v9 c0 7 -5 11 -11 13 -6 -2 -11 -6 -11 -13 V7z" fill="#1b3d55" stroke="#7fe0ff" stroke-width="1.6" stroke-linejoin="round"/><path d="M16 9 v12 M11 14 q5 4 10 0" fill="none" stroke="#ffd979" stroke-width="1.8" stroke-linecap="round"/></svg>';
+    case 'token': return SVG_TOKEN;
     default: return SVG_BAG;
   }
 }
@@ -549,6 +550,40 @@ function reviveShortName(id) {
   return it ? it.name : prettyKey(id);
 }
 
+// ---------------------------------------------------------------
+// Wave 6 — safe zone, retreat countdown, adrenaline, Revival Tokens
+// ---------------------------------------------------------------
+// Read defensively: a missing constant must never break the HUD.
+const SAFE = {
+  radius: Math.max(1, num(SAFE_ZONE && SAFE_ZONE.RADIUS, 140)),
+  retreat: Math.max(1, num(SAFE_ZONE && SAFE_ZONE.RETREAT_SECONDS, 20)),
+  maxHit: Math.max(1, num(SAFE_ZONE && SAFE_ZONE.EVENT_MAX_HIT, 45)),
+  adrenaline: Math.max(1, num(SAFE_ZONE && SAFE_ZONE.BLOOP_ADRENALINE, 1.3)),
+};
+// how long "IT'S STILL OUT THERE" hangs around after a cancelled retreat
+const HUNT_FLASH_MS = 2000;
+
+// a shield with calm water inside it — the safe-zone language, deliberately
+// green/teal so it reads AGAINST the red horror vignette instead of with it
+const SVG_SAFE =
+  '<svg viewBox="0 0 24 24" class="ico"><path d="M12 2.3l8.1 3v6.3c0 5.2-3.5 8.3-8.1 10.1-4.6-1.8-8.1-4.9-8.1-10.1V5.3z" ' +
+  'fill="rgba(58,214,168,.20)" stroke="#46e0b0" stroke-width="1.6" stroke-linejoin="round"/>' +
+  '<path d="M7 12.6q2.6-2.5 5-.7t5-1.3" fill="none" stroke="#8dfad6" stroke-width="1.7" stroke-linecap="round"/>' +
+  '<path d="M7 16.2q2.6-2.5 5-.7t5-1.3" fill="none" stroke="#8dfad6" stroke-width="1.5" stroke-linecap="round" opacity=".6"/></svg>';
+// the creature changed its mind — same silhouette, teeth instead of water
+const SVG_HUNT =
+  '<svg viewBox="0 0 24 24" class="ico"><path d="M12 2.3l8.1 3v6.3c0 5.2-3.5 8.3-8.1 10.1-4.6-1.8-8.1-4.9-8.1-10.1V5.3z" ' +
+  'fill="rgba(255,90,82,.20)" stroke="#ff6a5c" stroke-width="1.6" stroke-linejoin="round"/>' +
+  '<path d="M7.4 10.4l1.8 3 1.8-3 1.8 3 1.8-3 1.8 3" fill="none" stroke="#ffb3ad" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round"/></svg>';
+// adrenaline — a plain bolt, tinted by the chip through currentColor
+const SVG_BOLT =
+  '<svg viewBox="0 0 24 24" class="ico"><path d="M13.7 1.6L4.9 13.5h5.3L9.2 22.4 19.1 10.1h-5.5z" fill="currentColor"/></svg>';
+// a Revival Token — dark coin, gold rim, a heart still beating in the middle
+const SVG_TOKEN =
+  '<svg viewBox="0 0 24 24" class="ico"><circle cx="12" cy="12" r="9.3" fill="#2a1544" stroke="#ffca4a" stroke-width="1.6"/>' +
+  '<circle cx="12" cy="12" r="6.6" fill="none" stroke="rgba(255,202,74,.45)" stroke-width="1"/>' +
+  '<path d="M12 17.5s-4.3-2.7-4.3-5.5a2.45 2.45 0 0 1 4.3-1.55 2.45 2.45 0 0 1 4.3 1.55c0 2.8-4.3 5.5-4.3 5.5z" fill="#ff5e7a"/></svg>';
+
 // ===============================================================
 // initUI
 // ===============================================================
@@ -606,6 +641,16 @@ export function initUI(ctx) {
     tsunamiPulse: 0,
     damageFlash: 0,
     koShown: false,
+    // wave 6
+    retreatState: 'off',   // 'off' | 'retreat' | 'hunt'
+    retreatType: '',       // which creature is giving up
+    retreatEnd: 0,         // ui.now when the countdown hits zero
+    retreatTotal: 0,       // the server's full window, for the drain bar
+    retreatSeen: -99,      // ui.now of the last retreat message (staleness guard)
+    retreatTimer: 0,
+    adren: false,          // adrenaline chip currently shown
+    adrenBus: null,        // last bus 'adrenaline' value (null = never heard one)
+    tokens: -1,            // last painted team Revival Token count
     roomRev: -1,
     invRev: 0,
     lastInvRender: -1,
@@ -650,18 +695,23 @@ export function initUI(ctx) {
   const toastLayer = el('div', 'toast-layer');
   root.appendChild(toastLayer);
 
-  function toast(text, kind) {
+  // `glyph` is internal (inline SVG instead of the coloured dot) — the public
+  // handle still only ever passes (text, kind).
+  function toast(text, kind, glyph) {
     if (!text) return;
     if (ui.doom) return;   // doomsday owns the screen — nothing pops over the wave
-    const t = el('div', 'toast toast-' + (kind || 'info'));
-    t.appendChild(el('span', 'toast-dot'));
+    const k = kind || 'info';
+    const t = el('div', 'toast toast-' + k);
+    if (glyph) t.appendChild(el('span', 'toast-glyph', glyph));
+    else t.appendChild(el('span', 'toast-dot'));
     const body = el('span', 'toast-text');
     body.textContent = String(text);
     t.appendChild(body);
     toastLayer.appendChild(t);
     while (toastLayer.children.length > 5) toastLayer.removeChild(toastLayer.firstChild);
-    setTimeout(() => { t.classList.add('out'); }, 2600);
-    setTimeout(() => { if (t.parentNode) t.parentNode.removeChild(t); }, 3200);
+    const hold = (k === 'token') ? 4400 : 2600;   // the token save is the loudest news there is
+    setTimeout(() => { t.classList.add('out'); }, hold);
+    setTimeout(() => { if (t.parentNode) t.parentNode.removeChild(t); }, hold + 600);
   }
 
   // =============================================================
@@ -1059,6 +1109,10 @@ export function initUI(ctx) {
       <span class="wallet-num" id="walletNum">0</span>
       <span class="wallet-delta" id="walletDelta"></span>
       <span class="wallet-label">team purse</span>
+      <span class="wallet-sep"></span>
+      <span class="token-pill" id="tokenPill" title="Revival Tokens — if the whole crew goes down, one burns instead">
+        <span class="tp-ico">${SVG_TOKEN}</span><b class="tp-num" id="tokenNum">0</b><i>tokens</i>
+      </span>
     </div>
 
     <div class="hud-bottomleft">
@@ -1071,6 +1125,10 @@ export function initUI(ctx) {
         <div class="bar-row hp-row">
           <span class="bar-ico">${SVG_HEART}</span>
           <div class="bar hp-bar"><div class="bar-fill" id="hpFill"></div><span class="bar-txt" id="hpTxt">100</span></div>
+          <div class="adren-chip" id="adrenChip" title="The Bloop is hunting — everything you do is faster">
+            <span class="ad-bolt">${SVG_BOLT}</span>
+            <span class="ad-txt"><b>ADRENALINE</b><i id="adrenSub">+30% speed</i></span>
+          </div>
         </div>
         <div class="bar-row air-row" id="airRow">
           <span class="bar-ico air-ico">◌</span>
@@ -1173,6 +1231,14 @@ export function initUI(ctx) {
       <div class="eb-desc" id="ebDesc"></div>
     </div>
 
+    <div class="retreat-banner" id="retreatBanner">
+      <span class="rb-ico" id="rbIco">${SVG_SAFE}</span>
+      <div class="rb-main">
+        <div class="rb-line"><b class="rb-tag" id="rbTag">SAFE</b><span class="rb-txt" id="rbTxt"></span></div>
+        <div class="rb-bar"><div class="rb-fill" id="rbFill"></div></div>
+      </div>
+    </div>
+
     <div class="quota-banner" id="quotaBanner">
       <div class="qb-sweep"></div>
       <div class="qb-title" id="qbTitle">QUOTA MET</div>
@@ -1241,6 +1307,9 @@ export function initUI(ctx) {
   const elBaitIco = $('baitIco'), elBaitName = $('baitName'), elBaitSub = $('baitSub');
   const elSlotRod = $('slotRod'), elSlotWeapon = $('slotWeapon'), elInvSub = $('invSub');
   const elWeatherChip = $('weatherChip'), elWxIco = $('wxIco'), elWxName = $('wxName'), elWxHint = $('wxHint');
+  const elRetreat = $('retreatBanner'), elRbIco = $('rbIco'), elRbTag = $('rbTag'), elRbTxt = $('rbTxt'), elRbFill = $('rbFill');
+  const elAdren = $('adrenChip'), elAdrenSub = $('adrenSub');
+  const elTokenPill = $('tokenPill'), elTokenNum = $('tokenNum');
   const elFlopStrip = $('flopperStrip'), elFlopRows = $('flopperRows'), elLightning = $('lightningFlash');
   const elUnique = $('uniqueCard'), elUqName = $('uqName'), elUqEff = $('uqEff'), elUqDesc = $('uqDesc');
 
@@ -1323,6 +1392,8 @@ export function initUI(ctx) {
   modalLayer.querySelector('#btnSellAll').addEventListener('click', () => sellFish(true));
   modalLayer.querySelector('#btnSellSel').addEventListener('click', () => sellFish(false));
 
+  // A tab may cover more than one SHOP kind — the team shelf sells both the
+  // Revival Token (kind 'token') and the Tsunami Ward (kind 'ward').
   const SHOP_TABS = [
     { k: 'rod', label: 'Rods' },
     { k: 'boat', label: 'Boat' },
@@ -1331,9 +1402,13 @@ export function initUI(ctx) {
     { k: 'charm', label: 'Charms' },
     { k: 'revive', label: 'Rescue' },
     { k: 'diving', label: 'Diving' },
-    { k: 'ward', label: 'Ward' },
+    { k: 'ward', label: 'Team', kinds: ['token', 'ward'] },
     { k: 'sell', label: 'Sell' },
   ];
+  function tabKinds(k) {
+    const t = SHOP_TABS.find((x) => x.k === k);
+    return (t && Array.isArray(t.kinds)) ? t.kinds : [k];
+  }
   SHOP_TABS.forEach((t) => {
     const b = el('button', 'shop-tab', `<b>${t.label}</b>`);
     b.dataset.k = t.k;
@@ -1456,6 +1531,7 @@ export function initUI(ctx) {
     if (p !== 'playing') {
       closeShop(); closeInventory(); closeChat(false); clearFloppers(); ui.lootNear = null;
       hideReviveRing(); setTowing(null); clearDownedMarkers();
+      hideRetreat(); ui.adrenBus = null; setAdrenaline(false);
     }
     // the doomsday blackout only ever lifts on the way back to the dock
     if (p === 'menu' || p === 'lobby') endDoomsday();
@@ -1482,6 +1558,8 @@ export function initUI(ctx) {
     clearDownedMarkers();
     hideReviveRing();
     setTowing(null);
+    hideRetreat();
+    setAdrenaline(false);
     hideCastPower();
     hidePerfect();
     hideReel();
@@ -1565,6 +1643,7 @@ export function initUI(ctx) {
       elWalletDelta.classList.add('go');
     }
     setText(elShopWallet, money(wallet));
+    refreshTokens();
 
     const arts = Array.isArray(w.artifacts) ? w.artifacts : [];
     for (const s of elArtiTracker.children) s.classList.toggle('is-on', arts.indexOf(s.dataset.a) >= 0);
@@ -2158,6 +2237,10 @@ export function initUI(ctx) {
       const wards = Math.max(0, Math.floor(num(w.wards, 0)));
       bits.push('bought ×' + wards);
       if (dl) bits.push('deadline day ' + dl + ' → ' + (dl + 3));
+    } else if (item.kind === 'token') {
+      bits.push('team owned ×' + teamTokens());
+      bits.push('burns on a full-crew wipe');
+      bits.push('everyone back up at 50% hp');
     }
     return bits.join(' · ');
   }
@@ -2243,7 +2326,8 @@ export function initUI(ctx) {
     }
 
     elQuotaPreview.style.width = '0%';
-    const items = SHOP.filter((s) => s.kind === ui.shopTab);
+    const kinds = tabKinds(ui.shopTab);
+    const items = SHOP.filter((s) => kinds.indexOf(s.kind) >= 0);
     const list = el('div', 'shop-list');
     items.forEach((it) => list.appendChild(shopItemCard(it)));
     elShopBody.appendChild(list);
@@ -2254,8 +2338,12 @@ export function initUI(ctx) {
       elShopBody.insertBefore(el('div', 'shop-note', 'Currently equipped: <b>' + escapeHTML(names[cur] || ('Level ' + cur)) + '</b>'), list);
     }
     if (ui.shopTab === 'ward') {
-      elShopBody.insertBefore(el('div', 'shop-note',
-        'The ward is a <b>team purchase</b>. Each one buys three more days — and costs 50% more than the last.'), list);
+      const wards = Math.max(0, Math.floor(num(w.wards, 0)));
+      elShopBody.insertBefore(el('div', 'shop-note team-note',
+        'Bought from the <b>shared purse</b>, owned by the whole crew. '
+        + 'Revival Tokens <b>×' + teamTokens() + '</b> · Wards bought <b>×' + wards + '</b>. '
+        + 'A token burns itself if every last one of you goes down; a ward buys three more days '
+        + 'and costs 50% more than the one before it.'), list);
     }
     if (ui.shopTab === 'revive') {
       const rv = revivesMap();
@@ -2263,7 +2351,8 @@ export function initUI(ctx) {
         'Nobody stays down if the crew can reach them. In your pack: '
         + '<b>Sea Salts ×' + rv.salts + '</b> · <b>Revival Kits ×' + rv.revivalkit + '</b> · '
         + 'Rescue Claw <b>' + (rv.rescueclaw > 0 ? 'owned' : 'not owned') + '</b>. '
-        + 'If the WHOLE crew goes down at once, the island stops waiting.'), list);
+        + 'If the WHOLE crew goes down at once the island stops waiting — unless the team holds a '
+        + '<b>Revival Token</b> (Team shelf).'), list);
     }
   }
 
@@ -2503,6 +2592,7 @@ export function initUI(ctx) {
   }
 
   function showEventBanner(type) {
+    hideRetreat();            // a fresh hunt starts with no countdown running
     if (ui.doom) return;
     const def = EVENTS[type];
     const title = (def ? def.name : String(type || 'IT')).toUpperCase();
@@ -2519,6 +2609,9 @@ export function initUI(ctx) {
     root.dataset.event = '';
     elEventVig.classList.remove('on');
     elEventBanner.classList.remove('show');
+    hideRetreat();
+    ui.adrenBus = null;
+    setAdrenaline(false);
     if (info && info.survived) {
       const un = info.unlocked ? fishById(info.unlocked) : null;
       toast(un ? ('Survived. ' + un.name + ' now swims the Abyss.') : 'You survived the night.', 'good');
@@ -2550,6 +2643,128 @@ export function initUI(ctx) {
     elQuotaBanner.classList.remove('show'); void elQuotaBanner.offsetWidth;
     elQuotaBanner.classList.add('show');
     setTimeout(() => elQuotaBanner.classList.remove('show'), 3600);
+  }
+
+  // =============================================================
+  // WAVE 6 — RETREAT COUNTDOWN, ADRENALINE, REVIVAL TOKENS
+  // =============================================================
+  // The server owns the countdown: while every living crewmate is inside the
+  // safe zone it ticks EVENT_PHASE {phase:'retreat', data:{secondsLeft}} at
+  // ~1 Hz, and sends one {phase:'hunt'} the moment somebody steps back out.
+  // We interpolate between those beats so the number never looks frozen.
+  function eventName(type) {
+    const def = EVENTS[type];
+    return (def && def.name) ? def.name : 'It';
+  }
+
+  function paintRetreat(secs) {
+    const left = Math.max(0, num(secs, 0));
+    const total = Math.max(1, num(ui.retreatTotal, SAFE.retreat));
+    setHTML(elRbTxt, escapeHTML(eventName(ui.retreatType)) + ' is giving up in <b>' + Math.ceil(left) + '</b>s');
+    elRbFill.style.width = (clamp01(left / total) * 100).toFixed(1) + '%';
+    elRetreat.classList.toggle('is-close', left <= 5);
+  }
+
+  function showRetreat(type, secs, total) {
+    if (ui.doom || effectivePhase() !== 'playing') return;
+    ui.retreatType = (typeof type === 'string' && type) ? type : (state.eventActive || ui.retreatType || '');
+    // the server ships its own window; the constant is only the fallback
+    ui.retreatTotal = Math.max(1, num(total, SAFE.retreat));
+    ui.retreatEnd = ui.now + Math.max(0, num(secs, SAFE.retreat));
+    ui.retreatSeen = ui.now;
+    if (ui.retreatState !== 'retreat') {
+      ui.retreatState = 'retreat';
+      clearTimeout(ui.retreatTimer);
+      setHTML(elRbIco, SVG_SAFE);
+      setText(elRbTag, 'SAFE');
+      elRetreat.classList.remove('is-hunt');
+      elRetreat.classList.add('show');
+      root.classList.add('retreat-on');
+    }
+    paintRetreat(ui.retreatEnd - ui.now);
+  }
+
+  // Cancelled: the crew broke cover. One short, loud swap, then the banner goes.
+  function showStillOut() {
+    if (ui.retreatState !== 'retreat') return;
+    ui.retreatState = 'hunt';
+    setHTML(elRbIco, SVG_HUNT);
+    setText(elRbTag, '');
+    setHTML(elRbTxt, "IT'S STILL OUT THERE");
+    elRbFill.style.width = '0%';
+    elRetreat.classList.remove('is-close');
+    elRetreat.classList.add('is-hunt');
+    clearTimeout(ui.retreatTimer);
+    ui.retreatTimer = setTimeout(() => hideRetreat(), HUNT_FLASH_MS);
+  }
+
+  function hideRetreat() {
+    clearTimeout(ui.retreatTimer);
+    ui.retreatTimer = 0;
+    ui.retreatState = 'off';
+    ui.retreatEnd = 0;
+    ui.retreatSeen = -99;
+    elRetreat.classList.remove('show', 'is-hunt', 'is-close');
+    root.classList.remove('retreat-on');
+  }
+
+  // EVENT_PHASE carries every bit of coarse event scripting the server does
+  // ('approach' / 'lunge' / 'grab' / …) — only the two mercy phases are ours.
+  function onEventPhase(d) {
+    if (!d || typeof d !== 'object') return;
+    const phase = String(d.phase || '');
+    if (phase !== 'retreat' && phase !== 'hunt') return;
+    const type = (typeof d.type === 'string') ? d.type : '';
+    const data = (d.data && typeof d.data === 'object') ? d.data : d;
+    const secs = num(data.secondsLeft, num(data.seconds, num(data.left, SAFE.retreat)));
+    if (!fresh('evp:' + type + '|' + phase + '|' + Math.round(secs * 10), 250)) return;
+    if (phase === 'retreat') showRetreat(type, secs, data.total);
+    else showStillOut();
+  }
+
+  function tickRetreat() {
+    if (ui.retreatState !== 'retreat') return;
+    // the server went quiet (dropped 'hunt', event torn down): do not linger
+    if (ui.now - ui.retreatSeen > 8) { hideRetreat(); return; }
+    paintRetreat(ui.retreatEnd - ui.now);
+  }
+
+  // ---- adrenaline: the Bloop is fast, so for once so are you ----
+  function setAdrenaline(on) {
+    const want = !!on && !ui.doom;
+    if (want === ui.adren) return;
+    ui.adren = want;
+    elAdren.classList.toggle('show', want);
+    if (want) {
+      setText(elAdrenSub, '+' + Math.round((SAFE.adrenaline - 1) * 100) + '% speed');
+      if (fresh('adren', 4000)) toast('ADRENALINE — you move faster while it hunts', 'warn');
+    }
+  }
+  // player.js publishes bus 'adrenaline'; the Bloop is the only source of it,
+  // so a stray true can never leave the chip stuck on after the event.
+  function refreshAdrenaline() {
+    const bloop = state.eventActive === 'bloop';
+    setAdrenaline(bloop && ui.adrenBus !== false);
+  }
+
+  // ---- team Revival Tokens ----
+  function teamTokens() {
+    const w = state.world || {};
+    return Math.max(0, Math.floor(num(w.reviveTokens, 0)));
+  }
+  function refreshTokens() {
+    const n = teamTokens();
+    if (n === ui.tokens) return;
+    ui.tokens = n;
+    setText(elTokenNum, String(n));
+    elWallet.classList.toggle('has-tokens', n > 0);
+    if (n > 0) { elTokenPill.classList.remove('pop'); void elTokenPill.offsetWidth; elTokenPill.classList.add('pop'); }
+  }
+  // A wipe consumed one: every crewmate comes back at the campfire at once, so
+  // the whole rescue gets ONE headline instead of one line per player.
+  function tokenSaveToast() {
+    if (!fresh('tokensave', 6000)) return;
+    toast('A Revival Token saved the crew!', 'token', SVG_TOKEN);
   }
 
   // =============================================================
@@ -2948,6 +3163,9 @@ export function initUI(ctx) {
     if (!id) return;
     if (!fresh('rev:' + id, 400)) return;
     const me = myId() ? String(myId()) : null;
+    // wave 6: a burned Revival Token brings the WHOLE crew back in one breath.
+    // One headline for the rescue, not one line per body.
+    const byToken = String(d.cause || d.reason || '') === 'revivetoken';
     hideReviveRing();
     if (ui.towing && ui.towing.id === id) setTowing(null);
     dropMarker(id);
@@ -2960,10 +3178,11 @@ export function initUI(ctx) {
       root.dataset.ko = '';
       refreshVitals();
       const by = (d.by != null && d.by !== false) ? playerNameById(d.by) : null;
-      toast(by ? (by + ' hauled you back up') : 'You are back on your feet', 'good');
-    } else {
+      if (!byToken) toast(by ? (by + ' hauled you back up') : 'You are back on your feet', 'good');
+    } else if (!byToken) {
       toast(playerNameById(id) + ' is back up', 'good');
     }
+    if (byToken) tokenSaveToast();
     refreshPrompt();
   }
 
@@ -3235,6 +3454,15 @@ export function initUI(ctx) {
     state.eventActive = null;
     endEventBanner(d && typeof d === 'object' ? d : null);
   });
+  // wave 6: main relays MSG.EVENT_PHASE onto the bus; the safe-zone retreat
+  // countdown and its cancel ride that same channel.
+  onBus('eventPhase', (d) => onEventPhase(d));
+  // player.js owns the speed boost itself — this is only the chip
+  onBus('adrenaline', (d) => {
+    const on = (d && typeof d === 'object') ? !!(d.on != null ? d.on : d.active) : !!d;
+    ui.adrenBus = on;
+    refreshAdrenaline();
+  });
   onBus('localDamaged', (d) => { flashDamage(d && d.dmg); });
   onBus('underwater', (on) => {
     refreshVitals();
@@ -3292,6 +3520,11 @@ export function initUI(ctx) {
       if (item.kind === 'bait') {
         const g = state.gear || (state.gear = {});
         if (!g.activeBait) g.activeBait = item.id;
+      }
+      // the team counter only rides along on the 1 Hz WORLD_STATE — show the
+      // new token straight away, the next payload is the authority
+      if (item.kind === 'token' && state.world) {
+        state.world.reviveTokens = teamTokens() + 1;
       }
     }
     refreshHotbar();
@@ -3401,7 +3634,8 @@ export function initUI(ctx) {
     const me = myId();
     if (d.id && me && d.id !== me) return;
     if (typeof d.hp === 'number') state.hp = d.hp;
-    if (fresh('dmg:' + (d.hp != null ? d.hp : Math.random()), 120)) flashDamage();
+    // a revive rides the same channel (hp went UP) — no red flash for good news
+    if (!d.revived && fresh('dmg:' + (d.hp != null ? d.hp : Math.random()), 120)) flashDamage();
     refreshVitals();
   });
   onNet(MSG.EVENT_START, (d) => {
@@ -3416,6 +3650,7 @@ export function initUI(ctx) {
     state.eventActive = null;
     endEventBanner(d && typeof d === 'object' ? d : null);
   });
+  onNet(MSG.EVENT_PHASE, (d) => onEventPhase(d));
   onNet(MSG.BITE, () => { hideCastPower(); });
 
   // ---- wave 2: weather, landed-catch bonking, lightning ----
@@ -3545,6 +3780,12 @@ export function initUI(ctx) {
       elEventVig.classList.toggle('on', !!ev);
       root.dataset.event = ev || '';
     }
+
+    // wave 6: the retreat clock keeps counting between server beats, and the
+    // adrenaline chip lives and dies with the Bloop
+    tickRetreat();
+    refreshAdrenaline();
+    refreshTokens();
 
     if (ui.tsunamiPulse > 0) {
       ui.tsunamiPulse -= 0.1;

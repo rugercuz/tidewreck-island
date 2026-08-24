@@ -2158,6 +2158,161 @@ kbd.wide { min-width: 54px; }
 .screen-end.is-wipe .end-kicker { color: rgba(255, 150, 140, 0.75); }
 
 /* =================================================================
+   WAVE 6 — SAFE ZONE RETREAT, ADRENALINE, REVIVAL TOKENS
+   ================================================================= */
+
+/* ---- the retreat countdown ----
+   Every colour here is hard-coded on purpose. While an event runs the whole
+   ui is flipped to the horror palette (see #ui[data-event]), and this is the
+   one panel that has to read as RELIEF against all that red. It sits under
+   the top bar, never over the crosshair, and never takes pointer events. */
+.retreat-banner {
+  position: absolute; top: 84px; left: 50%;
+  transform: translateX(-50%) translateY(-10px);
+  display: flex; align-items: center; gap: 12px;
+  padding: 9px 20px 9px 13px;
+  border-radius: 999px;
+  background: linear-gradient(180deg, rgba(20, 88, 76, 0.82), rgba(3, 30, 28, 0.88));
+  border: 1.5px solid rgba(70, 224, 176, 0.62);
+  box-shadow: 0 0 0 2px rgba(70, 224, 176, 0.12), 0 0 32px rgba(70, 224, 176, 0.3), var(--shadow-md);
+  -webkit-backdrop-filter: var(--blur); backdrop-filter: var(--blur);
+  pointer-events: none; white-space: nowrap;
+  opacity: 0; visibility: hidden;
+  transition: opacity 220ms ease, transform 220ms ease, visibility 220ms,
+    border-color 260ms ease, box-shadow 260ms ease, background 260ms ease;
+}
+.retreat-banner.show {
+  opacity: 1; visibility: visible;
+  transform: translateX(-50%) translateY(0);
+  animation: rbBreath 2.8s ease-in-out infinite;
+}
+@keyframes rbBreath {
+  0%, 100% { box-shadow: 0 0 0 2px rgba(70, 224, 176, 0.10), 0 0 24px rgba(70, 224, 176, 0.24), var(--shadow-md); }
+  50% { box-shadow: 0 0 0 3px rgba(70, 224, 176, 0.20), 0 0 44px rgba(70, 224, 176, 0.5), var(--shadow-md); }
+}
+.rb-ico { width: 30px; height: 30px; flex: none; display: block; filter: drop-shadow(0 0 9px rgba(70, 224, 176, 0.6)); }
+.rb-ico svg { width: 100%; height: 100%; display: block; }
+.rb-main { display: flex; flex-direction: column; gap: 6px; min-width: 236px; }
+.rb-line { display: flex; align-items: baseline; gap: 10px; }
+.rb-tag {
+  font-size: 12.5px; font-weight: 900; letter-spacing: 0.3em;
+  color: #7dffcf; text-shadow: 0 0 14px rgba(70, 224, 176, 0.7);
+}
+.rb-tag:empty { display: none; }
+.rb-txt { font-size: 13px; font-weight: 700; letter-spacing: 0.03em; color: #d5fff1; }
+.rb-txt b {
+  font-size: 18px; font-weight: 900; color: #ffffff;
+  font-variant-numeric: tabular-nums;
+  text-shadow: 0 0 12px rgba(125, 255, 207, 0.7);
+}
+.rb-bar {
+  position: relative; height: 6px; border-radius: 999px; overflow: hidden;
+  background: rgba(1, 18, 16, 0.75);
+  box-shadow: inset 0 1px 4px rgba(0, 0, 0, 0.6);
+}
+.rb-fill {
+  position: absolute; left: 0; top: 0; bottom: 0; width: 100%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, #2fb894, #7dffcf);
+  box-shadow: 0 0 10px rgba(70, 224, 176, 0.6);
+  transition: width 240ms linear, background 300ms ease;
+}
+/* the last few seconds — warm the bar up without losing the calm */
+.retreat-banner.is-close { border-color: rgba(125, 255, 207, 0.9); }
+.retreat-banner.is-close .rb-fill { background: linear-gradient(90deg, #ffd06a, #7dffcf); }
+.retreat-banner.is-close .rb-txt b { color: #d9fff2; }
+
+/* somebody stepped back out — the same panel, one beat of bad news */
+.retreat-banner.is-hunt {
+  background: linear-gradient(180deg, rgba(96, 16, 14, 0.84), rgba(30, 4, 6, 0.9));
+  border-color: rgba(255, 106, 92, 0.75);
+  box-shadow: 0 0 0 2px rgba(255, 90, 82, 0.16), 0 0 34px rgba(255, 70, 60, 0.42), var(--shadow-md);
+  animation: rbAlarm 620ms ease-in-out infinite alternate;
+}
+@keyframes rbAlarm {
+  from { box-shadow: 0 0 0 2px rgba(255, 90, 82, 0.14), 0 0 22px rgba(255, 70, 60, 0.32), var(--shadow-md); }
+  to { box-shadow: 0 0 0 3px rgba(255, 90, 82, 0.26), 0 0 46px rgba(255, 70, 60, 0.6), var(--shadow-md); }
+}
+.retreat-banner.is-hunt .rb-ico { filter: drop-shadow(0 0 9px rgba(255, 90, 82, 0.7)); }
+.retreat-banner.is-hunt .rb-bar { display: none; }
+.retreat-banner.is-hunt .rb-main { min-width: 0; gap: 0; }
+.retreat-banner.is-hunt .rb-txt {
+  font-size: 17px; font-weight: 900; letter-spacing: 0.2em; color: #ffd9d4;
+  text-shadow: 0 0 18px rgba(255, 60, 50, 0.6);
+}
+
+/* toasts step down out of the banner's way while it is up */
+.toast-layer { transition: top 260ms cubic-bezier(.2, .9, .3, 1); }
+#ui.retreat-on .toast-layer { top: 160px; }
+
+/* ---- adrenaline chip (Bloop only) — small, arcade-y, next to the hp bar ---- */
+.adren-chip {
+  display: none; align-items: center; gap: 7px; flex: none;
+  padding: 4px 11px 4px 7px; border-radius: 999px;
+  background: linear-gradient(180deg, rgba(255, 225, 74, 0.22), rgba(34, 18, 4, 0.76));
+  border: 1.5px solid rgba(255, 225, 74, 0.7);
+  color: #ffe14a;
+  white-space: nowrap;
+}
+.adren-chip.show { display: flex; animation: adrenPulse 760ms ease-in-out infinite alternate; }
+@keyframes adrenPulse {
+  from { box-shadow: 0 0 10px rgba(255, 225, 74, 0.25); transform: scale(1); }
+  to { box-shadow: 0 0 24px rgba(255, 225, 74, 0.7); transform: scale(1.05); }
+}
+.ad-bolt { width: 16px; height: 16px; flex: none; display: block; filter: drop-shadow(0 0 6px rgba(255, 225, 74, 0.9)); }
+.ad-bolt svg { width: 100%; height: 100%; display: block; }
+.ad-txt { display: flex; flex-direction: column; line-height: 1.05; }
+.ad-txt b { font-size: 9.5px; font-weight: 900; letter-spacing: 0.15em; color: #fff3b0; }
+.ad-txt i {
+  font-style: normal; font-size: 8.5px; font-weight: 800; letter-spacing: 0.08em;
+  text-transform: uppercase; color: rgba(255, 225, 74, 0.72);
+}
+
+/* ---- team Revival Tokens: a second reading on the purse ---- */
+.wallet-sep {
+  display: none; width: 1.5px; height: 24px; flex: none;
+  border-radius: 2px; margin: 0 2px;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.04), var(--stroke), rgba(255, 255, 255, 0.04));
+}
+.token-pill { display: none; align-items: center; gap: 6px; }
+.hud-wallet.has-tokens .wallet-sep, .hud-wallet.has-tokens .token-pill { display: flex; }
+.tp-ico { width: 23px; height: 23px; flex: none; display: block; filter: drop-shadow(0 0 8px rgba(255, 94, 122, 0.45)); }
+.tp-ico svg { width: 100%; height: 100%; display: block; }
+.tp-num { font-size: 19px; font-weight: 900; color: #ffd98a; font-variant-numeric: tabular-nums; }
+.token-pill i {
+  font-style: normal; font-size: 9px; letter-spacing: 0.2em; text-transform: uppercase;
+  color: var(--text-faint); font-weight: 800; align-self: flex-end; padding-bottom: 4px;
+}
+.token-pill.pop { animation: walletpop 420ms cubic-bezier(.2, .9, .3, 1.5); }
+
+/* the loudest toast in the game: the crew was dead and is not any more */
+.toast-glyph { width: 22px; height: 22px; flex: none; display: block; }
+.toast-glyph svg { width: 100%; height: 100%; display: block; }
+.toast-token {
+  padding: 14px 24px;
+  border-color: rgba(255, 202, 74, 0.75);
+  background: linear-gradient(180deg, rgba(255, 202, 74, 0.2), rgba(44, 18, 62, 0.88));
+  box-shadow: var(--shadow-lg), 0 0 40px rgba(255, 202, 74, 0.45), 0 0 90px rgba(169, 123, 255, 0.3);
+  animation: tokenIn 640ms cubic-bezier(.16, .9, .3, 1.45);
+}
+@keyframes tokenIn {
+  0% { opacity: 0; transform: translateY(-18px) scale(0.7); }
+  55% { opacity: 1; transform: translateY(0) scale(1.07); }
+  100% { opacity: 1; transform: translateY(0) scale(1); }
+}
+.toast-token .toast-glyph { width: 32px; height: 32px; animation: uqfloat 3s ease-in-out infinite; }
+.toast-token .toast-text {
+  font-size: 17.5px; font-weight: 900; letter-spacing: 0.03em; white-space: normal;
+  background: linear-gradient(100deg, #fff6dd 0%, var(--gold) 38%, #fff6dd 58%, #ffb0d0 100%);
+  background-size: 220% 100%;
+  -webkit-background-clip: text; background-clip: text; color: transparent;
+  animation: shimmer 2.4s linear infinite;
+}
+
+/* team shelf note in the shop */
+.shop-note.team-note b { color: var(--gold); }
+
+/* =================================================================
    RESPONSIVE — comfortable down to 1280x720, usable below
    ================================================================= */
 @media (max-width: 1440px) {
@@ -2169,6 +2324,8 @@ kbd.wide { min-width: 54px; }
   .slot { width: 88px; height: 88px; }
   .slot-ico { width: 32px; height: 32px; }
   .hud-bottomleft { width: min(360px, 40vw); }
+  .ad-txt i { display: none; }
+  .token-pill i { display: none; }
 }
 @media (max-width: 900px) {
   .menu-stack { width: 94vw; }
@@ -2203,6 +2360,17 @@ kbd.wide { min-width: 54px; }
   .pb-rays { width: 190px; height: 190px; margin: -95px 0 0 -95px; }
   .rr-ring { width: 62px; height: 62px; }
   .cast-band-hint { display: none; }
+  .retreat-banner { top: 74px; padding: 8px 15px 8px 10px; gap: 9px; }
+  .rb-ico { width: 24px; height: 24px; }
+  .rb-main { min-width: 168px; }
+  .rb-tag { font-size: 11px; letter-spacing: 0.22em; }
+  .rb-txt { font-size: 12px; }
+  .rb-txt b { font-size: 15px; }
+  .retreat-banner.is-hunt .rb-txt { font-size: 14px; letter-spacing: 0.14em; }
+  #ui.retreat-on .toast-layer { top: 140px; }
+  .toast-token .toast-text { font-size: 15px; }
+  .tp-num { font-size: 16px; }
+  .tp-ico { width: 20px; height: 20px; }
 }
 @media (max-height: 720px) {
   .title-block { margin-top: 0; }
@@ -2226,6 +2394,10 @@ kbd.wide { min-width: 54px; }
   .tow-hint { bottom: 154px; }
   .ko-kit { margin-top: 12px; }
   .ko-hint { margin-top: 10px; }
+  .retreat-banner { top: 72px; padding: 7px 16px 7px 11px; }
+  .rb-ico { width: 26px; height: 26px; }
+  .rb-main { gap: 4px; }
+  #ui.retreat-on .toast-layer { top: 142px; }
 }
 
 /* reduce motion */

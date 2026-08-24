@@ -22,6 +22,7 @@ import {
   LOOT_RULES,
   UNIQUE_CHARMS,
   REVIVE,
+  SAFE_ZONE,
   PLAYER_MAX_HP,
   BASE_AIR_SECONDS,
   shopById,
@@ -103,6 +104,10 @@ const BODY_AIR_Y = -0.8;          // above this it has reached air — the claw 
 const TOW_DISTANCE = 1.5;         // metres the towed body trails behind the carrier
 const TOW_BODY_DROP = 0.4;        // ...and how far under them it hangs
 
+// --- safe zone / event mercy (see SAFE_ZONE) --------------------------
+const RETREAT_BROADCAST_S = 1;    // EVENT_PHASE 'retreat' cadence, ~1 Hz
+const TOKEN_REVIVE_HP = 0.5;      // a burned Revival Token puts you up at half
+
 // --- ambush / drift predators ----------------------------------------
 const AMBUSH_NODE_RADIUS = 8;     // ambushers coil this close to the node they guard
 const AMBUSH_BURST_MULT = 1.6;    // lunge speed multiplier
@@ -115,7 +120,6 @@ const ARTIFACT_IDS = Object.keys(ARTIFACTS);
 const AREA_BY_ID = new Map(AREAS.map(a => [a.id, a]));
 const MAX_ENEMY_DMG = Object.keys(ENEMIES)
   .reduce((m, k) => Math.max(m, ENEMIES[k].dmg), 0);
-const EVENT_HIT_MAX_DMG = 15;
 /** Horror events ordered by the day they first become possible. */
 const EVENT_ORDER = Object.keys(EVENTS).sort((a, b) => EVENTS[a].firstDay - EVENTS[b].firstDay);
 
@@ -238,6 +242,7 @@ export class Game {
     this.timeOfDay = START_TIME_OF_DAY;
     this.wallet = ECON.START_WALLET;
     this.wards = 0;
+    this.reviveTokens = 0;          // team-owned Revival Tokens (see SAFE_ZONE)
     this.boatLevel = 1;
     this.artifacts = [];
     this.eventsSurvived = [];
@@ -517,6 +522,40 @@ export class Game {
     return Math.max(1, Math.round(quotaTarget(n) * this.diffMult));
   }
 
+  // =========================================================
+  // Safe zone (see SAFE_ZONE)
+  // =========================================================
+
+  /**
+   * "Inside" = horizontal distance from the island centre within
+   * SAFE_ZONE.RADIUS. Works off the stored position, so a downed body counts
+   * by where it lies — only ALIVE players matter for triggering/retreat.
+   */
+  playerInSafeZone(p) {
+    if (!p || !Array.isArray(p.pos)) return false;
+    const r = Math.max(0, num(SAFE_ZONE.RADIUS, 140));
+    const x = num(p.pos[0], 0);
+    const z = num(p.pos[2], 0);
+    return x * x + z * z <= r * r;
+  }
+
+  /** {alive, outside} over the living crew — the input to both event rules. */
+  safeZoneCensus() {
+    let alive = 0;
+    let outside = 0;
+    for (const p of this.players.values()) {
+      if (!p.alive) continue;
+      alive++;
+      if (!this.playerInSafeZone(p)) outside++;
+    }
+    return { alive, outside };
+  }
+
+  /** Hard cap on any single event-creature hit, anywhere on the map. */
+  eventHitCap() {
+    return Math.max(1, Math.round(num(SAFE_ZONE.EVENT_MAX_HIT, 45)));
+  }
+
   worldStatePayload() {
     const players = [];
     for (const p of this.players.values()) {
@@ -548,6 +587,7 @@ export class Game {
         deadlineDay: this.quota.deadlineDay,
       },
       wards: this.wards,
+      reviveTokens: Math.max(0, Math.floor(num(this.reviveTokens, 0))),
       artifacts: this.artifacts.slice(),
       eventsSurvived: this.eventsSurvived.slice(),
       portalBuilt: this.portalBuilt,
@@ -1702,6 +1742,14 @@ export class Game {
         }
         break;
       }
+      case 'token': {
+        // Team purchase out of the shared wallet, like a ward: no owner, no
+        // duplicate limit, they just stack until a wipe burns one.
+        this.reviveTokens = Math.max(0, Math.floor(num(this.reviveTokens, 0))) + 1;
+        message = `Revival Token stowed. The crew holds ${this.reviveTokens}.`;
+        this.chat('ISLAND', `${p.name} bought a Revival Token. The sea owes you ${this.reviveTokens} more chance${this.reviveTokens === 1 ? '' : 's'}.`);
+        break;
+      }
       case 'ward': {
         this.wards++;
         this.quota.deadlineDay += WARD_DAYS;
@@ -1726,7 +1774,15 @@ export class Game {
 
   damagePlayer(p, dmg, cause) {
     if (!p || !p.alive || this.over) return;
-    const amount = Math.max(0, Math.round(num(dmg, 0)));
+    let amount = Math.max(0, Math.round(num(dmg, 0)));
+    // SAFE ZONE mercy — the single choke point for EVERY event-cause hit
+    // (client-reported PLAYER_HIT and any server-side event damage alike):
+    // nothing touches you on the island, and nothing ever one-shots you off it.
+    // Drowning / enemies / lightning are untouched.
+    if (eventDef(cause)) {
+      if (this.playerInSafeZone(p)) return;
+      amount = Math.min(amount, this.eventHitCap());
+    }
     if (!(amount > 0)) return;
     p.hp = clamp(p.hp - amount, 0, PLAYER_MAX_HP);
 
@@ -1766,9 +1822,47 @@ export class Game {
     if (this.players.size === 0) return false;
     for (const p of this.players.values()) if (p.alive) return false;
 
+    // A Revival Token buys the crew out of doomsday — once per token.
+    if (this.burnReviveToken()) return false;
+
     this.wiped = true;
     this.chat('ISLAND', 'The whole crew is down. The water pulls away from the beach. All of it.');
     this.triggerTsunami('wipe');
+    return true;
+  }
+
+  /**
+   * Spend one team Revival Token instead of the doomsday tsunami: everybody
+   * wakes at the campfire at half health. Any active event just keeps going —
+   * the crew is back on the island, which is the safe zone anyway.
+   * Returns false (and spends nothing) when there is no token to burn.
+   */
+  burnReviveToken() {
+    const held = Math.max(0, Math.floor(num(this.reviveTokens, 0)));
+    if (held <= 0) return false;
+    this.reviveTokens = held - 1;
+
+    let count = 0;
+    let idx = 0;
+    for (const p of this.players.values()) {
+      const slot = idx++;
+      if (p.alive) continue;
+      // Carried back to the campfire, spread around the fire like at spawn.
+      const angle = (slot / 8) * Math.PI * 2;
+      p.pos[0] = DOCK_SPAWN[0] + Math.cos(angle) * 3;
+      p.pos[1] = DOCK_SPAWN[1];
+      p.pos[2] = DOCK_SPAWN[2] + Math.sin(angle) * 3;
+      p.bl = null;
+      p.onBoat = false;
+      p.seat = -1;
+      p.swimming = false;
+      if (this.revivePlayer(p, null, TOKEN_REVIVE_HP, 'revivetoken')) count++;
+    }
+
+    if (count === 0) { this.reviveTokens = held; return false; }
+
+    this.chat('ISLAND', 'A Revival Token burns away - the sea spares you. Once.');
+    this.broadcastWorldState();
     return true;
   }
 
@@ -1801,11 +1895,17 @@ export class Game {
     if (now - p.lastSelfHit < PLAYER_HIT_COOLDOWN_S) return;
 
     const cause = typeof d.cause === 'string' ? d.cause.slice(0, 24) : 'unknown';
+    const isEvent = !!eventDef(cause);
+    // SAFE ZONE: a creature simply cannot land a hit on someone standing on the
+    // island — drop the report before it even costs them a cooldown.
+    if (isEvent && this.playerInSafeZone(p)) return;
+
     let max = MAX_ENEMY_DMG;
     const enemyDef = ownDef(ENEMIES, cause);
-    // Every horror event caps the same — serpent, kraken and bloop alike.
+    // Every horror event caps the same — serpent, kraken and bloop alike, at
+    // SAFE_ZONE.EVENT_MAX_HIT so nothing colossal can ever one-shot anybody.
     if (enemyDef) max = num(enemyDef.dmg, MAX_ENEMY_DMG);
-    else if (eventDef(cause)) max = EVENT_HIT_MAX_DMG;
+    else if (isEvent) max = this.eventHitCap();
     else {
       const byName = Object.keys(ENEMIES).find(k => ENEMIES[k].name === cause);
       if (byName) max = ENEMIES[byName].dmg;
@@ -2410,6 +2510,11 @@ export class Game {
 
   onNightfall() {
     if (this.over || this.eventActive || this.tsunamiAt > 0) return;
+    // SAFE ZONE: nothing comes for a crew that is already home. At least one
+    // ALIVE player has to be outside the ring when the roll happens. (The
+    // host's "/event" debug command goes straight to startEvent and is not
+    // gated — see rooms.js.)
+    if (this.safeZoneCensus().outside <= 0) return;
     // Bad skies draw bad things out: eventChanceMult scales the nightly roll,
     // but a normal night is never a certainty (the pity day still is).
     const mult = Math.max(0, num(this.weatherDef().eventChanceMult, 1));
@@ -2440,6 +2545,10 @@ export class Game {
       endsAt: now + def.duration,
       nextPhaseAt: now + 3,
       phaseIdx: 0,
+      // --- safe-zone retreat state, per event (never leaks to the next one) ---
+      retreating: false,
+      retreatUntil: 0,
+      retreatSaidAt: 0,
     };
     this.broadcast(MSG.EVENT_START, {
       type,
@@ -2464,11 +2573,73 @@ export class Game {
     return pool[Math.floor(Math.random() * pool.length) % pool.length];
   }
 
+  /**
+   * SAFE ZONE retreat. While EVERY alive player is inside the ring the creature
+   * gives up: a RETREAT_SECONDS countdown ticks down (broadcast ~1/s on the
+   * EVENT_PHASE channel) and at zero the event ends survived through the normal
+   * endEvent() path. Anyone stepping back outside cancels it with exactly one
+   * 'hunt' phase. Returns true when the event is gone — the caller must stop
+   * touching `ev` immediately.
+   */
+  updateRetreat(ev, now) {
+    const census = this.safeZoneCensus();
+
+    // Nobody left standing: the wipe check owns that outcome, not this timer.
+    if (census.alive === 0) {
+      ev.retreating = false;
+      ev.retreatUntil = 0;
+      ev.retreatSaidAt = 0;
+      return false;
+    }
+
+    // Somebody is still out there — call the hunt back on, once.
+    if (census.outside > 0) {
+      if (ev.retreating) {
+        ev.retreating = false;
+        ev.retreatUntil = 0;
+        ev.retreatSaidAt = 0;
+        this.broadcast(MSG.EVENT_PHASE, { type: ev.type, phase: 'hunt', data: {} });
+      }
+      return false;
+    }
+
+    const total = Math.max(1, Math.round(num(SAFE_ZONE.RETREAT_SECONDS, 20)));
+    if (!ev.retreating) {
+      ev.retreating = true;
+      ev.retreatUntil = now + total;
+      ev.retreatSaidAt = 0;   // announce the first second straight away
+      this.chat('ISLAND', `${ev.def.name} loses your scent near the shore.`);
+    }
+
+    const left = ev.retreatUntil - now;
+    const secondsLeft = Math.max(0, Math.round(left));
+    if (left <= 0 || !ev.retreatSaidAt || now - ev.retreatSaidAt >= RETREAT_BROADCAST_S) {
+      ev.retreatSaidAt = now;
+      this.broadcast(MSG.EVENT_PHASE, {
+        type: ev.type,
+        phase: 'retreat',
+        data: { secondsLeft, total },
+      });
+    }
+    if (left > 0) return false;
+
+    // Gave up. Same road as riding the timer out: unlock, EVENT_END, revives.
+    ev.retreating = false;
+    ev.retreatUntil = 0;
+    this.endEvent();
+    return true;
+  }
+
   updateEvent(now) {
     const ev = this.eventActive;
     if (!ev) return;
 
-    if (now >= ev.nextPhaseAt) {
+    if (this.updateRetreat(ev, now)) return;
+    if (this.eventActive !== ev) return;   // endEvent re-entered from anywhere
+
+    // While it circles offshore the hunt phases stop — but the event's own
+    // duration timer at the bottom still runs exactly as before.
+    if (!ev.retreating && now >= ev.nextPhaseAt) {
       ev.nextPhaseAt = now + EVENT_PHASE_INTERVAL_S;
       const phase = EVENT_PHASES[ev.phaseIdx % EVENT_PHASES.length];
       ev.phaseIdx++;

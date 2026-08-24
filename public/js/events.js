@@ -14,7 +14,7 @@
 
 import * as THREE from 'three';
 import { createFishMesh } from './fish.js';
-import { MSG, EVENTS, ECON, fishById } from '/shared/constants.js';
+import { MSG, EVENTS, ECON, SAFE_ZONE, fishById } from '/shared/constants.js';
 
 // ---------------- tunables ----------------
 // COLOSSAL SCALE: every creature is sized from EVENTS[type].bodyLength so the
@@ -42,6 +42,33 @@ const BLOOP_SEGS       = 24;
 const BLOOP_HEAD       = BLOOP_LENGTH * 0.20;    // ~52 m of head, half of it maw
 const BLOOP_GIRTH      = BLOOP_LENGTH * 0.115;   // ~30 m half-width of wrong whale
 const BLOOP_FAR        = 1250;                   // horizon distance it comes from
+
+// ---------------- wave 6: safe-zone retreat ----------------
+// When every alive crew member is standing inside the island's safe zone the
+// server starts a retreat countdown and says so on EVENT_PHASE ('retreat';
+// 'hunt' cancels it). The creature then drops EVERY aggressive branch - no
+// lunges, slams, grips, passes or damage - and just prowls a wide circle
+// around the island until the server ends the event.
+//
+// RETREAT_R is the circle it settles onto. RETREAT_FLOOR is a hard radial
+// floor applied to its body every frame, sized per creature so that no part of
+// it (girth, jaws, arm reach) can reach within SAFE_ZONE.RADIUS + RETREAT_CLEAR
+// metres of the origin once the ramp has run.
+const SAFE_RADIUS    = (SAFE_ZONE && Number(SAFE_ZONE.RADIUS) > 0) ? Number(SAFE_ZONE.RADIUS) : 140;
+const RETREAT_CLEAR  = 25;
+const RETREAT_MIN    = SAFE_RADIUS + RETREAT_CLEAR;
+const RETREAT_RAMP   = 2.0;     // seconds to slide out to the circle (and back)
+const RETREAT_R = {
+  serpent: RETREAT_MIN + SERPENT_HEAD_LEN + SERPENT_GIRTH * 2,
+  kraken:  RETREAT_MIN + KRAKEN_REACH * 0.95 + ARM_BASE_R,
+  bloop:   RETREAT_MIN + BLOOP_HEAD + BLOOP_GIRTH * 2,
+};
+const RETREAT_FLOOR = {
+  serpent: RETREAT_MIN + SERPENT_HEAD_LEN * 0.6 + SERPENT_GIRTH,
+  kraken:  RETREAT_MIN + KRAKEN_DOME_R * 1.2,
+  bloop:   RETREAT_MIN + BLOOP_HEAD * 0.8 + BLOOP_GIRTH,
+};
+const RETREAT_OMEGA = { serpent: 0.040, kraken: 0.022, bloop: 0.030 }; // rad/s
 
 const SHAKE_MAX_OFFSET = 0.62;  // metres at trauma 1
 const SHAKE_MAX_ROLL   = 0.055; // radians at trauma 1
@@ -78,6 +105,19 @@ function smooth01(x) { x = clamp(x, 0, 1); return x * x * (3 - 2 * x); }
 function smoothstep(e0, e1, x) { return smooth01((x - e0) / (e1 - e0 || 1e-6)); }
 function bump(x) { return x <= 0 || x >= 1 ? 0 : Math.sin(Math.PI * x); }
 function expApproach(dt, per) { return 1 - Math.pow(per, dt); }
+
+// Shove an XZ point out to at least `minR` metres from the island centre,
+// leaving y alone. minR <= 0 is a no-op, so this costs nothing when no retreat
+// is running.
+function pushOutside(v, minR) {
+  if (!(minR > 0)) return v;
+  const d = Math.hypot(v.x, v.z);
+  if (d >= minR) return v;
+  if (d < 1e-4) { v.x = minR; v.z = 0; return v; }
+  const k = minR / d;
+  v.x *= k; v.z *= k;
+  return v;
+}
 
 // Orient+scale an instance matrix so its local +Z runs along `dir`, keeping "up" upright.
 function orientMatrix(out, pos, dir, sx, sy, sz) {
@@ -686,6 +726,7 @@ export function initEvents(ctx) {
   function damageLocal(dmg, cause) {
     if (ctx.state && ctx.state.phase !== 'playing') return;
     if (ctx.state && ctx.state.hp <= 0) return;
+    if (EV.retreating) return;   // wave 6: a retreating creature hurts nobody
     try { if (ctx.net && ctx.net.send) ctx.net.send(MSG.PLAYER_HIT, { dmg, cause }); } catch (e) { /* offline */ }
     try { if (ctx.bus && ctx.bus.emit) ctx.bus.emit('localDamaged', { dmg, cause }); } catch (e) { /* no listener */ }
   }
@@ -895,6 +936,18 @@ export function initEvents(ctx) {
         out.lerp(_v3, w);
       }
     }
+
+    // wave 6: give-up circle. Same lag parameter `tt`, so the body still
+    // trails the head correctly; the constraint pass downstream fixes spacing.
+    if (EV.retreatBlend > 0.001) {
+      const R = retreatRadius();
+      const ang = retreatAngle(rig) + rig.dir * RETREAT_OMEGA.serpent * (tt - EV.elapsed);
+      const rx = Math.cos(ang) * R, rz = Math.sin(ang) * R;
+      _v3.set(rx, waterY(rx, rz, t) + Math.sin(tt * 0.55 + rig.undPhase) * (SERPENT_GIRTH * 1.5)
+              - SERPENT_GIRTH * 0.85, rz);
+      out.lerp(_v3, EV.retreatBlend);
+      pushOutside(out, retreatFloor());
+    }
     return out;
   }
 
@@ -932,8 +985,8 @@ export function initEvents(ctx) {
     const dur = EV.duration || 90;
     const head = rig.pts[0];
 
-    // lunge scheduling
-    if (!EV.ending) {
+    // lunge scheduling (never while it is backing off - see setRetreating)
+    if (!EV.ending && !EV.retreating) {
       if (rig.lunge && EV.elapsed > rig.lunge.start + rig.lunge.dur + 0.5) rig.lunge = null;
       if (!rig.lunge && EV.elapsed > rig.nextLunge) {
         startLunge(rig);
@@ -1169,9 +1222,20 @@ export function initEvents(ctx) {
 
   function updateKraken(rig, dt, t) {
     const dur = EV.duration || 100;
-    const wy = waterY(EV.center.x, EV.center.z, t);
-    rig.body.position.set(EV.center.x,
-      wy - KRAKEN_DOME_R * 0.5 + Math.sin(t * 0.4 + rig.bobPhase) * 2.4, EV.center.z);
+    // wave 6: while it is giving up the mantle slides out onto the offshore
+    // circle and every arm goes limp (see enterRetreat / exitRetreat).
+    let cx = EV.center.x, cz = EV.center.z;
+    if (EV.retreatBlend > 0.001) {
+      const R = retreatRadius(), ang = retreatAngle(rig);
+      cx = lerp(cx, Math.cos(ang) * R, EV.retreatBlend);
+      cz = lerp(cz, Math.sin(ang) * R, EV.retreatBlend);
+      _v5.set(cx, 0, cz);
+      pushOutside(_v5, retreatFloor());
+      cx = _v5.x; cz = _v5.z;
+    }
+    const wy = waterY(cx, cz, t);
+    rig.body.position.set(cx,
+      wy - KRAKEN_DOME_R * 0.5 + Math.sin(t * 0.4 + rig.bobPhase) * 2.4, cz);
     _v1.copy(EV.focus).sub(rig.body.position); _v1.y = 0;
     if (_v1.lengthSq() > 1e-4) rig.body.rotation.y = Math.atan2(_v1.x, _v1.z);
     if (EV.ending) rig.body.position.y -= Math.pow(clamp(EV.endT / 4.5, 0, 1), 1.7) * KRAKEN_REACH * 1.6;
@@ -1187,8 +1251,8 @@ export function initEvents(ctx) {
       if (rig.gripT <= 0 || rig.gripHits >= 6) releaseGrip(rig);
     }
 
-    // arm director
-    if (!EV.ending) {
+    // arm director (silent while it is backing off)
+    if (!EV.ending && !EV.retreating) {
       rig.nextArm -= dt;
       if (rig.nextArm <= 0) {
         const prog = clamp(EV.elapsed / dur, 0, 1);
@@ -1218,7 +1282,7 @@ export function initEvents(ctx) {
         switch (arm.state) {
           case 'idle':
             arm.hTarget = -KRAKEN_REACH * 0.19 + Math.sin(t * 0.8 + arm.phase) * KRAKEN_REACH * 0.075;
-            if (!arm.targetSet) { pickIdleTarget(arm, t); }
+            if (!arm.targetSet) { pickIdleTarget(arm, t, rig.body.position.x, rig.body.position.z); }
             break;
           case 'telegraph':
             // straight up: a column of meat taller than any hill on the island
@@ -1254,6 +1318,8 @@ export function initEvents(ctx) {
         }
       }
       if (EV.ending) arm.hTarget = -KRAKEN_REACH * 0.85 - a * 12;
+      // wave 6: nothing this thing owns may reach into the safe zone
+      if (EV.retreatBlend > 0.001) pushOutside(arm.target, retreatFloor());
       const k = arm.state === 'slam' ? expApproach(dt, 1e-8) : expApproach(dt, 0.06);
       arm.h += (arm.hTarget - arm.h) * k;
 
@@ -1334,11 +1400,15 @@ export function initEvents(ctx) {
     if (!order.length) return -1;
     return order[(Math.random() * order.length) | 0];
   }
-  function pickIdleTarget(arm, t) {
+  // cx/cz default to the staging centre; callers pass the mantle's own position
+  // so a retreating kraken idles its arms around itself, not around the crew.
+  function pickIdleTarget(arm, t, cx, cz) {
     const ang = arm.baseAng + (Math.random() - 0.5) * 1.2;
     const r = KRAKEN_REACH * 0.45 + Math.random() * KRAKEN_REACH * 0.35;
-    arm.target.set(EV.center.x + Math.cos(ang) * r,
-      waterY(0, 0, t) - KRAKEN_REACH * 0.12, EV.center.z + Math.sin(ang) * r);
+    const bx = Number.isFinite(cx) ? cx : EV.center.x;
+    const bz = Number.isFinite(cz) ? cz : EV.center.z;
+    arm.target.set(bx + Math.cos(ang) * r,
+      waterY(0, 0, t) - KRAKEN_REACH * 0.12, bz + Math.sin(ang) * r);
     arm.targetSet = true;
   }
   function pickSlamTarget(out) {
@@ -1368,7 +1438,7 @@ export function initEvents(ctx) {
     shake(0.5, 0.9);
   }
   function beginGrip(rig) {
-    if (rig.gripArm >= 0 || EV.ending) return;
+    if (rig.gripArm >= 0 || EV.ending || EV.retreating) return;
     let idx = pickIdleArm(rig);
     if (idx < 0) idx = 0;
     const arm = rig.armData[idx];
@@ -1597,6 +1667,15 @@ export function initEvents(ctx) {
       rig.target.set(f.x + EV.approachDir.x * 2600, -520, f.z + EV.approachDir.z * 2600);
       rig.speed += (150 - rig.speed) * expApproach(dt, 0.35);
       turnRate = 0.3;
+    } else if (EV.retreating) {
+      // wave 6: it stops hunting and just carves a slow ring around the island,
+      // aiming at a carrot a little way ahead of itself on the retreat circle.
+      const R = retreatRadius();
+      const a = Math.atan2(rig.pos.z, rig.pos.x) + (rig.retDir === -1 ? -1 : 1) * 0.55;
+      rig.target.set(Math.cos(a) * R, -BLOOP_GIRTH * 1.6, Math.sin(a) * R);
+      rig.speed += (28 - rig.speed) * expApproach(dt, 0.4);
+      rig.mawWant = 0;
+      turnRate = 0.55;
     } else if (rig.stage === 'approach') {
       // closes from the horizon FAST — inside the first third of the event
       rig.target.set(f.x - EV.approachDir.x * 200, -BLOOP_GIRTH * 1.5, f.z - EV.approachDir.z * 200);
@@ -1617,7 +1696,7 @@ export function initEvents(ctx) {
     }
 
     // hard leash: it must never become a distant speck for long
-    if (!EV.ending && rig.dist > 780 && rig.stage !== 'approach') bloopPickPass(rig);
+    if (!EV.ending && !EV.retreating && rig.dist > 780 && rig.stage !== 'approach') bloopPickPass(rig);
 
     // Limited-rate steering: a 260 m animal carves, it does not pivot.
     // A real axis-angle rotation, NOT a lerp — lerping toward a heading that is
@@ -1644,6 +1723,8 @@ export function initEvents(ctx) {
     rig.pos.addScaledVector(rig.dir, rig.speed * dt);
     // it lives in the water column: never fully airborne, never through the floor
     if (!EV.ending) rig.pos.y = clamp(rig.pos.y, -380, -BLOOP_GIRTH * 0.3);
+    // wave 6: and while it is backing off, never inside the safe zone either
+    if (EV.retreatBlend > 0.001) pushOutside(rig.pos, retreatFloor());
     rig.dist = rig.pos.distanceTo(f);
     rig.prox = clamp(1 - rig.dist / BLOOP_FAR, 0, 1);
   }
@@ -1883,7 +1964,8 @@ export function initEvents(ctx) {
     // It only truly hurts you if you are in the water with it — the crew on deck
     // just get the lurch. Swimming into an open maw is its own kind of mistake.
     rig.dmgCd -= dt;
-    if (!EV.ending && rig.dmgCd <= 0 && rig.near < BLOOP_GIRTH * 1.1 && localIsSwimming()) {
+    if (!EV.ending && !EV.retreating && rig.dmgCd <= 0 &&
+        rig.near < BLOOP_GIRTH * 1.1 && localIsSwimming()) {
       rig.dmgCd = 2.4;
       const inMaw = rig.mawOpen > 0.5 && getLocalPos(_v3) &&
         _v3.distanceTo(rig.nose) < BLOOP_HEAD * 0.6;
@@ -2141,6 +2223,8 @@ export function initEvents(ctx) {
     focus: new THREE.Vector3(0, 0, -160),
     approachDir: new THREE.Vector3(0, 0, -1),
     anchored: false, survived: true, day: 1,
+    // wave 6: the whole crew is inside the safe zone and the thing is giving up
+    retreating: false, retreatBlend: 0,
   };
 
   const TS = { active: false, elapsed: 0, dur: ECON.QUOTA_FAIL_GRACE_SECONDS || 20, rig: null };
@@ -2153,6 +2237,78 @@ export function initEvents(ctx) {
     else if (type === 'kraken') rigs.kraken = buildKraken();
     else if (type === 'bloop') rigs.bloop = buildBloop();
     return rigs[type] || null;
+  }
+
+  // ---------------------------------------------------------
+  // Retreat (wave 6). One boolean gates every aggressive branch; the rigs then
+  // fall back onto the shared offshore circle. Entering and leaving both reset
+  // the timers they own so nothing is left half-cocked on either side.
+  // ---------------------------------------------------------
+  function retreatRadius() { return RETREAT_R[EV.type] || (RETREAT_MIN + 80); }
+  // The hard floor grows with the ramp, so the creature is pushed steadily out
+  // instead of teleporting, and is provably clear once the ramp completes.
+  function retreatFloor() {
+    if (EV.retreatBlend <= 0.001) return 0;
+    return (RETREAT_FLOOR[EV.type] || (RETREAT_MIN + 40)) * EV.retreatBlend;
+  }
+  function retreatAngle(rig) {
+    const om = RETREAT_OMEGA[EV.type] || 0.03;
+    const a0 = Number.isFinite(rig.retAng) ? rig.retAng : 0;
+    const t0 = Number.isFinite(rig.retT0) ? rig.retT0 : 0;
+    return a0 + (rig.retDir === -1 ? -1 : 1) * om * (EV.elapsed - t0);
+  }
+
+  function enterRetreat() {
+    const rig = EV.rig;
+    if (!rig || !EV.type) return;
+    rig.retT0 = EV.elapsed;
+    rig.retDir = Math.random() < 0.5 ? 1 : -1;
+    if (EV.type === 'serpent') {
+      rig.lunge = null;                       // whatever it was winding up, drop it
+      rig.retAng = Math.atan2(rig.pts[0].z, rig.pts[0].x);
+      rig.retDir = rig.dir >= 0 ? 1 : -1;     // keep circling the way it already was
+    } else if (EV.type === 'kraken') {
+      releaseGrip(rig);
+      rig.retAng = Math.atan2(rig.body.position.z, rig.body.position.x);
+      for (let i = 0; i < rig.armData.length; i++) {
+        const arm = rig.armData[i];
+        arm.state = 'idle'; arm.st = 0; arm.targetSet = false; arm.slammed = false;
+        arm.flinch = 0;
+        arm.shadow.visible = false;
+        arm.shadow.material.opacity = 0;
+      }
+    } else if (EV.type === 'bloop') {
+      rig.stage = 'retreat'; rig.stageT = 0; rig.mawWant = 0;
+      rig.cpaDone = true; rig.prevD = 1e9;
+      // keep its current sense of rotation about the island
+      rig.retDir = (rig.pos.x * rig.dir.z - rig.pos.z * rig.dir.x) >= 0 ? 1 : -1;
+      rig.retAng = Math.atan2(rig.pos.z, rig.pos.x);
+    }
+  }
+
+  function exitRetreat() {
+    const rig = EV.rig;
+    if (!rig || !EV.type) return;
+    if (EV.type === 'serpent') {
+      rig.lunge = null;
+      rig.nextLunge = EV.elapsed + 5;         // a beat to close back in first
+    } else if (EV.type === 'kraken') {
+      rig.nextArm = 2.5;
+      for (let i = 0; i < rig.armData.length; i++) {
+        const arm = rig.armData[i];
+        arm.state = 'idle'; arm.st = 0; arm.targetSet = false; arm.slammed = false;
+      }
+    } else if (EV.type === 'bloop') {
+      bloopSweep(rig);                        // wheel round, then pick a fresh pass
+      rig.prevD = 1e9; rig.cpaDone = false;
+    }
+  }
+
+  function setRetreating(on) {
+    on = !!on;
+    if (EV.retreating === on) return;
+    EV.retreating = on;
+    if (on) enterRetreat(); else exitRetreat();
   }
 
   function updateAnchor(dt, first) {
@@ -2199,6 +2355,8 @@ export function initEvents(ctx) {
     EV.heartT = 0;
     EV.anchored = false;
     EV.survived = true;
+    EV.retreating = false;      // a fresh event always starts in the hunt
+    EV.retreatBlend = 0;
 
     // 1) the music stops dead
     cutMusic();
@@ -2283,6 +2441,7 @@ export function initEvents(ctx) {
     }
     EV.type = null; EV.rig = null; EV.ending = false; EV.elapsed = 0;
     EV.endT = 0; EV.phase = 'none'; EV.anchored = false;
+    EV.retreating = false; EV.retreatBlend = 0;
     killRings();
     if (OV.value > 0 || OV.target > 0) setOverlay(0x000000, 0, 3);
     clearShake();
@@ -2293,8 +2452,16 @@ export function initEvents(ctx) {
     if (msg.type !== EV.type) return;
     EV.phase = msg.phase || EV.phase;
     if (ctx.state) ctx.state.eventPhase = EV.phase;
+
+    // wave 6 mercy rules: 'retreat' = the whole crew is inside the safe zone
+    // and the countdown is running (msg.data.secondsLeft); 'hunt' cancels it.
+    // Anything else the server says while a countdown is live leaves it alone.
+    if (EV.phase === 'retreat') setRetreating(true);
+    else if (EV.phase === 'hunt') setRetreating(false);
+
     const rig = EV.rig;
     if (!rig) return;
+    if (EV.retreating) return;   // it is backing off: no scripted aggression
     if (EV.type === 'serpent') {
       if (EV.phase === 'lunge' && !rig.lunge && !EV.ending) { startLunge(rig); rig.nextLunge = EV.elapsed + 9; }
       else if (EV.phase === 'dive') { rig.nextLunge = EV.elapsed + 12; }
@@ -2318,6 +2485,7 @@ export function initEvents(ctx) {
   // ---- local phase scripting when the server stays quiet ----
   function autoPhase() {
     const p = clamp(EV.elapsed / (EV.duration || 90), 0, 1);
+    if (EV.retreating) return;   // wave 6: it is leaving, not grabbing
     if (EV.type === 'kraken' && EV.rig && p > 0.5 && p < 0.9 && EV.rig.gripArm < 0 && !EV.rig.gripDone) {
       EV.rig.gripDone = true;
       beginGrip(EV.rig);
@@ -2558,6 +2726,11 @@ export function initEvents(ctx) {
     if (EV.type) {
       updateAnchor(dt, false);
       EV.elapsed += dt;   // keeps running through the departure so it swims away
+      // wave 6: ease on and off the offshore retreat circle. Frozen once the
+      // event is ending, so the departure plays out from wherever it left off.
+      if (!EV.ending) {
+        EV.retreatBlend = clamp(EV.retreatBlend + (EV.retreating ? dt : -dt) / RETREAT_RAMP, 0, 1);
+      }
       if (!EV.ending) {
         // 2.5 s of pure silence, then the dread starts
         EV.droneT += dt;
