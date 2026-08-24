@@ -14,7 +14,8 @@ A co-op 3D multiplayer fishing party game for 2–8 friends. Built with Three.js
 - ⛈️ **Weather with a pity system**: Clear, Overcast, Dead Fog, Rain Squall, Thunderstorm — real wave-height changes, fishing luck boosts, lightning hazards, weather-exclusive fish, and storms that make horror events 2.5× more likely. Stay dry too long and the pity system sends the storm to find you
 - 🔨 **Kill your catch**: fish land at your feet *alive and flopping* — bonk them before they escape, then scoop up the glowing prize. Space vaults you out of the water onto shore, dock, or boat
 - 🏪 **Shop & progression**: 5 rods, 4 boats, 5 baits, 5 weapons (melee + ranged), luck charms, diving gear, and the Tsunami Ward
-- 💀 **Down but not out**: revive teammates with Sea Salts, tow drowned bodies up with the Rescue Claw, or self-revive with the pricey Revival Kit — but if the *whole* crew goes down at once, the sea sends a 300-meter doomsday wave to collect you
+- 💀 **Down but not out**: revive teammates with Sea Salts, tow drowned bodies up with the Rescue Claw, or self-revive with the pricey Revival Kit — but if the *whole* crew goes down at once, the sea sends a 300-meter doomsday wave to collect you (unless a team **Revival Token** burns in your place)
+- 🏝️ **The island is sacred ground**: event monsters can't hurt you in the spawn zone — hide the whole crew there and the creature circles offshore, gives up after a 20-second standoff, and leaves. No event hit can one-shot you, and the Bloop grants an adrenaline rush so you can actually outrun it
 - 🎯 **Perfect throws**: release your cast between the marked lines for bonus luck and faster bites
 - 📈 **Quota pressure**: the target grows ×1.55 every cycle; miss the deadline and the wave comes
 - 👹 **Horror events**: The Serpent, The Kraken, The Bloop. The soundtrack cuts to silence, day snaps to night, and something the size of a building surfaces. Survive to unlock their catchable offspring
