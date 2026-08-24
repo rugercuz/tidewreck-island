@@ -314,6 +314,8 @@ export const SHOP = [
   { id: 'snorkel',  kind: 'diving', level: 2, name: 'Snorkel',    price: 200,  air: 40,  desc: 'Stay under 40s.' },
   { id: 'scuba',    kind: 'diving', level: 3, name: 'Scuba Tank', price: 1500, air: 120, desc: 'Stay under 2 minutes.' },
   { id: 'deepsuit', kind: 'diving', level: 4, name: 'Deepsuit',   price: 6000, air: 300, desc: '5 minutes, pressure-proof.' },
+  // team consumables - bought from the shared wallet, owned by the whole crew
+  { id: 'revivetoken', kind: 'token', name: 'Revival Token', price: 5000, desc: 'If the WHOLE crew goes down, one token burns instead - everyone gets back up. Stacks.' },
   // the big one - team purchase, consumable, price rises 50% each time
   { id: 'ward', kind: 'ward', name: 'Tsunami Ward', price: 15000, desc: 'Ancient charm. Pushes the tsunami back 3 days. Price rises each purchase.' },
 ];
@@ -332,6 +334,25 @@ export const ECON = {
   WARD_PRICE_GROWTH: 1.5,
   WEIGHT_VALUE_EXP: 0.35,    // value *= (kg / kgMin)^exp — heavier fish worth more
   QUOTA_FAIL_GRACE_SECONDS: 20, // tsunami cinematic length before game over
+};
+
+// ---------------- Safe zone & event mercy rules ----------------
+// The spawn island (and its beach shallows) is a SAFE ZONE:
+// - Event creatures cannot hurt players inside it, and no single event hit
+//   can ever deal more than EVENT_MAX_HIT (no one-shots, anywhere).
+// - A horror event can only START if at least one alive player is OUTSIDE
+//   the zone at the nightly roll.
+// - During an event, if EVERY alive player is inside the zone, the creature
+//   just circles offshore and a retreat countdown starts; when it hits zero
+//   the creature gives up and leaves (event ends, survived). Stepping back
+//   outside cancels the countdown.
+// - While the Bloop hunts, everyone gets an adrenaline surge so it can
+//   actually be outrun.
+export const SAFE_ZONE = {
+  RADIUS: 140,            // metres from island centre
+  RETREAT_SECONDS: 20,    // all-inside countdown before the creature leaves
+  EVENT_MAX_HIT: 45,      // hard cap on any single event-creature hit
+  BLOOP_ADRENALINE: 1.3,  // move + boat speed multiplier during the Bloop
 };
 
 // ---------------- Horror events ----------------

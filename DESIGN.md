@@ -330,3 +330,41 @@ screen remain; restore the hud on phase changes back to menu/lobby). events.js r
 wave as a true doomsday: a curling water wall reaching HUNDREDS of metres up ("to the sky"),
 sky gone black-green, lightning flickering inside the wave face, glowing foam crest, the sea
 visibly drawn back first, building ground-shake, deep quake audio — then white-out.
+
+## Wave 6 addendum — safe zone, event mercy, adrenaline, Revival Tokens
+
+See constants: SAFE_ZONE and the new 'token' SHOP item (revivetoken).
+
+**Safe zone (server-authoritative, applies to ALL three events):** a player is "inside" when
+their horizontal distance from the origin is <= SAFE_ZONE.RADIUS. Rules:
+1. EVENT DAMAGE: any damage whose cause is an event type ('serpent'|'kraken'|'bloop') is
+   IGNORED for players inside the zone, and clamped to SAFE_ZONE.EVENT_MAX_HIT for everyone
+   else (applies to both client-reported PLAYER_HIT and server-side event damage paths).
+   Non-event damage (drowning, enemies, lightning) is unchanged.
+2. TRIGGERING: the nightly event roll only fires if at least one ALIVE player is outside the
+   zone at that moment (the /event debug command stays unconditional).
+3. RETREAT: during an event, when EVERY alive player is inside the zone, start a
+   RETREAT_SECONDS countdown (tick it server-side; broadcast progress ~1/s via the existing
+   EVENT_PHASE channel as {type, phase:'retreat', data:{secondsLeft}}). Any alive player
+   stepping outside cancels it (broadcast one EVENT_PHASE {phase:'hunt'} so clients clear the
+   countdown). At zero: end the event immediately with survived = true (normal EVENT_END with
+   its unlock). The event duration timer otherwise runs as before.
+
+**Client creature behavior:** while a retreat countdown is active (client hears
+phase 'retreat'), the creature stops menacing and CIRCLES OFFSHORE — it must never come
+within ~SAFE_ZONE.RADIUS + 25 m of the origin during this state; on 'hunt' it resumes
+normal behavior; on EVENT_END it departs as usual.
+
+**Adrenaline (Bloop only):** while ctx.state.eventActive === 'bloop', local player run/swim
+speeds and boat max speed/acceleration are multiplied by SAFE_ZONE.BLOOP_ADRENALINE.
+Client-side feel only; no server change. ui shows a small 'ADRENALINE' chip while active.
+
+**Revival Tokens (team item):** BUY_ITEM 'revivetoken' (kind 'token') deducts from the shared
+wallet and increments a TEAM counter (like wards; no per-player ownership); include
+reviveTokens in WORLD_STATE. On a full-crew wipe: if reviveTokens > 0, consume ONE instead of
+triggering the doomsday — revive ALL players at the campfire at 50% hp (REVIVED broadcast for
+each, by:null, cause:'revivetoken'), announce via CHAT_MSG from 'ISLAND', and if an event is
+active it continues (the crew is back on the island, which is safe anyway). Zero tokens =
+doomsday exactly as before. ui: token count visible in the HUD (next to wards/purse area),
+celebratory toast on token save, shop card renders via the generic path (verify kind 'token'
+is handled and shows the team-owned count).
