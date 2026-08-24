@@ -2313,6 +2313,209 @@ kbd.wide { min-width: 54px; }
 .shop-note.team-note b { color: var(--gold); }
 
 /* =================================================================
+   WAVE 7 — DEEP WATER, RAZORFIN FRENZY, HEADSHOT STUNS
+   ================================================================= */
+
+/* ---- DEEP WATER chip ----
+   Lives in the top-left status column with the area chip, because it IS a
+   status: you are out past the shelf with a lot of water under you. Only
+   the pulse rate (--rate, written by ui.js from the risk estimate) and the
+   palette (data-lvl) move — the wording stays flat, so the actual scare
+   still belongs to the ambush banner. */
+.deep-chip {
+  --rate: 2.2s;
+  --dw: #7fd7ff;
+  --dw-glow: rgba(127, 215, 255, 0.35);
+  display: none; align-items: center; gap: 9px;
+  padding: 6px 14px 6px 9px; border-radius: 999px;
+  background: linear-gradient(180deg, rgba(6, 32, 52, 0.78), rgba(2, 12, 22, 0.82));
+  border: 1.5px solid var(--dw);
+  color: var(--dw);
+  -webkit-backdrop-filter: blur(8px); backdrop-filter: blur(8px);
+  white-space: nowrap;
+}
+.deep-chip.show { display: flex; animation: dwPulse var(--rate) ease-in-out infinite; }
+@keyframes dwPulse {
+  0%, 100% { box-shadow: 0 0 8px var(--dw-glow); filter: brightness(0.92); }
+  50% { box-shadow: 0 0 28px var(--dw-glow); filter: brightness(1.24); }
+}
+.deep-chip[data-lvl="1"] { --dw: #ffd06a; --dw-glow: rgba(255, 208, 106, 0.42); }
+.deep-chip[data-lvl="2"] { --dw: #ff9a5c; --dw-glow: rgba(255, 154, 92, 0.52); }
+.deep-chip[data-lvl="3"] { --dw: #ff5a52; --dw-glow: rgba(255, 90, 82, 0.65); }
+.dp-ico { width: 22px; height: 22px; flex: none; display: block; filter: drop-shadow(0 0 7px var(--dw-glow)); }
+.dp-ico svg { width: 100%; height: 100%; display: block; }
+.dp-txt { display: flex; flex-direction: column; line-height: 1.08; }
+.dp-txt b { font-size: 11.5px; font-weight: 900; letter-spacing: 0.16em; }
+.dp-txt i {
+  font-style: normal; font-size: 9px; font-weight: 800; letter-spacing: 0.09em;
+  text-transform: uppercase; color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---- RAZORFIN FRENZY chip — the same column, one step worse ---- */
+.frenzy-chip {
+  display: none; align-items: center; gap: 9px;
+  padding: 6px 14px 6px 9px; border-radius: 999px;
+  background: linear-gradient(180deg, rgba(122, 12, 14, 0.86), rgba(28, 2, 4, 0.9));
+  border: 1.5px solid rgba(255, 90, 82, 0.85);
+  color: #ff8a7c;
+  -webkit-backdrop-filter: blur(8px); backdrop-filter: blur(8px);
+  white-space: nowrap;
+}
+.frenzy-chip.show { display: flex; animation: fzPulse 400ms ease-in-out infinite alternate; }
+@keyframes fzPulse {
+  from { box-shadow: 0 0 10px rgba(255, 60, 50, 0.35); transform: translateX(-1px); }
+  to { box-shadow: 0 0 30px rgba(255, 60, 50, 0.8); transform: translateX(1px); }
+}
+.fz-ico { width: 22px; height: 22px; flex: none; display: block; filter: drop-shadow(0 0 8px rgba(255, 60, 50, 0.75)); }
+.fz-ico svg { width: 100%; height: 100%; display: block; }
+.fz-txt { display: flex; flex-direction: column; line-height: 1.08; }
+.fz-txt b { font-size: 11.5px; font-weight: 900; letter-spacing: 0.14em; color: #ffd9d4; }
+.fz-txt i {
+  font-style: normal; font-size: 9px; font-weight: 800; letter-spacing: 0.09em;
+  text-transform: uppercase; color: rgba(255, 154, 142, 0.8);
+}
+
+/* ---- the frenzy vignette ----
+   Held for as long as the pack is on you. It is a HARDER, faster red than
+   the event vignette on purpose: a giant circling the boat breathes, teeth
+   in the water do not. It sits under .damage-vignette so a bite still
+   flashes clearly on top of it. */
+.frenzy-vignette {
+  position: absolute; inset: 0; pointer-events: none; opacity: 0;
+  transition: opacity 300ms ease;
+  background:
+    radial-gradient(112% 86% at 50% 50%, rgba(0, 0, 0, 0) 24%, rgba(186, 14, 12, 0.34) 70%, rgba(92, 0, 0, 0.74) 100%);
+}
+.frenzy-vignette.on { opacity: 1; animation: fzBreath 820ms ease-in-out infinite; }
+@keyframes fzBreath { 0%, 100% { opacity: 0.6; } 50% { opacity: 1; } }
+
+/* while the pack is on you, your health is the only number that matters */
+#ui.frenzy-on .hp-bar {
+  border-color: rgba(255, 90, 82, 0.55);
+  box-shadow: inset 0 2px 6px rgba(0, 0, 0, 0.6), 0 0 18px rgba(255, 60, 50, 0.35);
+}
+#ui.frenzy-on .hp-bar .bar-fill { animation: lowpulse 620ms ease-in-out infinite; }
+
+/* ---- "SOMETHING'S CIRCLING BENEATH YOU" ----
+   The warn telegraph, target only, roughly AMBUSH.WARN_SECONDS long. The
+   text shakes; the panel does not, so it stays readable while it does. */
+.ambush-banner {
+  position: absolute; left: 0; right: 0; top: 27%;
+  text-align: center; pointer-events: none;
+  opacity: 0; visibility: hidden;
+}
+.ambush-banner.show { opacity: 1; visibility: visible; animation: amIn 2.2s ease-out forwards; }
+@keyframes amIn {
+  0% { opacity: 0; transform: scale(1.12); filter: blur(9px); }
+  9% { opacity: 1; transform: scale(1); filter: blur(0); }
+  84% { opacity: 1; }
+  100% { opacity: 0; transform: scale(0.98); }
+}
+.am-line { display: inline-flex; align-items: center; gap: 14px; }
+.am-ico {
+  width: 46px; height: 46px; flex: none; display: block; color: #ff4a3d;
+  filter: drop-shadow(0 0 16px rgba(255, 50, 40, 0.8));
+  animation: amFin 460ms ease-in-out infinite alternate;
+}
+.am-ico svg { width: 100%; height: 100%; display: block; }
+@keyframes amFin { from { transform: translateY(2px) rotate(-5deg); } to { transform: translateY(-3px) rotate(5deg); } }
+.am-line b {
+  font-size: clamp(21px, 3.4vw, 46px); font-weight: 900; letter-spacing: 0.1em;
+  color: #ffd9d4;
+  text-shadow: 0 0 30px rgba(255, 40, 30, 0.7), 0 5px 0 rgba(0, 0, 0, 0.8);
+  animation: amShake 200ms steps(2) infinite;
+}
+@keyframes amShake {
+  0%, 100% { transform: translate(-3px, 1px); }
+  25% { transform: translate(3px, -2px); }
+  50% { transform: translate(-2px, -2px); }
+  75% { transform: translate(2px, 2px); }
+}
+.am-sub {
+  margin-top: 12px;
+  font-size: clamp(11px, 1.3vw, 16px); font-weight: 800;
+  letter-spacing: 0.3em; text-transform: uppercase; color: #ff9a8e;
+  text-shadow: 0 2px 12px rgba(0, 0, 0, 0.9);
+}
+
+/* ---- "IT'S DAZED — GO!" — a head hit landed on one of the giants ----
+   Gold, not red: for four seconds the horror palette is wrong and this is
+   the one thing on screen telling you to move. The bar drains over exactly
+   the window the server sent (ui.js writes the transition duration). */
+.dazed-banner {
+  position: absolute; left: 50%; top: 30%;
+  transform: translateX(-50%) translateY(-8px);
+  display: flex; align-items: center; gap: 14px;
+  padding: 12px 26px 12px 16px; border-radius: 999px;
+  background: linear-gradient(180deg, rgba(88, 64, 8, 0.86), rgba(24, 14, 2, 0.9));
+  border: 1.5px solid rgba(255, 214, 96, 0.8);
+  box-shadow: 0 0 0 2px rgba(255, 214, 96, 0.14), 0 0 40px rgba(255, 202, 74, 0.45), var(--shadow-lg);
+  -webkit-backdrop-filter: var(--blur); backdrop-filter: var(--blur);
+  pointer-events: none; white-space: nowrap;
+  opacity: 0; visibility: hidden;
+  transition: opacity 180ms ease, transform 180ms ease, visibility 180ms;
+}
+.dazed-banner.show {
+  opacity: 1; visibility: visible; transform: translateX(-50%) translateY(0);
+  animation: dzBreath 680ms ease-in-out infinite alternate;
+}
+@keyframes dzBreath {
+  from { box-shadow: 0 0 0 2px rgba(255, 214, 96, 0.12), 0 0 26px rgba(255, 202, 74, 0.32), var(--shadow-lg); }
+  to { box-shadow: 0 0 0 3px rgba(255, 214, 96, 0.26), 0 0 56px rgba(255, 202, 74, 0.7), var(--shadow-lg); }
+}
+.dz-ico {
+  width: 34px; height: 34px; flex: none; display: block; color: #ffe6a0;
+  filter: drop-shadow(0 0 10px rgba(255, 202, 74, 0.8));
+  animation: dzWobble 1.5s ease-in-out infinite;
+}
+.dz-ico svg { width: 100%; height: 100%; display: block; }
+@keyframes dzWobble { 0%, 100% { transform: rotate(-10deg); } 50% { transform: rotate(10deg); } }
+.dz-main { display: flex; flex-direction: column; gap: 7px; min-width: 236px; }
+.dz-txt {
+  font-size: clamp(15px, 2vw, 25px); font-weight: 900; letter-spacing: 0.13em;
+  color: #fff3cf;
+  text-shadow: 0 0 18px rgba(255, 202, 74, 0.7), 0 3px 0 rgba(0, 0, 0, 0.65);
+}
+.dz-bar {
+  position: relative; height: 6px; border-radius: 999px; overflow: hidden;
+  background: rgba(24, 14, 2, 0.8);
+  box-shadow: inset 0 1px 4px rgba(0, 0, 0, 0.6);
+}
+.dz-fill {
+  position: absolute; left: 0; top: 0; bottom: 0; width: 100%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, #ffb03a, #fff0b8);
+  box-shadow: 0 0 10px rgba(255, 202, 74, 0.7);
+}
+
+/* ---- STUNNED! — the headshot popover, floating up off the crosshair ---- */
+.stun-pop {
+  position: absolute; left: 50%; top: 43%;
+  transform: translate(-50%, -50%);
+  text-align: center; white-space: nowrap;
+  pointer-events: none; opacity: 0; visibility: hidden;
+}
+.stun-pop.show { visibility: visible; animation: stunPop 950ms cubic-bezier(.16, .9, .3, 1) forwards; }
+@keyframes stunPop {
+  0% { opacity: 0; transform: translate(-50%, -50%) scale(0.55); }
+  18% { opacity: 1; transform: translate(-50%, -58%) scale(1.14); }
+  32% { transform: translate(-50%, -60%) scale(1); }
+  72% { opacity: 1; }
+  100% { opacity: 0; transform: translate(-50%, -108%) scale(1.03); }
+}
+.stun-pop b {
+  font-size: clamp(17px, 2.4vw, 34px); font-weight: 900; letter-spacing: 0.16em;
+  color: #fff6d8;
+  text-shadow: 0 0 22px rgba(255, 202, 74, 0.9), 0 0 46px rgba(255, 140, 40, 0.5), 0 4px 0 rgba(0, 0, 0, 0.75);
+}
+/* the giants get the loud one */
+.stun-pop.is-big b {
+  font-size: clamp(20px, 3vw, 42px); color: #fff;
+  text-shadow: 0 0 26px rgba(255, 90, 82, 0.95), 0 0 60px rgba(255, 40, 30, 0.55), 0 4px 0 rgba(0, 0, 0, 0.8);
+}
+
+/* =================================================================
    RESPONSIVE — comfortable down to 1280x720, usable below
    ================================================================= */
 @media (max-width: 1440px) {
@@ -2326,6 +2529,7 @@ kbd.wide { min-width: 54px; }
   .hud-bottomleft { width: min(360px, 40vw); }
   .ad-txt i { display: none; }
   .token-pill i { display: none; }
+  .dz-main { min-width: 190px; }
 }
 @media (max-width: 900px) {
   .menu-stack { width: 94vw; }
@@ -2371,6 +2575,17 @@ kbd.wide { min-width: 54px; }
   .toast-token .toast-text { font-size: 15px; }
   .tp-num { font-size: 16px; }
   .tp-ico { width: 20px; height: 20px; }
+  /* wave 7 */
+  .deep-chip, .frenzy-chip { padding: 5px 11px 5px 7px; gap: 7px; }
+  .dp-ico, .fz-ico { width: 18px; height: 18px; }
+  .dp-txt b, .fz-txt b { font-size: 10px; letter-spacing: 0.12em; }
+  .dp-txt i, .fz-txt i { font-size: 8px; }
+  .am-ico { width: 32px; height: 32px; }
+  .am-line { gap: 10px; }
+  .am-sub { margin-top: 8px; letter-spacing: 0.22em; }
+  .dazed-banner { padding: 9px 18px 9px 11px; gap: 10px; }
+  .dz-ico { width: 26px; height: 26px; }
+  .dz-main { min-width: 168px; gap: 5px; }
 }
 @media (max-height: 720px) {
   .title-block { margin-top: 0; }
@@ -2398,6 +2613,9 @@ kbd.wide { min-width: 54px; }
   .rb-ico { width: 26px; height: 26px; }
   .rb-main { gap: 4px; }
   #ui.retreat-on .toast-layer { top: 142px; }
+  .ambush-banner { top: 24%; }
+  .dazed-banner { top: 28%; }
+  .stun-pop { top: 41%; }
 }
 
 /* reduce motion */

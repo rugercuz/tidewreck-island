@@ -19,7 +19,8 @@ A co-op 3D multiplayer fishing party game for 2–8 friends. Built with Three.js
 - 🎯 **Perfect throws**: release your cast between the marked lines for bonus luck and faster bites
 - 📈 **Quota pressure**: the target grows ×1.55 every cycle; miss the deadline and the wave comes
 - 👹 **Horror events**: The Serpent, The Kraken, The Bloop. The soundtrack cuts to silence, day snaps to night, and something the size of a building surfaces. Survive to unlock their catchable offspring
-- ⚔️ **Enemies & weapons**: barracuda packs, reef sharks, abyss stalkers, jellies, morays, and the Depthmaw — fight back with club, cutlass, harpoon, speargun, or Storm Trident
+- ⚔️ **Enemies & weapons**: barracuda packs, reef sharks, abyss stalkers, jellies, morays, and the Depthmaw — fight back with club, cutlass, harpoon, speargun, or Storm Trident. Every hit staggers; land a **headshot** for 1.5× damage and a full stun — and a head hit on an event giant *dazes it for 4 seconds* so you can run
+- 🩸 **The deep hunts loners**: swim too far from land and your luck starts rolling — the farther and deeper (and more alone) you are, the sooner a **Razorfin frenzy** erupts out of nowhere. Fight the pack off or sprint for the boat, dry land, or the island
 - 🎵 **Fully synthesized soundtrack & SFX** via WebAudio — zero audio files
 - 🏠 **Rooms**: create an island with a 4-letter code, set max players and difficulty, and share it with friends
 

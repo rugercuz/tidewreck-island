@@ -14,7 +14,7 @@
 
 import * as THREE from 'three';
 import { createFishMesh } from './fish.js';
-import { MSG, EVENTS, ECON, SAFE_ZONE, fishById } from '/shared/constants.js';
+import { MSG, EVENTS, ECON, SAFE_ZONE, COMBAT, fishById } from '/shared/constants.js';
 
 // ---------------- tunables ----------------
 // COLOSSAL SCALE: every creature is sized from EVENTS[type].bodyLength so the
@@ -70,6 +70,23 @@ const RETREAT_FLOOR = {
 };
 const RETREAT_OMEGA = { serpent: 0.040, kraken: 0.022, bloop: 0.030 }; // rad/s
 
+// ---------------- wave 7: head zone + stun ----------------
+// enemies.js owns hit detection for every weapon; it asks us where the head is
+// (headWorld / headRadius) and how close a point is to the body (bodyDist), then
+// reports the connection to the server. A head hit comes back as
+// EVENT_PHASE {phase:'stunned', data:{seconds}} and freezes the giant dead.
+//
+// The radii are DELIBERATELY generous: these things are 100-260 m long, and a
+// player squinting up a serpent's skull from a rocking deck deserves the hit.
+const HEAD_R = {
+  serpent: SERPENT_HEAD_LEN * 0.62,   // ~15 m
+  kraken:  KRAKEN_DOME_R * 0.85,      // ~39 m of dome-front
+  bloop:   BLOOP_HEAD * 0.62,         // ~32 m of maw
+};
+const STUN_SECONDS_MAX = 12;          // sanity clamp on whatever the server sends
+const STUN_FALLBACK = (COMBAT && COMBAT.EVENT_STUN_SECONDS) || 4;
+const BODY_HIT_PAD = 0.75;            // metres of slack on a body connection
+
 const SHAKE_MAX_OFFSET = 0.62;  // metres at trauma 1
 const SHAKE_MAX_ROLL   = 0.055; // radians at trauma 1
 const SWELL_MAX_RISE   = 1.35;  // metres of slow deck heave at swell 1
@@ -95,6 +112,9 @@ const _up = new THREE.Vector3();
 const _fr = new THREE.Vector3();
 const _fu = new THREE.Vector3();
 const _sc = new THREE.Vector3();
+// wave 7: head/body queries are answered from OUTSIDE our own update (enemies.js
+// calls them mid-frame), so they get scratch nobody else touches.
+const _hq = new THREE.Vector3();
 const _m1 = new THREE.Matrix4();
 const UP  = new THREE.Vector3(0, 1, 0);
 
@@ -727,6 +747,7 @@ export function initEvents(ctx) {
     if (ctx.state && ctx.state.phase !== 'playing') return;
     if (ctx.state && ctx.state.hp <= 0) return;
     if (EV.retreating) return;   // wave 6: a retreating creature hurts nobody
+    if (EV.stunned) return;      // wave 7: nor does a dazed one
     try { if (ctx.net && ctx.net.send) ctx.net.send(MSG.PLAYER_HIT, { dmg, cause }); } catch (e) { /* offline */ }
     try { if (ctx.bus && ctx.bus.emit) ctx.bus.emit('localDamaged', { dmg, cause }); } catch (e) { /* no listener */ }
   }
@@ -985,8 +1006,9 @@ export function initEvents(ctx) {
     const dur = EV.duration || 90;
     const head = rig.pts[0];
 
-    // lunge scheduling (never while it is backing off - see setRetreating)
-    if (!EV.ending && !EV.retreating) {
+    // lunge scheduling (never while it is backing off - see setRetreating -
+    // and never while a head hit has it seeing stars)
+    if (!EV.ending && !EV.retreating && !EV.stunned) {
       if (rig.lunge && EV.elapsed > rig.lunge.start + rig.lunge.dur + 0.5) rig.lunge = null;
       if (!rig.lunge && EV.elapsed > rig.nextLunge) {
         startLunge(rig);
@@ -1060,6 +1082,10 @@ export function initEvents(ctx) {
     rig.head.position.copy(rig.pts[0]).addScaledVector(_v2.normalize(), SERPENT_HEAD_LEN * 0.24);
     rig.head.quaternion.setFromRotationMatrix(_m1);
     rig.light.position.copy(rig.head.position);
+    // wave 7: publish the skull for enemies.js (_v2 is the unit heading here)
+    EV.head.copy(rig.head.position).addScaledVector(_v2, SERPENT_HEAD_LEN * 0.22);
+    EV.head.y += SERPENT_HEAD_LEN * 0.05;
+    EV.headOk = true;
     animateFish(rig.neck, t);
 
     // jaw + roar beats
@@ -1239,6 +1265,13 @@ export function initEvents(ctx) {
     _v1.copy(EV.focus).sub(rig.body.position); _v1.y = 0;
     if (_v1.lengthSq() > 1e-4) rig.body.rotation.y = Math.atan2(_v1.x, _v1.z);
     if (EV.ending) rig.body.position.y -= Math.pow(clamp(EV.endT / 4.5, 0, 1), 1.7) * KRAKEN_REACH * 1.6;
+    // wave 7: the "head" is the front of the dome, between the eyes
+    EV.head.set(
+      rig.body.position.x + Math.sin(rig.body.rotation.y) * KRAKEN_DOME_R * 0.82,
+      rig.body.position.y + KRAKEN_DOME_R * 0.46,
+      rig.body.position.z + Math.cos(rig.body.rotation.y) * KRAKEN_DOME_R * 0.82
+    );
+    EV.headOk = true;
     animateFish(rig.mantle, t);
     const eyeP = 0.6 + 0.4 * Math.abs(Math.sin(t * 1.15));
     rig.eyeL.material.opacity = rig.eyeR.material.opacity = eyeP * (EV.ending ? clamp(1 - EV.endT / 3, 0, 1) : 1);
@@ -1251,8 +1284,8 @@ export function initEvents(ctx) {
       if (rig.gripT <= 0 || rig.gripHits >= 6) releaseGrip(rig);
     }
 
-    // arm director (silent while it is backing off)
-    if (!EV.ending && !EV.retreating) {
+    // arm director (silent while it is backing off, or dazed)
+    if (!EV.ending && !EV.retreating && !EV.stunned) {
       rig.nextArm -= dt;
       if (rig.nextArm <= 0) {
         const prog = clamp(EV.elapsed / dur, 0, 1);
@@ -1367,7 +1400,7 @@ export function initEvents(ctx) {
     // "FIGHT IT OFF": swinging a weapon near a raised arm makes it recoil (pure flavour)
     rig.attackCd -= dt;
     const st = ctx.state;
-    if (!EV.ending && rig.attackCd <= 0 && ctx.input && ctx.input.mouseDown &&
+    if (!EV.ending && !EV.stunned && rig.attackCd <= 0 && ctx.input && ctx.input.mouseDown &&
         st && st.activeTool === 'weapon' && getLocalPos(_v4)) {
       let best = -1, bestD = ARM_GIRTH * 3.2;
       for (let a = 0; a < rig.armData.length; a++) {
@@ -1658,6 +1691,7 @@ export function initEvents(ctx) {
   }
 
   function bloopSteer(rig, dt, t, p) {
+    if (EV.stunned) return;   // wave 7: dead in the water, steering nothing
     rig.stageT += dt;
     const f = EV.focus;
     let turnRate = 0.42;
@@ -1848,6 +1882,9 @@ export function initEvents(ctx) {
     rig.headG.rotateZ(rig.bank);
     rig.light.position.copy(rig.headPos);
     rig.light.intensity = 160 + 120 * rig.mawOpen;
+    // wave 7: the maw is the head zone — hit it and the whole 260 m goes limp
+    EV.head.copy(rig.headPos).addScaledVector(rig.dir, BLOOP_HEAD * 0.26);
+    EV.headOk = true;
 
     // maw: hinges open on the run-in, snaps open as it goes past the hull
     if (!EV.ending && rig.stage === 'dive') {
@@ -1900,7 +1937,7 @@ export function initEvents(ctx) {
 
     // ---- surface interaction: wake, breach foam, displacement ----
     rig.wakeCd -= dt;
-    if (!EV.ending && rig.wakeCd <= 0) {
+    if (!EV.ending && !EV.stunned && rig.wakeCd <= 0) {
       const q = rpts[dorsalIdx], r = rad[dorsalIdx];
       const wy = waterY(q.x, q.z, t);
       const clearance = q.y + r * 0.78 - wy;
@@ -1948,7 +1985,7 @@ export function initEvents(ctx) {
     }
 
     // the call — it announces itself, and the sound arrives before it does
-    if (!EV.ending) {
+    if (!EV.ending && !EV.stunned) {
       rig.nextCall -= dt;
       if (rig.nextCall <= 0) { bloopCall(rig, t); rig.nextCall = lerp(13, 5.5, p); }
     }
@@ -1964,7 +2001,7 @@ export function initEvents(ctx) {
     // It only truly hurts you if you are in the water with it — the crew on deck
     // just get the lurch. Swimming into an open maw is its own kind of mistake.
     rig.dmgCd -= dt;
-    if (!EV.ending && !EV.retreating && rig.dmgCd <= 0 &&
+    if (!EV.ending && !EV.retreating && !EV.stunned && rig.dmgCd <= 0 &&
         rig.near < BLOOP_GIRTH * 1.1 && localIsSwimming()) {
       rig.dmgCd = 2.4;
       const inMaw = rig.mawOpen > 0.5 && getLocalPos(_v3) &&
@@ -2225,6 +2262,9 @@ export function initEvents(ctx) {
     anchored: false, survived: true, day: 1,
     // wave 6: the whole crew is inside the safe zone and the thing is giving up
     retreating: false, retreatBlend: 0,
+    // wave 7: somebody put a harpoon through its skull
+    stunned: false, stunT: 0, stunTotal: 0, stunFreeze: 0, dazeFade: 0,
+    head: new THREE.Vector3(), headOk: false, lastT: 0,
   };
 
   const TS = { active: false, elapsed: 0, dur: ECON.QUOTA_FAIL_GRACE_SECONDS || 20, rig: null };
@@ -2311,7 +2351,194 @@ export function initEvents(ctx) {
     if (on) enterRetreat(); else exitRetreat();
   }
 
+  // ---------------------------------------------------------
+  // Wave 7 — the head zone, the body surface, and the daze
+  //
+  // enemies.js owns every weapon and therefore every hit test; all it needs
+  // from us is geometry. `EV.head` is written by each creature's own update
+  // (so it is always in step with the instance matrices we just drew) and
+  // `bodyDist` walks the live spine/arm points the rigs already keep around.
+  // Both go quiet the moment the thing is leaving.
+  // ---------------------------------------------------------
+  function creatureHeadR() {
+    return HEAD_R[EV.type] || 0;
+  }
+
+  function headAvailable() {
+    return !!(EV.type && EV.rig && EV.headOk && !EV.ending);
+  }
+
+  // Distance from a world point to the creature's hide (negative = inside).
+  // Infinity when there is nothing out there to hit.
+  function bodyDistance(p) {
+    if (!headAvailable() || !p || typeof p.x !== 'number') return Infinity;
+    const rig = EV.rig;
+    let best = Infinity;
+    if (EV.type === 'serpent') {
+      for (let i = 0; i < SERPENT_SEGMENTS; i++) {
+        const q = rig.pts[i];
+        const dx = p.x - q.x, dy = p.y - q.y, dz = p.z - q.z;
+        const d = Math.sqrt(dx * dx + dy * dy + dz * dz) - rig.radii[i];
+        if (d < best) best = d;
+      }
+    } else if (EV.type === 'kraken') {
+      const b = rig.body.position;
+      const dx = p.x - b.x, dy = (p.y - b.y) / 0.62, dz = p.z - b.z;
+      best = Math.sqrt(dx * dx + dy * dy + dz * dz) - KRAKEN_DOME_R;
+      for (let a = 0; a < rig.armData.length; a++) {
+        const arm = rig.armData[a];
+        for (let i = 0; i < ARM_SEGMENTS; i++) {
+          const q = arm.pts[i];
+          const u = i / (ARM_SEGMENTS - 1);
+          const r = lerp(ARM_GIRTH, ARM_GIRTH * 0.22, Math.pow(u, 0.85));
+          const ex = p.x - q.x, ey = p.y - q.y, ez = p.z - q.z;
+          const d = Math.sqrt(ex * ex + ey * ey + ez * ez) - r;
+          if (d < best) best = d;
+        }
+      }
+    } else if (EV.type === 'bloop') {
+      for (let i = 0; i < BLOOP_SEGS; i++) {
+        const q = rig.rpts[i];
+        const dx = p.x - q.x, dy = p.y - q.y, dz = p.z - q.z;
+        const d = Math.sqrt(dx * dx + dy * dy + dz * dz) - rig.rad[i];
+        if (d < best) best = d;
+      }
+      const hx = p.x - rig.headPos.x, hy = p.y - rig.headPos.y, hz = p.z - rig.headPos.z;
+      const dh = Math.sqrt(hx * hx + hy * hy + hz * hz) - BLOOP_HEAD * 0.45;
+      if (dh < best) best = dh;
+    }
+    return Number.isFinite(best) ? best : Infinity;
+  }
+
+  // ---- the daze: stars and rings orbiting a head the size of a house ----
+  let daze = null;
+  function ensureDaze() {
+    if (daze) return daze;
+    const g = new THREE.Group();
+    g.visible = false;
+    const stars = [];
+    for (let i = 0; i < 9; i++) {
+      const s = glowSprite(i % 2 ? 0xfff2b8 : 0xffcf4a, 1, 0);
+      s.renderOrder = 8;
+      g.add(s);
+      stars.push({ s, ph: (i / 9) * Math.PI * 2, lift: (i % 3) - 1 });
+    }
+    const ringMeshes = [];
+    for (let i = 0; i < 3; i++) {
+      const m = new THREE.Mesh(GEO.ring, new THREE.MeshBasicMaterial({
+        color: i === 1 ? 0xfff0c0 : 0xffc84a, transparent: true, opacity: 0,
+        depthWrite: false, blending: THREE.AdditiveBlending, side: THREE.DoubleSide,
+        fog: false, toneMapped: false,
+      }));
+      m.renderOrder = 8;
+      g.add(m);
+      ringMeshes.push({ m, ph: i * 2.1, tilt: 0.35 + i * 0.4 });
+    }
+    const halo = glowSprite(0xffdd88, 1, 0);
+    halo.renderOrder = 7;
+    g.add(halo);
+    scene.add(g);
+    daze = { g, stars, rings: ringMeshes, halo };
+    return daze;
+  }
+
+  function updateDaze(dt, t) {
+    const on = EV.stunned;
+    EV.dazeFade = clamp(EV.dazeFade + (on ? dt * 3.6 : -dt * 2.2), 0, 1);
+    if (EV.dazeFade <= 0.005) {
+      if (daze) daze.g.visible = false;
+      return;
+    }
+    const D = ensureDaze();
+    if (!headAvailable()) { D.g.visible = false; return; }
+    D.g.visible = true;
+    const r = Math.max(4, creatureHeadR());
+    const f = EV.dazeFade;
+    D.g.position.set(EV.head.x, EV.head.y + r * 0.85, EV.head.z);
+
+    const orbit = r * 1.15;
+    for (let i = 0; i < D.stars.length; i++) {
+      const st = D.stars[i];
+      const a = st.ph + t * 1.9;
+      st.s.position.set(
+        Math.cos(a) * orbit,
+        Math.sin(a * 2 + st.ph) * r * 0.22 + st.lift * r * 0.16,
+        Math.sin(a) * orbit
+      );
+      const sz = r * 0.24 * (0.78 + 0.22 * Math.sin(t * 7.4 + st.ph));
+      st.s.scale.setScalar(sz);
+      st.s.material.opacity = f * clamp(0.45 + 0.55 * Math.sin(t * 5.1 + st.ph * 1.7), 0, 1);
+    }
+    for (let i = 0; i < D.rings.length; i++) {
+      const R = D.rings[i];
+      const u = ((t * 0.55 + R.ph * 0.33) % 1);
+      const s = r * lerp(0.5, 2.6, u);
+      R.m.scale.set(s, s, 1);
+      R.m.rotation.set(-Math.PI / 2 + Math.sin(t * 0.9 + R.ph) * R.tilt, t * 0.8 + R.ph, 0);
+      R.m.material.opacity = f * 0.5 * (1 - u) * (1 - u);
+    }
+    D.halo.scale.setScalar(r * 2.6);
+    D.halo.material.opacity = f * 0.2 * (0.7 + 0.3 * Math.sin(t * 3.1));
+  }
+
+  // ---- stun lifecycle ----
+  function beginStun(seconds) {
+    if (!EV.type || !EV.rig || EV.ending) return;
+    const s = clamp(Number(seconds) > 0 ? Number(seconds) : STUN_FALLBACK, 0.5, STUN_SECONDS_MAX);
+    const fresh = !EV.stunned;
+    EV.stunned = true;
+    EV.stunT = Math.max(EV.stunT, s);
+    EV.stunTotal = EV.stunT;
+    if (fresh) EV.stunFreeze = EV.lastT;   // the animation clock stops HERE
+    if (EV.type === 'kraken' && EV.rig.gripArm >= 0) releaseGrip(EV.rig);
+    if (!fresh) return;
+
+    sfx('eventStunned', { type: EV.type, seconds: s });
+    shake(1.05, 1.3);
+    swell(0.55, 0.34);
+    if (EV.headOk) {
+      const r = Math.max(4, creatureHeadR());
+      const wy = waterY(EV.head.x, EV.head.z, EV.lastT);
+      shockRing(EV.head.x, wy, EV.head.z, r * 0.4, r * 5.5, 2.4, 0xffe6a0, 0.6);
+      shockRing(EV.head.x, wy, EV.head.z, r * 0.2, r * 3.0, 1.5, 0xfff6d8, 0.5);
+      emit(spray, EV.head.x, EV.head.y, EV.head.z, 46, 20, r * 0.55, 1.15, 1.0, 0.88, 0.5, 1.7);
+      emit(foam, EV.head.x, EV.head.y + r * 0.3, EV.head.z, 12, 10, r * 0.7, 0.9, 0.95, 0.86, 0.55, 2.0, 5);
+    }
+  }
+
+  function clearStun() {
+    if (!EV.stunned) return;
+    EV.stunned = false;
+    EV.stunT = 0;
+    EV.stunTotal = 0;
+    // hand the phase label back to whatever it was doing before the head hit
+    if (EV.phase === 'stunned') {
+      EV.phase = EV.ending ? 'depart' : (EV.retreating ? 'retreat' : 'hunt');
+      if (ctx.state) ctx.state.eventPhase = EV.phase;
+    }
+  }
+
+  // The shudder + eye flicker that sell "it does not know where it is".
+  // Runs on REAL time while everything else is frozen on EV.stunFreeze.
+  function updateStunFX(dt, t) {
+    const rig = EV.rig;
+    if (!rig) return;
+    const k = EV.stunTotal > 0 ? clamp(EV.stunT / EV.stunTotal, 0, 1) : 0;
+    shake(0.09 + 0.07 * Math.abs(Math.sin(t * 24)) * k, 0.3);
+    swell(0.18 * k, 0.5);
+    const gate = Math.sin(t * 31.7) > -0.35 ? 1 : 0.1;
+    const fl = (0.2 + 0.8 * Math.abs(Math.sin(t * 12.3))) * gate;
+    if (rig.eyeL && rig.eyeL.material) rig.eyeL.material.opacity = fl;
+    if (rig.eyeR && rig.eyeR.material) rig.eyeR.material.opacity = fl * 0.85;
+    if (EV.headOk && Math.random() < dt * 7) {
+      const r = Math.max(3, creatureHeadR());
+      emit(spray, EV.head.x, EV.head.y, EV.head.z, 2, 9, r * 0.5, 1.0, 1.0, 0.9, 0.55, 1.1);
+    }
+  }
+
   function updateAnchor(dt, first) {
+    // dt 0 = the wave-7 stun freeze: focus and staging centre hold where they are
+    if (!first && !(dt > 0)) return;
     const hasBoat = getBoatPos(_v1);
     const hasLocal = getLocalPos(_v2);
     let tx, tz;
@@ -2357,6 +2584,11 @@ export function initEvents(ctx) {
     EV.survived = true;
     EV.retreating = false;      // a fresh event always starts in the hunt
     EV.retreatBlend = 0;
+    EV.stunned = false;         // ...and unbruised
+    EV.stunT = 0;
+    EV.stunTotal = 0;
+    EV.dazeFade = 0;
+    EV.headOk = false;
 
     // 1) the music stops dead
     cutMusic();
@@ -2408,6 +2640,7 @@ export function initEvents(ctx) {
 
   function endEvent(data) {
     if (!EV.type || EV.ending) return;   // bus + net can both deliver this
+    clearStun();                         // wave 7: a stun never outlives the event
     EV.ending = true;
     EV.endT = 0;
     EV.phase = 'depart';
@@ -2442,6 +2675,9 @@ export function initEvents(ctx) {
     EV.type = null; EV.rig = null; EV.ending = false; EV.elapsed = 0;
     EV.endT = 0; EV.phase = 'none'; EV.anchored = false;
     EV.retreating = false; EV.retreatBlend = 0;
+    EV.stunned = false; EV.stunT = 0; EV.stunTotal = 0; EV.headOk = false;
+    EV.dazeFade = 0;
+    if (daze) { daze.g.visible = false; }
     killRings();
     if (OV.value > 0 || OV.target > 0) setOverlay(0x000000, 0, 3);
     clearShake();
@@ -2459,9 +2695,16 @@ export function initEvents(ctx) {
     if (EV.phase === 'retreat') setRetreating(true);
     else if (EV.phase === 'hunt') setRetreating(false);
 
+    // wave 7: a head hit. The giant freezes for data.seconds; the retreat flag
+    // is deliberately left alone so a countdown resumes cleanly afterwards.
+    if (EV.phase === 'stunned') {
+      beginStun(msg.data && msg.data.seconds);
+      return;
+    }
+
     const rig = EV.rig;
     if (!rig) return;
-    if (EV.retreating) return;   // it is backing off: no scripted aggression
+    if (EV.retreating || EV.stunned) return;   // backing off or dazed: no scripted aggression
     if (EV.type === 'serpent') {
       if (EV.phase === 'lunge' && !rig.lunge && !EV.ending) { startLunge(rig); rig.nextLunge = EV.elapsed + 9; }
       else if (EV.phase === 'dive') { rig.nextLunge = EV.elapsed + 12; }
@@ -2485,7 +2728,7 @@ export function initEvents(ctx) {
   // ---- local phase scripting when the server stays quiet ----
   function autoPhase() {
     const p = clamp(EV.elapsed / (EV.duration || 90), 0, 1);
-    if (EV.retreating) return;   // wave 6: it is leaving, not grabbing
+    if (EV.retreating || EV.stunned) return;   // wave 6/7: it is leaving, or seeing stars
     if (EV.type === 'kraken' && EV.rig && p > 0.5 && p < 0.9 && EV.rig.gripArm < 0 && !EV.rig.gripDone) {
       EV.rig.gripDone = true;
       beginGrip(EV.rig);
@@ -2722,13 +2965,27 @@ export function initEvents(ctx) {
   // =========================================================
   function update(dt, t) {
     if (!(dt > 0)) dt = 0.0001;
+    EV.lastT = t;
 
     if (EV.type) {
-      updateAnchor(dt, false);
-      EV.elapsed += dt;   // keeps running through the departure so it swims away
+      // wave 7: while it is stunned the creature's whole world stops - we hand
+      // its update a dt of 0 and the frozen clock it was hit on, so movement,
+      // lunges, slams, passes, wakes and damage all halt in place. Only the
+      // daze FX (and the audio/heartbeat below) run on real time.
+      if (EV.stunned) {
+        EV.stunT -= dt;
+        if (EV.stunT <= 0 || EV.ending) clearStun();
+      }
+      const frozen = EV.stunned;
+      const cdt = frozen ? 0 : dt;
+      const ctime = frozen ? EV.stunFreeze : t;
+
+      updateAnchor(cdt, false);   // the staging anchor holds still too
+      EV.elapsed += cdt;   // keeps running through the departure so it swims away
       // wave 6: ease on and off the offshore retreat circle. Frozen once the
-      // event is ending, so the departure plays out from wherever it left off.
-      if (!EV.ending) {
+      // event is ending (so the departure plays out from wherever it left off)
+      // or stunned (so a countdown picks up exactly where it stopped).
+      if (!EV.ending && !frozen) {
         EV.retreatBlend = clamp(EV.retreatBlend + (EV.retreating ? dt : -dt) / RETREAT_RAMP, 0, 1);
       }
       if (!EV.ending) {
@@ -2758,10 +3015,14 @@ export function initEvents(ctx) {
 
       const rig = EV.rig;
       if (rig && EV.type) {
-        if (EV.type === 'serpent') updateSerpent(rig, dt, t);
-        else if (EV.type === 'kraken') updateKraken(rig, dt, t);
-        else if (EV.type === 'bloop') updateBloop(rig, dt, t);
+        if (EV.type === 'serpent') updateSerpent(rig, cdt, ctime);
+        else if (EV.type === 'kraken') updateKraken(rig, cdt, ctime);
+        else if (EV.type === 'bloop') updateBloop(rig, cdt, ctime);
+        if (frozen) updateStunFX(dt, t);
       }
+      updateDaze(dt, t);
+    } else if (EV.dazeFade > 0) {
+      updateDaze(dt, t);
     }
 
     if (TS.active) updateTsunami(dt, t);
@@ -2781,5 +3042,28 @@ export function initEvents(ctx) {
     swell,
     isEventActive() { return !!EV.type; },
     isTsunamiActive() { return TS.active; },
+
+    // ---- wave 7: the seam enemies.js aims through ----
+    // Writes the CURRENT creature's head position (serpent skull, kraken
+    // dome-front, bloop maw) into `out` and returns true. False whenever there
+    // is nothing to hit: no event, no rig, or the thing is already leaving.
+    headWorld(out) {
+      if (!out || typeof out.set !== 'function') return false;
+      if (!headAvailable()) return false;
+      out.set(EV.head.x, EV.head.y, EV.head.z);
+      return true;
+    },
+    // Generous head sphere, scaled to the creature. 0 when there is no creature.
+    headRadius() { return headAvailable() ? creatureHeadR() : 0; },
+    // Distance from a world point to the hide (negative inside); Infinity if
+    // there is nothing out there. Lets enemies.js tell a body graze from a miss.
+    bodyDist(p) {
+      if (!p) return Infinity;
+      if (p.isVector3) return bodyDistance(p);
+      _hq.set(p.x || 0, p.y || 0, p.z || 0);
+      return bodyDistance(_hq);
+    },
+    bodyHitPad() { return BODY_HIT_PAD; },
+    isStunned() { return !!EV.stunned; },
   };
 }

@@ -9,6 +9,7 @@ import {
   MSG, MUTATIONS, FISH, ARTIFACTS, AREAS, SHOP, ECON, EVENTS,
   PLAYER_COLORS, PLAYER_MAX_HP, WEATHER, FLOPPER,
   LOOT_TYPES, FOUND_BAITS, UNIQUE_CHARMS, CAST_PERFECT, REVIVE, SAFE_ZONE,
+  AMBUSH, COMBAT,
   fishById, shopById, quotaTarget, wardPrice,
 } from '/shared/constants.js';
 
@@ -584,6 +585,43 @@ const SVG_TOKEN =
   '<circle cx="12" cy="12" r="6.6" fill="none" stroke="rgba(255,202,74,.45)" stroke-width="1"/>' +
   '<path d="M12 17.5s-4.3-2.7-4.3-5.5a2.45 2.45 0 0 1 4.3-1.55 2.45 2.45 0 0 1 4.3 1.55c0 2.8-4.3 5.5-4.3 5.5z" fill="#ff5e7a"/></svg>';
 
+// ---------------------------------------------------------------
+// Wave 7 — deep-water ambushes, headshot stuns
+// ---------------------------------------------------------------
+// The SERVER owns every ambush decision (MSG.AMBUSH is the only truth).
+// These numbers are only used to ESTIMATE the same risk curve locally so
+// the DEEP WATER chip can pulse at roughly the right urgency — read
+// defensively, because a missing constant must never break the HUD.
+const AMB = {
+  safeDist: Math.max(1, num(AMBUSH && AMBUSH.SAFE_DIST, 150)),
+  distFull: Math.max(2, num(AMBUSH && AMBUSH.DIST_FULL, 700)),
+  depthFull: Math.max(1, num(AMBUSH && AMBUSH.DEPTH_FULL, 120)),
+  baseRisk: Math.max(0, num(AMBUSH && AMBUSH.BASE_RISK, 0.012)),
+  maxRisk: Math.max(0.001, num(AMBUSH && AMBUSH.MAX_RISK, 0.14)),
+  warn: Math.max(0.2, num(AMBUSH && AMBUSH.WARN_SECONDS, 1.8)),
+  duration: Math.max(2, num(AMBUSH && AMBUSH.DURATION, 22)),
+};
+// how long a dazed giant stays dazed when the payload forgets to say
+const STUN_S = Math.max(0.5, num(COMBAT && COMBAT.EVENT_STUN_SECONDS, 4));
+
+// deep water — a plumb line dropping away into a trench
+const SVG_DEEP =
+  '<svg viewBox="0 0 24 24" class="ico"><path d="M1.8 6.2q2.9-2.6 5.4 0t5.1 0 5.4 0 4.5-.7" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" opacity=".85"/>' +
+  '<path d="M12 8.4v8" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>' +
+  '<path d="M8.7 13.2L12 16.8l3.3-3.6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>' +
+  '<path d="M3.2 20.6q3.5-1.7 8.8-1.7t8.8 1.7" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" opacity=".42"/></svg>';
+// razorfin — a torn fin over teeth
+const SVG_FIN =
+  '<svg viewBox="0 0 24 24" class="ico"><path d="M14.2 1.9q4.5 6.2 5.4 15.3-6.2-1.3-11-5.2 2.6-6.1 5.6-10.1z" fill="currentColor"/>' +
+  '<path d="M9.3 12.1l2.1 2.3 2-2.3 2.1 2.3 2-2.3" fill="none" stroke="rgba(4,10,16,.5)" stroke-width="1.4" stroke-linejoin="round"/>' +
+  '<path d="M1.8 20.4q2.9-2.5 5.4 0t5.1 0 5.4 0 4.5-.7" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" opacity=".65"/></svg>';
+// dazed — a star going round something very large that just got hit
+const SVG_DAZED =
+  '<svg viewBox="0 0 24 24" class="ico"><path d="M12 2.2l1.6 3.4 3.7.5-2.7 2.6.7 3.7L12 10.6l-3.3 1.8.7-3.7L6.7 6.1l3.7-.5z" fill="currentColor"/>' +
+  '<circle cx="4.4" cy="14.6" r="2" fill="currentColor" opacity=".78"/>' +
+  '<circle cx="19.8" cy="13.6" r="1.6" fill="currentColor" opacity=".58"/>' +
+  '<path d="M3.6 20.6q4.2-2.6 8.4-2.6t8.4 2.6" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" opacity=".5"/></svg>';
+
 // ===============================================================
 // initUI
 // ===============================================================
@@ -651,6 +689,15 @@ export function initUI(ctx) {
     adren: false,          // adrenaline chip currently shown
     adrenBus: null,        // last bus 'adrenaline' value (null = never heard one)
     tokens: -1,            // last painted team Revival Token count
+    // wave 7
+    frenzy: false,         // a razorfin pack is on ME right now
+    frenzyEnd: 0,          // ui.now backstop in case the 'end' beat never lands
+    ambushTimer: 0,
+    deepOn: false,         // DEEP WATER chip currently shown
+    deepLvl: -1,           // last painted danger tier (0..3)
+    deepRate: -1,          // last pulse rate written to the chip
+    dazedTimer: 0,
+    stunTimer: 0,
     roomRev: -1,
     invRev: 0,
     lastInvRender: -1,
@@ -1077,11 +1124,20 @@ export function initUI(ctx) {
   hud.innerHTML = `
     <div class="hud-vignette"></div>
     <div class="event-vignette" id="eventVignette"></div>
+    <div class="frenzy-vignette" id="frenzyVignette"></div>
     <div class="damage-vignette" id="damageVignette"></div>
 
     <div class="hud-topleft">
       <div class="artifact-tracker" id="artifactTracker"></div>
       <div class="area-chip" id="areaChip"></div>
+      <div class="deep-chip" id="deepChip" data-lvl="0" title="Far from the island, with a lot of water under you. Things hunt out here.">
+        <span class="dp-ico">${SVG_DEEP}</span>
+        <span class="dp-txt"><b>DEEP WATER</b><i id="deepSub">past the shelf</i></span>
+      </div>
+      <div class="frenzy-chip" id="frenzyChip" title="A razorfin pack has you. Reach the island, dry land or a deck.">
+        <span class="fz-ico">${SVG_FIN}</span>
+        <span class="fz-txt"><b>RAZORFIN FRENZY</b><i id="frenzySub">get to shallow water</i></span>
+      </div>
     </div>
 
     <div class="hud-topbar" id="hudTopbar">
@@ -1231,6 +1287,21 @@ export function initUI(ctx) {
       <div class="eb-desc" id="ebDesc"></div>
     </div>
 
+    <div class="ambush-banner" id="ambushBanner">
+      <div class="am-line"><span class="am-ico">${SVG_FIN}</span><b>SOMETHING'S CIRCLING BENEATH YOU</b></div>
+      <div class="am-sub">get out of the deep</div>
+    </div>
+
+    <div class="dazed-banner" id="dazedBanner">
+      <span class="dz-ico">${SVG_DAZED}</span>
+      <div class="dz-main">
+        <b class="dz-txt">IT'S DAZED — GO!</b>
+        <div class="dz-bar"><div class="dz-fill" id="dzFill"></div></div>
+      </div>
+    </div>
+
+    <div class="stun-pop" id="stunPop"><b id="stunTxt">STUNNED!</b></div>
+
     <div class="retreat-banner" id="retreatBanner">
       <span class="rb-ico" id="rbIco">${SVG_SAFE}</span>
       <div class="rb-main">
@@ -1308,6 +1379,12 @@ export function initUI(ctx) {
   const elSlotRod = $('slotRod'), elSlotWeapon = $('slotWeapon'), elInvSub = $('invSub');
   const elWeatherChip = $('weatherChip'), elWxIco = $('wxIco'), elWxName = $('wxName'), elWxHint = $('wxHint');
   const elRetreat = $('retreatBanner'), elRbIco = $('rbIco'), elRbTag = $('rbTag'), elRbTxt = $('rbTxt'), elRbFill = $('rbFill');
+  const elFrenzyVig = $('frenzyVignette');
+  const elDeep = $('deepChip'), elDeepSub = $('deepSub');
+  const elFrenzyChip = $('frenzyChip'), elFrenzySub = $('frenzySub');
+  const elAmbush = $('ambushBanner');
+  const elDazed = $('dazedBanner'), elDzFill = $('dzFill');
+  const elStunPop = $('stunPop'), elStunTxt = $('stunTxt');
   const elAdren = $('adrenChip'), elAdrenSub = $('adrenSub');
   const elTokenPill = $('tokenPill'), elTokenNum = $('tokenNum');
   const elFlopStrip = $('flopperStrip'), elFlopRows = $('flopperRows'), elLightning = $('lightningFlash');
@@ -1532,6 +1609,7 @@ export function initUI(ctx) {
       closeShop(); closeInventory(); closeChat(false); clearFloppers(); ui.lootNear = null;
       hideReviveRing(); setTowing(null); clearDownedMarkers();
       hideRetreat(); ui.adrenBus = null; setAdrenaline(false);
+      clearWave7();
     }
     // the doomsday blackout only ever lifts on the way back to the dock
     if (p === 'menu' || p === 'lobby') endDoomsday();
@@ -1560,6 +1638,7 @@ export function initUI(ctx) {
     setTowing(null);
     hideRetreat();
     setAdrenaline(false);
+    clearWave7();
     hideCastPower();
     hidePerfect();
     hideReel();
@@ -2593,6 +2672,7 @@ export function initUI(ctx) {
 
   function showEventBanner(type) {
     hideRetreat();            // a fresh hunt starts with no countdown running
+    hideDazed();              // ...and nothing is dazed yet either
     if (ui.doom) return;
     const def = EVENTS[type];
     const title = (def ? def.name : String(type || 'IT')).toUpperCase();
@@ -2610,6 +2690,7 @@ export function initUI(ctx) {
     elEventVig.classList.remove('on');
     elEventBanner.classList.remove('show');
     hideRetreat();
+    hideDazed();
     ui.adrenBus = null;
     setAdrenaline(false);
     if (info && info.survived) {
@@ -2709,13 +2790,21 @@ export function initUI(ctx) {
   }
 
   // EVENT_PHASE carries every bit of coarse event scripting the server does
-  // ('approach' / 'lunge' / 'grab' / …) — only the two mercy phases are ours.
+  // ('approach' / 'lunge' / 'grab' / …) — only the mercy phases and the
+  // wave-7 headshot daze are ours.
   function onEventPhase(d) {
     if (!d || typeof d !== 'object') return;
     const phase = String(d.phase || '');
-    if (phase !== 'retreat' && phase !== 'hunt') return;
+    if (phase !== 'retreat' && phase !== 'hunt' && phase !== 'stunned') return;
     const type = (typeof d.type === 'string') ? d.type : '';
     const data = (d.data && typeof d.data === 'object') ? d.data : d;
+    // a head hit landed: the giant freezes for data.seconds. This path works
+    // even if nobody emits bus 'headshot' — the server always says so.
+    if (phase === 'stunned') {
+      if (!fresh('evstun:' + type, 500)) return;
+      showDazed(num(data.seconds, num(data.secondsLeft, STUN_S)));
+      return;
+    }
     const secs = num(data.secondsLeft, num(data.seconds, num(data.left, SAFE.retreat)));
     if (!fresh('evp:' + type + '|' + phase + '|' + Math.round(secs * 10), 250)) return;
     if (phase === 'retreat') showRetreat(type, secs, data.total);
@@ -2765,6 +2854,241 @@ export function initUI(ctx) {
   function tokenSaveToast() {
     if (!fresh('tokensave', 6000)) return;
     toast('A Revival Token saved the crew!', 'token', SVG_TOKEN);
+  }
+
+  // =============================================================
+  // WAVE 7 — DEEP-WATER AMBUSHES, HEADSHOT STUNS
+  // =============================================================
+  // MSG.AMBUSH {targetId, phase:'warn'|'start'|'end', count?} is the whole
+  // contract. Banners belong to the TARGET only: a crewmate's frenzy gets
+  // one line of news so the crew can go help, and nothing else.
+  function showAmbushWarn() {
+    if (ui.doom || effectivePhase() !== 'playing') return;
+    elAmbush.classList.remove('show'); void elAmbush.offsetWidth;
+    elAmbush.classList.add('show');
+    clearTimeout(ui.ambushTimer);
+    // the css hold matches WARN_SECONDS; the timer only takes the class back off
+    ui.ambushTimer = setTimeout(() => elAmbush.classList.remove('show'),
+      Math.round(Math.max(1.6, AMB.warn + 0.45) * 1000));
+  }
+  function hideAmbushWarn() {
+    clearTimeout(ui.ambushTimer);
+    ui.ambushTimer = 0;
+    elAmbush.classList.remove('show');
+  }
+
+  // The frenzy vignette is HELD for as long as the pack is on you — it is the
+  // one red that is not the event palette, so it reads as "in the water with
+  // teeth" rather than "a giant is nearby".
+  function startFrenzy(count, seconds) {
+    hideAmbushWarn();
+    ui.frenzy = true;
+    // the server ships its own window; the constant is only the fallback, and
+    // the slack on top is the backstop for an 'end' beat that never lands
+    ui.frenzyEnd = ui.now + Math.max(4, num(seconds, AMB.duration)) + 8;
+    if (ui.doom) return;
+    const n = Math.max(0, Math.floor(num(count, 0)));
+    setText(elFrenzySub, n > 0 ? (n + ' on you · get shallow') : 'get to shallow water');
+    elFrenzyChip.classList.add('show');
+    elFrenzyVig.classList.add('on');
+    root.classList.add('frenzy-on');
+  }
+  function endFrenzy(quiet) {
+    const was = ui.frenzy;
+    ui.frenzy = false;
+    ui.frenzyEnd = 0;
+    hideAmbushWarn();
+    elFrenzyChip.classList.remove('show');
+    elFrenzyVig.classList.remove('on');
+    root.classList.remove('frenzy-on');
+    if (was && !quiet && !ui.doom && effectivePhase() === 'playing') {
+      toast('…they scatter into the dark', 'good');
+    }
+  }
+  function tickFrenzy() {
+    if (!ui.frenzy || !ui.frenzyEnd) return;
+    if (ui.now > ui.frenzyEnd) endFrenzy(true);
+  }
+
+  function onAmbush(d) {
+    if (!d || typeof d !== 'object') return;
+    const phase = String(d.phase || '');
+    if (phase !== 'warn' && phase !== 'start' && phase !== 'end') return;
+    const target = (d.targetId != null) ? String(d.targetId) : '';
+    const me = myId() ? String(myId()) : null;
+    // no targetId at all = assume it is ours; the server always sends one
+    const mine = target ? (!!me && target === me) : true;
+    if (!fresh('amb:' + target + '|' + phase, 300)) return;
+    if (mine) {
+      if (phase === 'warn') showAmbushWarn();
+      else if (phase === 'start') startFrenzy(d.count, d.seconds);
+      else endFrenzy(false);
+      return;
+    }
+    // somebody else's water: no banners, no vignette — just the news
+    if (phase === 'start') toast(playerNameById(target) + ' is swarmed by razorfins', 'bad');
+  }
+
+  // ---- DEEP WATER chip -------------------------------------------------
+  // A local estimate of the server's per-second risk (see AMBUSH): distance
+  // from the island does most of it, depth below does the rest. It drives the
+  // pulse rate and the palette only — the server still owns the dice.
+  function waterDepthAt(p) {
+    for (let i = 0; i < AREAS.length; i++) {
+      const a = AREAS[i];
+      const c = Array.isArray(a.center) ? a.center : [0, 0];
+      const dx = p.x - num(c[0], 0), dz = p.z - num(c[1], 0);
+      const r = Math.max(1, num(a.radius, 1));
+      if (dx * dx + dz * dz <= r * r) return Math.max(0, num(a.depth, 0));
+    }
+    const w = ctx.world;
+    if (w && typeof w.getTerrainHeight === 'function') {
+      try {
+        const g = num(w.getTerrainHeight(p.x, p.z), 0);
+        if (g < 0) return -g;
+      } catch (e) { /* world not ready */ }
+    }
+    return 0;
+  }
+  // "swimming" the way the server means it: in the water, off every deck
+  function swimmingNow() {
+    if (state.onBoat || state.onDeck === true) return false;
+    if (state.underwater) return true;
+    const l = ctx.playerMod && ctx.playerMod.local;
+    return !!(l && (l.swimming || l.underwater));
+  }
+  function deepHint(lvl) {
+    if (lvl >= 3) return 'something is hunting';
+    if (lvl === 2) return 'you are being watched';
+    if (lvl === 1) return 'open water';
+    return 'past the shelf';
+  }
+  function hideDeep() {
+    if (!ui.deepOn) return;
+    ui.deepOn = false;
+    ui.deepLvl = -1;
+    ui.deepRate = -1;
+    elDeep.classList.remove('show');
+  }
+  function refreshDeepWater() {
+    if (ui.doom || ui.phase !== 'playing' || num(state.hp, PLAYER_MAX_HP) <= 0) { hideDeep(); return; }
+    if (!swimmingNow()) { hideDeep(); return; }
+    const p = playerPos(TMP);
+    const dist = Math.sqrt(p.x * p.x + p.z * p.z);
+    if (!(dist > AMB.safeDist)) { hideDeep(); return; }
+    const distF = clamp01((dist - AMB.safeDist) / Math.max(1, AMB.distFull - AMB.safeDist));
+    const depthF = clamp01(waterDepthAt(p) / AMB.depthFull);
+    const risk = AMB.baseRisk + (AMB.maxRisk - AMB.baseRisk) * (0.6 * distF + 0.4 * depthF);
+    const r01 = clamp01(risk / AMB.maxRisk);
+    ui.deepOn = true;
+    elDeep.classList.add('show');
+    const lvl = r01 > 0.72 ? 3 : r01 > 0.45 ? 2 : r01 > 0.2 ? 1 : 0;
+    if (lvl !== ui.deepLvl) {
+      ui.deepLvl = lvl;
+      elDeep.dataset.lvl = String(lvl);
+    }
+    // a slow breath just past the line, a hammer out over the abyss
+    const rate = 2.2 - r01 * 1.65;
+    if (Math.abs(rate - ui.deepRate) > 0.04) {
+      ui.deepRate = rate;
+      elDeep.style.setProperty('--rate', rate.toFixed(2) + 's');
+    }
+    setText(elDeepSub, Math.round(dist) + ' m out · ' + deepHint(lvl));
+  }
+
+  // ---- headshot / stun feedback ---------------------------------------
+  // enemies.js owns hit detection and its own crit visuals; all we add is the
+  // word. Three independent paths feed it so the popover cannot go missing:
+  //   1. bus 'headshot' {eventCreature?, stunned?} if that module ever emits it
+  //   2. ENEMY_STATE transitions into 'stunned' (below) — always available
+  //   3. EVENT_PHASE 'stunned' for the giants, straight off the protocol
+  function showStunPop(text, big) {
+    if (ui.doom || effectivePhase() !== 'playing') return;
+    setText(elStunTxt, text);
+    elStunPop.classList.toggle('is-big', !!big);
+    elStunPop.classList.remove('show'); void elStunPop.offsetWidth;
+    elStunPop.classList.add('show');
+    clearTimeout(ui.stunTimer);
+    ui.stunTimer = setTimeout(() => elStunPop.classList.remove('show'), 950);
+  }
+  function showDazed(secs) {
+    if (ui.doom || effectivePhase() !== 'playing') return;
+    const s = Math.max(0.6, Math.min(20, num(secs, STUN_S)));
+    elDazed.classList.add('show');
+    // the bar drains over exactly the window the server handed us
+    elDzFill.style.transition = 'none';
+    elDzFill.style.width = '100%';
+    void elDzFill.offsetWidth;
+    elDzFill.style.transition = 'width ' + s.toFixed(2) + 's linear';
+    elDzFill.style.width = '0%';
+    clearTimeout(ui.dazedTimer);
+    ui.dazedTimer = setTimeout(() => hideDazed(), Math.round(s * 1000) + 280);
+  }
+  function hideDazed() {
+    clearTimeout(ui.dazedTimer);
+    ui.dazedTimer = 0;
+    elDazed.classList.remove('show');
+  }
+  function onHeadshot(d) {
+    const ev = !!(d && (d.eventCreature === true || d.event === true || d.giant === true));
+    // a head hit on a stun-immune enemy still crits — say so honestly
+    const stunned = (d && d.stunned != null) ? !!d.stunned : true;
+    if (!fresh('hs:' + (ev ? 'e' : 'n'), 90)) return;
+    // the giants get the banner instead: it already says IT'S DAZED — GO!
+    if (ev) { showDazed(num(d && d.seconds, STUN_S)); return; }
+    showStunPop(stunned ? 'STUNNED!' : 'CRIT!', false);
+  }
+
+  // Path 2, the one that needs nobody's cooperation: ENEMY_STATE already
+  // carries `state`, so a transition INTO 'stunned' on something the
+  // crosshair is pointing at IS the hitmarker moment. The payload arrives
+  // over both the bus and the socket — whichever lands first records the new
+  // state, so the second delivery can never pop a second time.
+  const enemyStates = new Map();      // enemyId -> last `state` we saw
+  function onScreenNear(p) {
+    const cam = ctx.camera;
+    if (!cam || !PROJ) return false;
+    const v = vecOf(p, TMP2);
+    if (!v) return false;
+    const me = playerPos(TMP);
+    const dx = v.x - me.x, dy = v.y - me.y, dz = v.z - me.z;
+    if (dx * dx + dy * dy + dz * dz > 3600) return false;      // 60 m
+    PROJ.set(num(v.x, 0), num(v.y, 0), num(v.z, 0));
+    try { PROJ.project(cam); } catch (e) { return false; }
+    if (num(PROJ.z, 0) > 1) return false;                      // behind you
+    return Math.abs(num(PROJ.x, 0)) < 0.45 && Math.abs(num(PROJ.y, 0)) < 0.45;
+  }
+  function onEnemyState(d) {
+    if (!d || !Array.isArray(d.list)) return;
+    if (ui.doom || ui.phase !== 'playing') { enemyStates.clear(); return; }
+    const live = new Set();
+    let pop = false;
+    for (let i = 0; i < d.list.length; i++) {
+      const e = d.list[i];
+      if (!e || e.id == null) continue;
+      const id = String(e.id);
+      live.add(id);
+      const st = (typeof e.state === 'string') ? e.state : '';
+      const prev = enemyStates.get(id);
+      enemyStates.set(id, st);
+      // adopt what is already stunned when we first see it, never announce it
+      if (prev === undefined || prev === 'stunned' || st !== 'stunned') continue;
+      if (!pop && onScreenNear(e.p)) pop = true;
+    }
+    for (const id of Array.from(enemyStates.keys())) if (!live.has(id)) enemyStates.delete(id);
+    if (pop) showStunPop('STUNNED!', false);
+  }
+
+  // one place to take every wave-7 overlay back down
+  function clearWave7() {
+    endFrenzy(true);
+    hideAmbushWarn();
+    hideDazed();
+    hideDeep();
+    enemyStates.clear();
+    clearTimeout(ui.stunTimer);
+    ui.stunTimer = 0;
+    elStunPop.classList.remove('show');
   }
 
   // =============================================================
@@ -3487,6 +3811,11 @@ export function initUI(ctx) {
   onBus('bodyTowed', (d) => onBodyTowed(d));
   onBus('revived', (d) => onRevived(d));
   onBus('tsunami', () => startDoomsday());
+  // wave 7: enemies.js fires 'headshot' on a head connection; the server's
+  // AMBUSH beats may arrive over the bus as well as straight off the socket
+  onBus('headshot', (d) => onHeadshot(d));
+  onBus('ambush', (d) => onAmbush(d));
+  onBus('enemyState', (d) => onEnemyState(d));
 
   function handleChatMsg(from, text) {
     const sys = !from || from === 'ISLAND' || from === 'system' || from === 'System';
@@ -3667,6 +3996,10 @@ export function initUI(ctx) {
   // ---- wave 5: reviving ----
   onNet(MSG.REVIVED, (d) => onRevived(d));
   onNet(MSG.BODY_TOWED, (d) => onBodyTowed(d));
+
+  // ---- wave 7: deep-water ambushes + headshot stuns ----
+  onNet(MSG.AMBUSH, (d) => onAmbush(d));
+  onNet(MSG.ENEMY_STATE, (d) => onEnemyState(d));
   onNet(MSG.LIGHTNING, (d) => {
     if (!d) return;
     const me = myId();
@@ -3786,6 +4119,11 @@ export function initUI(ctx) {
     tickRetreat();
     refreshAdrenaline();
     refreshTokens();
+
+    // wave 7: the deep-water estimate is re-read every tick, and the frenzy
+    // has a backstop in case the server's 'end' beat never arrives
+    refreshDeepWater();
+    tickFrenzy();
 
     if (ui.tsunamiPulse > 0) {
       ui.tsunamiPulse -= 0.1;

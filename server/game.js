@@ -23,6 +23,8 @@ import {
   UNIQUE_CHARMS,
   REVIVE,
   SAFE_ZONE,
+  COMBAT,
+  AMBUSH,
   PLAYER_MAX_HP,
   BASE_AIR_SECONDS,
   shopById,
@@ -116,6 +118,27 @@ const AMBUSH_REST_S = 5;          // then back to the coil, no re-lunge until th
 const DRIFT_SPEED_MULT = 0.5;
 const DRIFT_MIN_Y = -2;           // jellies hang between here and half the area depth
 
+// --- deep-water ambushes (see AMBUSH + ENEMIES.razorfin) --------------
+const AMBUSH_PACK_TYPE = 'razorfin';
+const AMBUSH_RING_MIN = 10;       // the pack erupts in a ring this wide...
+const AMBUSH_RING_MAX = 16;       // ...around the swimmer
+const AMBUSH_ALONE_RANGE = 30;    // "no living crewmate within 30 m" -> ALONE_MULT
+const AMBUSH_ALONE_RANGE_SQ = AMBUSH_ALONE_RANGE * AMBUSH_ALONE_RANGE;
+const AMBUSH_MAX_PACK = 24;       // hard ceiling whatever the tuning asks for
+const AMBUSH_ROLL_S = 1;          // the risk accumulator rolls once per swum second
+const SWIM_SURFACE_Y = 1;         // at/below this you are IN the water, not on it
+// The server has no terrain function, so the AREAS depth wells stand in for
+// the seabed; everywhere else is the ~30 m open shelf (see DESIGN world layout).
+const OPEN_SEA_DEPTH = 30;
+// --- 'swarm' pack AI (hit-and-run) -----------------------------------
+const SWARM_BITE_RANGE = 1.9;     // dart in until this close, then peel off
+const SWARM_BITE_RANGE_SQ = SWARM_BITE_RANGE * SWARM_BITE_RANGE;
+const SWARM_BACK_OFF = 4;         // ...and fall back roughly this far
+const SWARM_DART_MIN_S = 0.8;     // a dart that never connects still breaks off
+const SWARM_DART_MAX_S = 2.0;
+const SWARM_BACK_MIN_S = 0.45;    // short breath before turning around again
+const SWARM_BACK_MAX_S = 0.9;
+
 const ARTIFACT_IDS = Object.keys(ARTIFACTS);
 const AREA_BY_ID = new Map(AREAS.map(a => [a.id, a]));
 const MAX_ENEMY_DMG = Object.keys(ENEMIES)
@@ -135,6 +158,7 @@ const SOCKET_FALLBACKS = [
   [MSG.REVIVE_TEAMMATE, 'onReviveTeammate'],
   [MSG.USE_REVIVAL_KIT, 'onUseRevivalKit'],
   [MSG.TOW_BODY, 'onTowBody'],
+  [MSG.EVENT_HIT, 'onEventHit'],
 ];
 
 // ---------------- Small helpers ----------------
@@ -282,6 +306,7 @@ export class Game {
     // --- runtime ------------------------------------------------------
     this.enemies = [];
     this.enemyCounter = 0;
+    this.ambushes = new Map();      // targetId -> live razorfin frenzy (see AMBUSH)
     this.invCounter = 0;
     this.tickCount = 0;
     this.over = false;
@@ -376,6 +401,9 @@ export class Game {
       bodySettled: true,     // false = still owe this body one settling MOVE
       towedBy: null,         // carrier id while the Rescue Claw has this body
       towing: null,          // the body id this player is dragging along
+      // --- deep-water ambushes (see AMBUSH) ---
+      ambushAccum: 0,        // swum seconds banked toward the next risk roll
+      ambushReadyAt: 0,      // per-player COOLDOWN — no frenzy before this
       stats: { fish: 0, earned: 0 },
     };
     this.players.set(player.id, player);
@@ -435,6 +463,8 @@ export class Game {
     // Whatever they were dragging is dropped, and nobody keeps dragging them.
     this.releaseTowByCarrier(p, 'carrierLeft');
     this.releaseTow(p, 'bodyLeft');
+    // Their razorfins have nothing to hunt any more.
+    this.endAmbushFor(id, 'left');
     this.unbindPlayerSocket(id);
     this.players.delete(id);
     this.moveDirty.delete(id);
@@ -789,6 +819,9 @@ export class Game {
     this.updateFloppers(now);
     this.updateEvent(now);
     this.updateLoot(now);
+    // Frenzies resolve BEFORE the AI runs, so a pack that just ended never
+    // gets one more free tick of biting.
+    this.updateAmbushes(dt, now);
     this.updateEnemies(dt, now);
     this.updateTsunami(now);
 
@@ -1780,6 +1813,8 @@ export class Game {
     // nothing touches you on the island, and nothing ever one-shots you off it.
     // Drowning / enemies / lightning are untouched.
     if (eventDef(cause)) {
+      // Dazed by a head hit: it cannot land anything at all right now.
+      if (this.eventStunned()) return;
       if (this.playerInSafeZone(p)) return;
       amount = Math.min(amount, this.eventHitCap());
     }
@@ -1881,7 +1916,8 @@ export class Game {
 
     // A tsunami trumps whatever is circling the boat, but the event still has
     // to close properly (EVENT_END) or clients keep the night snap and the
-    // cut music forever.
+    // cut music forever. Any razorfin frenzy scatters too.
+    this.endAllAmbushes('tsunami');
     if (this.eventActive) this.endEvent();
 
     this.broadcast(MSG.TSUNAMI, { reason: why });
@@ -1897,8 +1933,9 @@ export class Game {
     const cause = typeof d.cause === 'string' ? d.cause.slice(0, 24) : 'unknown';
     const isEvent = !!eventDef(cause);
     // SAFE ZONE: a creature simply cannot land a hit on someone standing on the
-    // island — drop the report before it even costs them a cooldown.
-    if (isEvent && this.playerInSafeZone(p)) return;
+    // island — drop the report before it even costs them a cooldown. Same for
+    // anything it "did" while dazed by a head hit.
+    if (isEvent && (this.playerInSafeZone(p) || this.eventStunned(now))) return;
 
     let max = MAX_ENEMY_DMG;
     const enemyDef = ownDef(ENEMIES, cause);
@@ -2170,9 +2207,59 @@ export class Game {
       respawnAt: 0,
       lastHitAt: 0,
       repathAt: 0,
+      // --- stuns & flinches (see COMBAT) ---
+      flinchUntil: 0,
+      stunUntil: 0,
+      stunImmuneUntil: 0,
+      // --- 'swarm' pack fish only (see AMBUSH) ---
+      ambushId: null,
+      targetId: null,
+      swarmPhase: 'dart',
+      swarmUntil: 0,
+      swarmPoint: [0, -5, 0],
+      swarmPointAt: 0,
     };
     this.placeEnemy(e);
     return e;
+  }
+
+  /**
+   * A razorfin from an ambush pack: no area, no respawn, no wandering — it
+   * exists only for the frenzy that spawned it and is spliced out of the enemy
+   * list the moment it dies or the frenzy ends.
+   */
+  makeSwarmEnemy(type, def, amb, target, x, y, z, biteDelay, now) {
+    return {
+      id: `rf${this.code}${++this.enemyCounter}`,
+      type,
+      def,
+      area: null,           // pack fish roam free; they belong to an ambush
+      behavior: 'swarm',
+      p: [x, y, z],
+      wander: [x, y, z],
+      anchor: [x, y, z],
+      anchorLootId: null,
+      burstUntil: 0,
+      burstReadyAt: 0,
+      r: Math.atan2(target.pos[0] - x, target.pos[2] - z),
+      hp: def.hp,
+      maxHp: def.hp,
+      state: 'chase',
+      alive: true,
+      respawnAt: 0,
+      // Staggered so the pack's bites land in a stream, not one burst.
+      lastHitAt: now + Math.max(0, num(biteDelay, 0)),
+      repathAt: 0,
+      flinchUntil: 0,
+      stunUntil: 0,
+      stunImmuneUntil: 0,
+      ambushId: amb.targetId,
+      targetId: target.id,
+      swarmPhase: 'dart',
+      swarmUntil: now + SWARM_DART_MIN_S + Math.random() * (SWARM_DART_MAX_S - SWARM_DART_MIN_S),
+      swarmPoint: [x, y, z],
+      swarmPointAt: 0,
+    };
   }
 
   /** Deepest y an enemy may sit at in this area (the abyss is not reachable). */
@@ -2277,6 +2364,10 @@ export class Game {
     e.respawnAt = 0;
     e.burstUntil = 0;
     e.burstReadyAt = 0;
+    // A fresh body remembers nothing: no flinch, no stun, no immunity.
+    e.flinchUntil = 0;
+    e.stunUntil = 0;
+    e.stunImmuneUntil = 0;
   }
 
   updateEnemies(dt, now) {
@@ -2290,20 +2381,40 @@ export class Game {
     for (let i = 0; i < this.enemies.length; i++) {
       const e = this.enemies[i];
       if (!e.alive) {
+        // Ambush pack fish are ephemeral — they never come back, and they are
+        // spliced out of the list on death / at the end of the frenzy.
+        if (e.behavior === 'swarm') continue;
         if (now >= e.respawnAt) this.respawnEnemy(e);
         continue;
       }
 
+      // --- stuns & flinches (see COMBAT) ---------------------------
+      // A stunned enemy is frozen solid; a flinching one is off its rhythm for
+      // a beat. Neither moves and neither can land a bite — which is exactly
+      // how a lunge or a dart gets interrupted.
+      if (now < num(e.stunUntil, 0)) { e.state = 'stunned'; continue; }
+      if (now < num(e.flinchUntil, 0)) { e.state = 'flinch'; continue; }
+
       const def = e.def;
       // --- pick a target -------------------------------------------
-      const near = this.nearestPlayer(e, def.aggroRange * aggroMult);
-      const target = near ? near.player : null;
-      const bestD2 = near ? near.d2 : Infinity;
+      // 'swarm' ignores aggroRange entirely: the pack hunts the swimmer the
+      // frenzy was spawned for, however far it has to follow them.
+      let target = null;
+      let bestD2 = Infinity;
+      if (e.behavior === 'swarm') {
+        const prey = this.swarmTarget(e);
+        if (prey) { target = prey; bestD2 = this.enemyDist2(e, prey); }
+      } else {
+        const near = this.nearestPlayer(e, def.aggroRange * aggroMult);
+        if (near) { target = near.player; bestD2 = near.d2; }
+      }
 
       if (e.behavior === 'drift') {
         this.updateDrifter(e, def, dt, now);
       } else if (e.behavior === 'ambush') {
         this.updateAmbusher(e, def, target, dt, now);
+      } else if (e.behavior === 'swarm') {
+        this.updateSwarmer(e, def, target, dt, now);
       } else if (target) {
         e.state = 'chase';
         this.moveEnemyToward(e, target.pos[0], target.pos[1], target.pos[2], def.speed, dt);
@@ -2327,11 +2438,26 @@ export class Game {
       }
 
       // --- keep them in their water --------------------------------
-      const maxDepth = this.areaFloorDepth(e.area);
       if (e.p[1] > -0.4) e.p[1] = -0.4;
-      if (e.p[1] < -maxDepth - seaFloorPad) e.p[1] = -maxDepth - seaFloorPad;
-      this.clampToArea(e.area, e.p, 1.15);
+      if (e.area) {
+        const maxDepth = this.areaFloorDepth(e.area);
+        if (e.p[1] < -maxDepth - seaFloorPad) e.p[1] = -maxDepth - seaFloorPad;
+        this.clampToArea(e.area, e.p, 1.15);
+      } else {
+        // Pack fish have no area to hold them — just the surface and the
+        // seabed proxy under wherever they currently are.
+        const floor = this.waterDepthAt(e.p[0], e.p[2]) + seaFloorPad;
+        if (e.p[1] < -floor) e.p[1] = -floor;
+      }
     }
+  }
+
+  /** Squared distance from an enemy to a player. */
+  enemyDist2(e, p) {
+    const dx = p.pos[0] - e.p[0];
+    const dy = p.pos[1] - e.p[1];
+    const dz = p.pos[2] - e.p[2];
+    return dx * dx + dy * dy + dz * dz;
   }
 
   /** Nearest living player within `range` metres, or null. */
@@ -2406,6 +2532,80 @@ export class Game {
     }
   }
 
+  /**
+   * The swimmer a pack fish is on. It keeps its own target while they are
+   * alive and still in the water outside the safe zone; otherwise it switches
+   * to the nearest living swimmer. Null = nothing left worth chasing.
+   */
+  swarmTarget(e) {
+    const held = e.targetId ? this.players.get(e.targetId) : null;
+    if (held && held.alive && this.isSwimming(held) && !this.playerInSafeZone(held)) return held;
+
+    let best = null;
+    let bestD2 = Infinity;
+    for (const p of this.players.values()) {
+      if (!p.alive || !this.isSwimming(p) || this.playerInSafeZone(p)) continue;
+      const d2 = this.enemyDist2(e, p);
+      if (d2 < bestD2) { bestD2 = d2; best = p; }
+    }
+    if (best) { e.targetId = best.id; return best; }
+    return null;
+  }
+
+  /** Where a pack fish falls back to after a bite: off to one side, a bit deeper. */
+  pickSwarmRetreat(e, target, now) {
+    const ang = Math.random() * Math.PI * 2;
+    const rad = SWARM_BACK_OFF * (0.8 + Math.random() * 0.5);
+    e.swarmPoint[0] = target.pos[0] + Math.cos(ang) * rad;
+    e.swarmPoint[1] = Math.min(-0.6, num(target.pos[1], -2) - 0.5 - Math.random() * 2.5);
+    e.swarmPoint[2] = target.pos[2] + Math.sin(ang) * rad;
+    e.swarmPointAt = now;
+    e.swarmUntil = now + SWARM_BACK_MIN_S + Math.random() * (SWARM_BACK_MAX_S - SWARM_BACK_MIN_S);
+  }
+
+  /**
+   * 'swarm': razorfins from a deep-water ambush. Relentless hit-and-run — dart
+   * straight at their swimmer until they are on top of them (the shared
+   * contact check lands the bite), peel off ~4 m, turn, come back. No aggro
+   * gate, no wandering, no going home.
+   */
+  updateSwarmer(e, def, target, dt, now) {
+    const speed = Math.max(1, num(def.speed, 12));
+
+    if (!target) {
+      // Nothing left in the water — circle until the frenzy expires.
+      e.state = 'idle';
+      e.r += dt * 1.6;
+      this.moveEnemyToward(e,
+        e.p[0] + Math.sin(e.r) * 2, e.p[1], e.p[2] + Math.cos(e.r) * 2,
+        speed * 0.3, dt);
+      return;
+    }
+
+    if (e.swarmPhase === 'back') {
+      if (!e.swarmPointAt) this.pickSwarmRetreat(e, target, now);
+      this.moveEnemyToward(e, e.swarmPoint[0], e.swarmPoint[1], e.swarmPoint[2], speed * 0.9, dt);
+      const dx = e.swarmPoint[0] - e.p[0];
+      const dy = e.swarmPoint[1] - e.p[1];
+      const dz = e.swarmPoint[2] - e.p[2];
+      if (now >= e.swarmUntil || (dx * dx + dy * dy + dz * dz) < 1.2) {
+        e.swarmPhase = 'dart';
+        e.swarmPointAt = 0;
+        e.swarmUntil = now + SWARM_DART_MIN_S + Math.random() * (SWARM_DART_MAX_S - SWARM_DART_MIN_S);
+      }
+      e.state = 'idle';
+      return;
+    }
+
+    e.state = 'chase';
+    this.moveEnemyToward(e, target.pos[0], num(target.pos[1], 0) - 0.3, target.pos[2], speed, dt);
+    if (this.enemyDist2(e, target) <= SWARM_BITE_RANGE_SQ || now >= e.swarmUntil) {
+      e.swarmPhase = 'back';
+      e.swarmPointAt = 0;
+      this.pickSwarmRetreat(e, target, now);
+    }
+  }
+
   moveEnemyToward(e, tx, ty, tz, speed, dt) {
     const dx = tx - e.p[0];
     const dy = ty - e.p[1];
@@ -2436,20 +2636,21 @@ export class Game {
   broadcastEnemyState() {
     const active = this.activeAreaIds();
     const list = [];
-    if (active.size) {
-      for (let i = 0; i < this.enemies.length; i++) {
-        const e = this.enemies[i];
-        if (!e.alive || !active.has(e.area.id)) continue;
-        list.push({
-          id: e.id,
-          type: e.type,
-          p: [r2(e.p[0]), r2(e.p[1]), r2(e.p[2])],
-          r: r3(e.r),
-          hp: e.hp,
-          state: e.state,
-          behavior: e.behavior,
-        });
-      }
+    for (let i = 0; i < this.enemies.length; i++) {
+      const e = this.enemies[i];
+      if (!e.alive) continue;
+      // Ambush pack fish have no area — they are already on top of a player,
+      // so they are always in the snapshot.
+      if (e.area && !active.has(e.area.id)) continue;
+      list.push({
+        id: e.id,
+        type: e.type,
+        p: [r2(e.p[0]), r2(e.p[1]), r2(e.p[2])],
+        r: r3(e.r),
+        hp: e.hp,
+        state: e.state,
+        behavior: e.behavior,
+      });
     }
     // Don't spam empty lists — one is enough to make clients despawn.
     if (list.length === 0 && this.lastEnemyListSize === 0) return;
@@ -2468,6 +2669,10 @@ export class Game {
     const weapon = shopById(weaponId);
     if (!weapon || weapon.kind !== 'weapon') return;
     if (p.gear.weapons.indexOf(weapon.id) === -1) return;
+
+    // The client owns hit detection, so a head hit is a claim — accepted only
+    // as a literal true, never a truthy 1/'yes'/{}.
+    const headshot = d.headshot === true;
 
     // Out-of-range hits are ignored (generous margin for latency). Melee has to
     // be in the enemy's face; 'both' weapons jab up close and fire past that.
@@ -2491,17 +2696,346 @@ export class Game {
     }
     if (dist > maxRange) return;
 
-    const dmg = clamp(Math.round(num(d.dmg, maxDmg)), 1, Math.max(1, Math.round(maxDmg)));
+    let dmg = clamp(Math.round(num(d.dmg, maxDmg)), 1, Math.max(1, Math.round(maxDmg)));
+    // Head hits hit harder — applied after the weapon clamp, before the hp.
+    if (headshot) {
+      dmg = Math.max(1, Math.round(dmg * Math.max(1, num(COMBAT.HEADSHOT_DMG_MULT, 1.5))));
+    }
+
+    const now = nowSeconds();
     e.hp = Math.max(0, e.hp - dmg);
-    this.broadcast(MSG.ENEMY_HIT, { enemyId: e.id, hp: e.hp, byId: p.id, dmg });
+
+    // Every landed hit staggers; a head hit on a stunnable enemy freezes it.
+    let stunSeconds = 0;
+    if (e.hp > 0) {
+      this.flinchEnemy(e, now);
+      if (headshot && this.canStunEnemy(e, now)) {
+        stunSeconds = Math.max(0.1, num(COMBAT.HEADSHOT_STUN_SECONDS, 2.5));
+        e.stunUntil = now + stunSeconds;
+        // The immunity window starts when the stun WEARS OFF — no stunlock.
+        e.stunImmuneUntil = e.stunUntil + Math.max(0, num(COMBAT.STUN_IMMUNE_SECONDS, 6));
+        e.state = 'stunned';
+      }
+    }
+
+    this.broadcast(MSG.ENEMY_HIT, {
+      enemyId: e.id,
+      hp: e.hp,
+      byId: p.id,
+      dmg,
+      // additive extras (safe for clients that ignore them)
+      headshot,
+      stunned: stunSeconds > 0,
+      stunSeconds: r2(stunSeconds),
+      flinch: r2(Math.max(0, num(COMBAT.HIT_FLINCH_SECONDS, 0.35))),
+    });
 
     if (e.hp <= 0) {
       e.alive = false;
       e.state = 'dead';
-      e.respawnAt = nowSeconds() + ENEMY_RESPAWN_S;
-      this.chat('ISLAND', `${p.name} killed a ${e.def.name}.`);
+      // A corpse holds no stun, no flinch and no immunity.
+      e.flinchUntil = 0;
+      e.stunUntil = 0;
+      e.stunImmuneUntil = 0;
+      if (e.behavior === 'swarm') {
+        // Ephemeral pack fish: no respawn, and no kill feed for a dozen of them.
+        e.respawnAt = 0;
+        this.removeSwarmEnemy(e);
+      } else {
+        e.respawnAt = now + ENEMY_RESPAWN_S;
+        this.chat('ISLAND', `${p.name} killed a ${e.def.name}.`);
+      }
       this.broadcastEnemyState();
     }
+  }
+
+  /** Stunnable right now? Not while the post-stun immunity window is open. */
+  canStunEnemy(e, now) {
+    if (!e || !e.alive) return false;
+    if (e.def && e.def.stunImmune === true) return false;
+    return num(now, nowSeconds()) >= num(e.stunImmuneUntil, 0);
+  }
+
+  /**
+   * Every landed hit staggers a regular enemy: the AI is paused for
+   * COMBAT.HIT_FLINCH_SECONDS and whatever it was mid-way through — an
+   * ambusher's lunge, a pack fish's dart — is dropped on the spot. Flinches
+   * land even on a stun-immune enemy.
+   */
+  flinchEnemy(e, now) {
+    if (!e || !e.alive) return;
+    const at = num(now, nowSeconds());
+    const until = at + Math.max(0, num(COMBAT.HIT_FLINCH_SECONDS, 0.35));
+    if (until > num(e.flinchUntil, 0)) e.flinchUntil = until;
+    e.burstUntil = 0;                   // an ambusher's lunge breaks off
+    if (e.behavior === 'swarm') {       // a pack fish recoils out of the bite
+      e.swarmPhase = 'back';
+      e.swarmPointAt = 0;
+      e.swarmUntil = until + SWARM_BACK_MIN_S;
+    }
+    // Don't paper over a live stun — the tick relabels it next frame anyway.
+    if (num(e.stunUntil, 0) <= at) e.state = 'flinch';
+  }
+
+  // =========================================================
+  // Deep-water ambushes (see AMBUSH)
+  // =========================================================
+
+  /**
+   * Water depth below a point, metres. The server has no terrain function, so
+   * the AREAS depth wells are the proxy for the seabed: inside a fishing area
+   * you are over its `depth`, anywhere else over the ~30 m open shelf that
+   * DESIGN gives the ocean floor. Overlapping areas resolve to the one whose
+   * centre is nearest — the same "which ring am I in" the client uses.
+   */
+  waterDepthAt(x, z) {
+    let depth = OPEN_SEA_DEPTH;
+    let bestD2 = Infinity;
+    for (const area of AREAS) {
+      const dx = num(x, 0) - area.center[0];
+      const dz = num(z, 0) - area.center[1];
+      const d2 = dx * dx + dz * dz;
+      const rad = Math.max(1, num(area.radius, 60));
+      if (d2 > rad * rad || d2 >= bestD2) continue;
+      bestD2 = d2;
+      depth = Math.max(1, num(area.depth, OPEN_SEA_DEPTH));
+    }
+    return depth;
+  }
+
+  /**
+   * "Swimming" for the ambush roll: in the water under their own power — the
+   * client's swimming flag, no seat, no deck anchor, and at or below the
+   * waterline. Standing on the island is covered by AMBUSH.SAFE_DIST (the
+   * island is only ~120 m across), and a body never counts.
+   */
+  isSwimming(p) {
+    if (!p || !p.alive) return false;
+    if (p.onBoat || p.bl) return false;
+    if (!p.swimming) return false;
+    return num(p.pos[1], 0) <= SWIM_SURFACE_Y;
+  }
+
+  /** Out of the frenzy's reach: the safe zone, dry land or a deck. */
+  reachedSafety(p) {
+    if (!p) return true;
+    return this.playerInSafeZone(p) || !this.isSwimming(p);
+  }
+
+  /** ALONE_MULT applies when no OTHER living crewmate is within 30 m. */
+  isAlone(p) {
+    for (const q of this.players.values()) {
+      if (q === p || !q.alive) continue;
+      const dx = q.pos[0] - p.pos[0];
+      const dy = q.pos[1] - p.pos[1];
+      const dz = q.pos[2] - p.pos[2];
+      if (dx * dx + dy * dy + dz * dz <= AMBUSH_ALONE_RANGE_SQ) return false;
+    }
+    return true;
+  }
+
+  /**
+   * Per-second trigger chance for one swimmer:
+   *   lerp(BASE_RISK, MAX_RISK, 0.6 * distF + 0.4 * depthF) * (alone ? ALONE_MULT : 1)
+   * distF ramps from SAFE_DIST out to DIST_FULL, depthF with the water below
+   * them up to DEPTH_FULL.
+   */
+  ambushRisk(p, dist) {
+    const safe = Math.max(0, num(AMBUSH.SAFE_DIST, 150));
+    const full = Math.max(safe + 1, num(AMBUSH.DIST_FULL, 700));
+    const distF = clamp((num(dist, 0) - safe) / (full - safe), 0, 1);
+    const depthFull = Math.max(1, num(AMBUSH.DEPTH_FULL, 120));
+    const depthF = clamp(this.waterDepthAt(p.pos[0], p.pos[2]) / depthFull, 0, 1);
+
+    const base = Math.max(0, num(AMBUSH.BASE_RISK, 0.012));
+    const top = Math.max(base, num(AMBUSH.MAX_RISK, 0.14));
+    let risk = base + (top - base) * clamp(0.6 * distF + 0.4 * depthF, 0, 1);
+    if (this.isAlone(p)) risk *= Math.max(1, num(AMBUSH.ALONE_MULT, 1.5));
+    return clamp(risk, 0, 1);
+  }
+
+  /** No new frenzy during the doomsday wave or a safe-zone retreat countdown. */
+  canStartAmbush() {
+    if (this.over || this.wiped || this.tsunamiAt > 0) return false;
+    const ev = this.eventActive;
+    if (ev && ev.retreating) return false;
+    return true;
+  }
+
+  /**
+   * Runs the live frenzies (warn -> spawn -> end) and then rolls the risk for
+   * every swimmer who is far enough out. One ambush per player at a time, and
+   * a COOLDOWN before the sea comes back for them.
+   */
+  updateAmbushes(dt, now) {
+    if (this.over) return;
+
+    if (this.ambushes.size) {
+      for (const amb of Array.from(this.ambushes.values())) this.updateAmbush(amb, now);
+    }
+    if (!this.canStartAmbush()) return;
+
+    const step = clamp(num(dt, 0), 0, 0.5);
+    for (const p of this.players.values()) {
+      if (!this.isSwimming(p) || this.ambushes.has(p.id) || now < num(p.ambushReadyAt, 0)) {
+        p.ambushAccum = 0;
+        continue;
+      }
+      const dist = Math.sqrt(p.pos[0] * p.pos[0] + p.pos[2] * p.pos[2]);
+      if (dist <= Math.max(0, num(AMBUSH.SAFE_DIST, 150))) { p.ambushAccum = 0; continue; }
+
+      // One roll per swum second, banked across the 10 Hz ticks.
+      p.ambushAccum = num(p.ambushAccum, 0) + step;
+      if (p.ambushAccum < AMBUSH_ROLL_S) continue;
+      p.ambushAccum = clamp(p.ambushAccum - AMBUSH_ROLL_S, 0, AMBUSH_ROLL_S);
+
+      const risk = this.ambushRisk(p, dist);
+      if (Math.random() < risk) this.startAmbush(p, risk, now);
+    }
+  }
+
+  /** Something is circling: the WARN_SECONDS telegraph before the pack lands. */
+  startAmbush(p, risk, now) {
+    if (this.ambushes.has(p.id)) return;
+    const warn = Math.max(0, num(AMBUSH.WARN_SECONDS, 1.8));
+    const top = Math.max(0.0001, num(AMBUSH.MAX_RISK, 0.14));
+    const t = clamp(num(risk, 0) / top, 0, 1);
+    const lo = Math.max(1, Math.round(num(AMBUSH.PACK_MIN, 5)));
+    const hi = Math.max(lo, Math.round(num(AMBUSH.PACK_MAX, 12)));
+    const packSize = clamp(Math.round(lo + (hi - lo) * t), 1, AMBUSH_MAX_PACK);
+
+    const amb = {
+      targetId: p.id,
+      phase: 'warn',
+      spawnAt: now + warn,
+      endsAt: 0,
+      packSize,
+      enemyIds: new Set(),
+    };
+    this.ambushes.set(p.id, amb);
+    p.ambushAccum = 0;
+    // Provisional cooldown so a mid-frenzy re-roll can never happen; the real
+    // one is set from the actual end time in endAmbush().
+    p.ambushReadyAt = now + warn + Math.max(4, num(AMBUSH.DURATION, 22))
+      + Math.max(0, num(AMBUSH.COOLDOWN, 60));
+
+    this.broadcast(MSG.AMBUSH, {
+      targetId: p.id,
+      phase: 'warn',
+      seconds: r2(warn),
+    });
+  }
+
+  /** One live frenzy, one tick. */
+  updateAmbush(amb, now) {
+    const p = this.players.get(amb.targetId);
+    if (!p) { this.endAmbush(amb, 'gone'); return; }
+
+    if (amb.phase === 'warn') {
+      // Still time to get out before it commits — and nothing erupts around a
+      // body: a target who goes down during the telegraph calls it off.
+      if (!p.alive) { this.endAmbush(amb, 'down'); return; }
+      if (this.reachedSafety(p)) { this.endAmbush(amb, 'escaped'); return; }
+      if (now >= amb.spawnAt) this.spawnRazorfinPack(amb, p, now);
+      return;
+    }
+
+    if (now >= amb.endsAt) { this.endAmbush(amb, 'timeout'); return; }
+    // Reaching the safe zone / dry land / a deck calls it off early. A DOWNED
+    // target does not end it — the pack just picks the next swimmer.
+    if (p.alive && this.reachedSafety(p)) { this.endAmbush(amb, 'safe'); return; }
+    if (amb.enemyIds.size === 0) { this.endAmbush(amb, 'killed'); return; }
+  }
+
+  /** The water erupts: a ring of razorfins at the swimmer's depth. */
+  spawnRazorfinPack(amb, p, now) {
+    const def = ownDef(ENEMIES, AMBUSH_PACK_TYPE);
+    if (!def) { this.endAmbush(amb, 'nopack'); return; }
+
+    const count = clamp(Math.round(num(amb.packSize, 6)), 1, AMBUSH_MAX_PACK);
+    const floor = this.waterDepthAt(p.pos[0], p.pos[2]);
+    const spin = Math.random() * Math.PI * 2;
+    const bite = Math.max(0.1, ENEMY_HIT_COOLDOWN_S);
+
+    for (let i = 0; i < count; i++) {
+      const ang = spin + (i / count) * Math.PI * 2 + (Math.random() - 0.5) * 0.35;
+      const rad = AMBUSH_RING_MIN + Math.random() * (AMBUSH_RING_MAX - AMBUSH_RING_MIN);
+      const y = clamp(num(p.pos[1], -2) - 0.5 - Math.random() * 2.5, -(floor + 2), -0.6);
+      const e = this.makeSwarmEnemy(
+        AMBUSH_PACK_TYPE, def, amb, p,
+        p.pos[0] + Math.cos(ang) * rad,
+        y,
+        p.pos[2] + Math.sin(ang) * rad,
+        (i / count) * bite,   // staggered first bites
+        now,
+      );
+      this.enemies.push(e);
+      amb.enemyIds.add(e.id);
+    }
+
+    amb.phase = 'start';
+    amb.endsAt = now + Math.max(4, num(AMBUSH.DURATION, 22));
+    this.broadcast(MSG.AMBUSH, {
+      targetId: amb.targetId,
+      phase: 'start',
+      count,
+      seconds: r2(Math.max(4, num(AMBUSH.DURATION, 22))),
+    });
+    this.broadcastEnemyState();
+  }
+
+  /**
+   * The pack disperses. Survivors are spliced out of the enemy list, the
+   * target gets their COOLDOWN and everyone hears one 'end'. Deleting from the
+   * map first makes a second call (death cleanup, disconnect, tsunami) a no-op.
+   */
+  endAmbush(amb, reason) {
+    if (!amb || !this.ambushes.delete(amb.targetId)) return;
+
+    if (amb.enemyIds.size) {
+      const doomed = amb.enemyIds;
+      this.enemies = this.enemies.filter(e => !doomed.has(e.id));
+      amb.enemyIds.clear();
+    }
+    amb.phase = 'end';
+
+    const p = this.players.get(amb.targetId);
+    if (p) {
+      p.ambushAccum = 0;
+      p.ambushReadyAt = nowSeconds() + Math.max(0, num(AMBUSH.COOLDOWN, 60));
+    }
+
+    this.broadcast(MSG.AMBUSH, {
+      targetId: amb.targetId,
+      phase: 'end',
+      reason: reason || 'over',
+    });
+    this.broadcastEnemyState();
+  }
+
+  /** End whatever frenzy is hunting this player, if any. */
+  endAmbushFor(id, reason) {
+    const amb = this.ambushes.get(id);
+    if (amb) this.endAmbush(amb, reason);
+  }
+
+  /** Every frenzy at once (the doomsday wave calls this). */
+  endAllAmbushes(reason) {
+    if (!this.ambushes.size) return;
+    for (const amb of Array.from(this.ambushes.values())) this.endAmbush(amb, reason);
+  }
+
+  /**
+   * A pack fish that just died: out of the enemy list and out of its frenzy's
+   * roster for good. Both drops are idempotent, so the end-of-ambush sweep can
+   * never free it twice.
+   */
+  removeSwarmEnemy(e) {
+    if (!e) return;
+    const i = this.enemies.indexOf(e);
+    if (i !== -1) this.enemies.splice(i, 1);
+    const amb = e.ambushId ? this.ambushes.get(e.ambushId) : null;
+    if (amb) amb.enemyIds.delete(e.id);
   }
 
   // =========================================================
@@ -2549,6 +3083,9 @@ export class Game {
       retreating: false,
       retreatUntil: 0,
       retreatSaidAt: 0,
+      // --- head-hit daze, per event (see COMBAT.EVENT_STUN_*) ---
+      stunUntil: 0,
+      stunReadyAt: 0,
     };
     this.broadcast(MSG.EVENT_START, {
       type,
@@ -2571,6 +3108,60 @@ export class Game {
     const pool = onBoat.length ? onBoat : alive;
     if (!pool.length) return null;
     return pool[Math.floor(Math.random() * pool.length) % pool.length];
+  }
+
+  /**
+   * True while a head hit has the creature dazed: its scripted phases are
+   * suspended and every event-cause hit is dropped (see damagePlayer).
+   */
+  eventStunned(now) {
+    const ev = this.eventActive;
+    if (!ev) return false;
+    return num(ev.stunUntil, 0) > num(now, nowSeconds());
+  }
+
+  /**
+   * MSG.EVENT_HIT {headshot, weaponId} — you struck the colossal thing. It
+   * cannot be hurt, so body hits are acknowledged with nothing at all. A HEAD
+   * hit dazes it for COMBAT.EVENT_STUN_SECONDS (phases suspended, event damage
+   * suppressed), then it shrugs off further stuns for EVENT_STUN_COOLDOWN.
+   * A retreat countdown is untouched — the two states just overlap.
+   */
+  onEventHit(id, d) {
+    const p = this.players.get(id);
+    if (!p || !p.alive || this.over) return;
+    const ev = this.eventActive;
+    if (!ev) return;
+    if (!d || d.headshot !== true) return;   // the giants don't care about ribs
+
+    // A weapon id is optional, but a claimed one has to be a weapon they own.
+    const weaponId = typeof d.weaponId === 'string' ? d.weaponId : '';
+    if (weaponId) {
+      const weapon = shopById(weaponId);
+      if (!weapon || weapon.kind !== 'weapon') return;
+      if (p.gear.weapons.indexOf(weapon.id) === -1) return;
+    }
+
+    const now = nowSeconds();
+    if (now < num(ev.stunReadyAt, 0)) return;
+
+    const seconds = Math.max(0.5, num(COMBAT.EVENT_STUN_SECONDS, 4));
+    ev.stunUntil = now + seconds;
+    ev.stunReadyAt = now + Math.max(seconds, num(COMBAT.EVENT_STUN_COOLDOWN, 15));
+    // Nothing scripted fires while it reels.
+    if (ev.nextPhaseAt < ev.stunUntil) ev.nextPhaseAt = ev.stunUntil;
+
+    this.broadcast(MSG.EVENT_PHASE, {
+      type: ev.type,
+      phase: 'stunned',
+      data: {
+        seconds: r2(seconds),
+        // additive extras (safe for clients that ignore them)
+        byId: p.id,
+        name: ev.def.name,
+      },
+    });
+    this.chat('ISLAND', `${p.name} cracked ${ev.def.name} across the head. It reels — GO.`);
   }
 
   /**
@@ -2637,9 +3228,11 @@ export class Game {
     if (this.updateRetreat(ev, now)) return;
     if (this.eventActive !== ev) return;   // endEvent re-entered from anywhere
 
-    // While it circles offshore the hunt phases stop — but the event's own
-    // duration timer at the bottom still runs exactly as before.
-    if (!ev.retreating && now >= ev.nextPhaseAt) {
+    // While it circles offshore (retreat) or reels from a head hit (stun) the
+    // hunt phases stop — but the event's own duration timer at the bottom
+    // still runs exactly as before, and a retreat countdown keeps ticking
+    // right through a daze.
+    if (!ev.retreating && !this.eventStunned(now) && now >= ev.nextPhaseAt) {
       ev.nextPhaseAt = now + EVENT_PHASE_INTERVAL_S;
       const phase = EVENT_PHASES[ev.phaseIdx % EVENT_PHASES.length];
       ev.phaseIdx++;

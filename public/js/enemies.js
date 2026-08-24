@@ -35,6 +35,7 @@ const DESPAWN_FADE = 0.45;    // fade for enemies that vanish from the server li
 const BITE_RANGE = 3.0;       // metres — aggro enemy this close bites the local player
 const BITE_COOLDOWN = 1.15;   // seconds between bite feedback pulses
 const MAX_POOLED = 3;         // cached meshes kept per enemy type
+const MAX_POOLED_SWARM = 14;  // ...but a razorfin pack arrives all at once
 
 const HARPOON_SPEED = 30;
 const HARPOON_GRAVITY = 4.0;
@@ -58,6 +59,21 @@ const AMBUSH_SURGE = [1.4, 1.2];  // [min, random extra] seconds between re-lung
 const STING_RANGE_PAD = 1.25;  // metres past the jelly radius that counts as contact
 const STING_SFX_GAP = 0.4;     // seconds before a sting may make noise again
 
+// Wave 7 — head zones, stuns and the razorfin frenzy.
+// Every enemy carries a head sphere derived from its interpolated facing; melee
+// arcs and projectiles test it BEFORE the body, and a connection is reported to
+// the server as DAMAGE_ENEMY {... headshot:true} (bonus damage + a real stun).
+const HEAD_FWD = 0.45;         // * def.size, forward of the enemy origin
+const HEAD_RAD = 0.35;         // * def.size
+const HEAD_MIN_RAD = 0.30;     // ...but never so small a razorfin is unhittable
+const STUN_LIST = 0.38;        // radians of woozy roll while stunned
+const STUN_STAR_COUNT = 4;
+const RECOIL_TIME = 0.22;      // seconds of flinch recoil after a landed hit
+const EVENT_HEAD_GAP = 0.3;    // seconds between head hits on an event creature
+const EVENT_BODY_GAP = 1.0;    // "at most once per second" for body thuds
+const EVENT_BODY_STEPS = 12;   // samples along an attack segment vs the giant
+const SWARM_LUNGE_SPEED = 0.5; // fraction of def.speed that reads as a dart-in
+
 // ------------------------------------------------------------------
 // Scratch objects — module level so per-frame allocation stays at zero
 // ------------------------------------------------------------------
@@ -80,9 +96,16 @@ const _qOff = new THREE.Quaternion();
 const _axisZ = new THREE.Vector3(0, 0, 1);
 const _axisX = new THREE.Vector3(1, 0, 0);
 const _colTmp = new THREE.Color();
+// wave 7 scratch — head/event queries run inside hit tests that are already
+// holding _v1.._v5, so they get vectors nobody else writes.
+const _hv = new THREE.Vector3();
+const _ehead = new THREE.Vector3();
+const _epick = new THREE.Vector3();
+const _ehit = new THREE.Vector3();
 
 const C_WHITE = new THREE.Color(0xffffff);
 const C_RIM = new THREE.Color(0xff2a1c);
+const C_CRIT = new THREE.Color(0xffe9a0);
 
 const HEAD_HINT = /(tooth|teeth|jaw|maw|lure|snout|head|bill|eye|whisker)/i;
 
@@ -569,6 +592,22 @@ const ENEMY_VISUALS = {
     coil: { color: 0x0a0a10, emissive: 0x6b0d10, rings: 3, radius: 0.95, tube: 0.26 },
     aura: { color: 0xff2a18, size: 1.5, idle: 0.1, hot: 0.85 },
   },
+  // --- Wave 7: the deep-water ambush pack. Never area-spawned (count 0) — the
+  //     server erupts a ring of these around a lone swimmer. Slim silver eel of
+  //     a thing, red-barred flanks, all teeth, and eyes that are already lit.
+  razorfin: {
+    fishDef: {
+      id: 'enemy_razorfin', name: 'Razorfin', tier: 5, value: 0, kg: [1, 4],
+      model: {
+        shape: 'eel', size: 0.7,
+        colors: [0xd6dde6, 0x8e2630], belly: 0xf4f8fb,
+        stripes: 0xb01c26, finTint: 0xd83a34, teeth: true,
+      },
+    },
+    eyeColor: 0xff3018, eyeIdle: 0.55, eyeSize: 0.17,
+    lure: null, bob: 1.5, animBase: 3.6, wake: 0xffc0b0,
+    frenzy: true,
+  },
 };
 
 function visualsFor(type) {
@@ -580,7 +619,7 @@ function visualsFor(type) {
 // then to the historical 'patrol'.
 function behaviorOf(e, def) {
   const b = (e && e.behavior) || (def && def.behavior);
-  return (b === 'drift' || b === 'ambush' || b === 'patrol') ? b : 'patrol';
+  return (b === 'drift' || b === 'ambush' || b === 'swarm' || b === 'patrol') ? b : 'patrol';
 }
 
 // A defensive stand-in used only if fish.js cannot produce a mesh for us
@@ -1054,6 +1093,14 @@ export function initEnemies(ctx) {
     origin: new THREE.Vector3(), dir: new THREE.Vector3(0, 0, 1),
   };
 
+  // Wave 7 — dazed-star sprite groups, pooled (a stunned enemy borrows one)
+  const starPool = [];
+  // Wave 7 — throttles for reporting hits on the colossal event creature
+  let lastEventHead = -10;
+  let lastEventBody = -10;
+  let lastHitWasHead = false;   // set by hitScan(), read immediately after
+  let lastAmbushRef = null;
+
   // ---------------- audio helper ----------------
   function sfx(name, volume, pos) {
     const a = ctx.audio;
@@ -1093,6 +1140,51 @@ export function initEnemies(ctx) {
     if (typeof f !== 'function') return 0;
     const h = f(x, z, t);
     return typeof h === 'number' && isFinite(h) ? h : 0;
+  }
+
+  // Any player by id — the local one or a remote. player.js is written in
+  // parallel, so every plausible container shape is probed and none is required.
+  function playerPos(id, out) {
+    if (id === undefined || id === null) return false;
+    const st = ctx.state;
+    if (st && st.myId === id) return getLocalPos(out);
+    const pm = ctx.playerMod;
+    const rem = pm && pm.remotes;
+    if (!rem) return false;
+    let r = null;
+    try {
+      if (typeof rem.get === 'function') r = rem.get(id);
+      else if (Array.isArray(rem)) {
+        for (let i = 0; i < rem.length; i++) { if (rem[i] && rem[i].id === id) { r = rem[i]; break; } }
+      } else r = rem[id];
+    } catch (e) { r = null; }
+    if (!r) return false;
+    const g = (r.char && r.char.group) || r.group || (r.isObject3D ? r : null);
+    if (g && g.isObject3D) { g.getWorldPosition(out); return true; }
+    if (r.position && r.position.isVector3) { out.copy(r.position); return true; }
+    return false;
+  }
+
+  // ---------------- wave 7: head zones ----------------
+  // A sphere ~0.35 * size across, sitting ~0.45 * size forward of the enemy
+  // origin along its INTERPOLATED facing (yaw + pitch), at body height.
+  function headRadiusOf(rec) {
+    return Math.max(HEAD_MIN_RAD, rec.def.size * HEAD_RAD);
+  }
+
+  function headCenter(rec, out) {
+    const cp = Math.cos(rec.pitch), sp = Math.sin(rec.pitch);
+    const fwd = rec.def.size * HEAD_FWD;
+    out.set(
+      rec.renderPos.x + Math.sin(rec.yaw) * cp * fwd,
+      rec.renderPos.y + rec.visual.center.y * 0.4 - sp * fwd,
+      rec.renderPos.z + Math.cos(rec.yaw) * cp * fwd
+    );
+    return out;
+  }
+
+  function bodyCenterY(rec) {
+    return rec.renderPos.y + rec.visual.center.y * 0.4;
   }
 
   // ==================================================================
@@ -1303,7 +1395,10 @@ export function initEnemies(ctx) {
     for (let i = 0; i < visual.eyes.length; i++) visual.eyes[i].material.opacity = 0;
     let pool = pools.get(type);
     if (!pool) { pool = []; pools.set(type, pool); }
-    if (pool.length < MAX_POOLED) { pool.push(visual); return; }
+    // a whole ambush pack despawns at once and the next one wants them straight
+    // back, so swarm bodies get a much deeper cache than the area regulars
+    const cap = (ENEMIES[type] && ENEMIES[type].behavior === 'swarm') ? MAX_POOLED_SWARM : MAX_POOLED;
+    if (pool.length < cap) { pool.push(visual); return; }
     // over capacity — drop it, disposing only the materials WE cloned
     for (let i = 0; i < visual.mats.length; i++) visual.mats[i].mat.dispose();
     for (let i = 0; i < visual.eyes.length; i++) visual.eyes[i].material.dispose();
@@ -1358,13 +1453,31 @@ export function initEnemies(ctx) {
       uncoil: 0, nextSurge: 0, wakeT: 0, dim: 1,
       sting: 0, lastSting: -10,
       driftSpin: (Math.random() - 0.5) * 0.5,
-      _lf: -1, _lr: -1, _ld: -1, _ldim: -1,
+      // wave 7: stun / flinch / frenzy state
+      stunned: false, stars: null, recoil: 0, crit: 0, lungeCd: 0, swarmSeed: Math.random() * 30,
+      _lf: -1, _lr: -1, _ld: -1, _ldim: -1, _lc: -1,
     };
     enemies.set(e.id, rec);
+    // the pack does not swim in — it ERUPTS, in a boil of bubbles
+    if (behavior === 'swarm') arriveFX(rec);
     return rec;
   }
 
+  // Razorfins boil up out of the dark... (a whole pack arrives at once, so the
+  // per-fish burst stays small — the ring-wide eruption is in onAmbush)
+  function arriveFX(rec) {
+    const p = rec.renderPos;
+    bubbles.burst(p.x, p.y, p.z, 6, 1.5, 0.1, 1.4, 0xdff2ff, 1.0, 1.0, 0, 0, 0, 0);
+  }
+
+  // ...and dive away just as hard when the frenzy breaks.
+  function diveAwayFX(rec) {
+    const p = rec.renderPos;
+    bubbles.burst(p.x, p.y, p.z, 8, 1.8, 0.1, 1.6, 0xdff2ff, 1.1, 0.9, 0, -1, 0, 1.1);
+  }
+
   function destroyEnemy(rec) {
+    releaseStars(rec);
     if (rec.wrapper.parent) rec.wrapper.parent.remove(rec.wrapper);
     releaseVisual(rec.type, rec.visual);
     enemies.delete(rec.id);
@@ -1377,6 +1490,8 @@ export function initEnemies(ctx) {
     rec.rim = 0;
     rec.lunge = 0;
     rec.uncoil = 0;
+    rec.stunned = false;
+    releaseStars(rec);
     rec.despawn = 0;   // the death animation owns the removal from here on
     sfx('enemyDie', 0.9, rec.renderPos);
     bubbles.burst(rec.renderPos.x, rec.renderPos.y, rec.renderPos.z, 14, 0.9,
@@ -1405,6 +1520,15 @@ export function initEnemies(ctx) {
       if (typeof e.behavior === 'string') rec.behavior = behaviorOf(e, rec.def);
       if (e.state) {
         rec.state = e.state;
+        // wave 7: a stunned enemy is frozen solid — not hostile, not moving
+        const stunned = e.state === 'stunned';
+        if (stunned && !rec.stunned && !rec.dead) {
+          rec.recoil = Math.max(rec.recoil, 1);
+          headCenter(rec, _hv);
+          sparks.burst(_hv.x, _hv.y + rec.def.size * 0.3, _hv.z, 10, 2.6, 0.11, 0.4,
+            0xffd85a, -0.5, 3.0, 0, 0, 0, 0);
+        }
+        rec.stunned = stunned;
         // 'lurk' is explicitly NOT hostile — that is the whole point of it
         const hostile = e.state === 'aggro' || e.state === 'attack' || e.state === 'lunge' || e.state === 'chase';
         if (hostile && !rec.aggro) {
@@ -1436,7 +1560,10 @@ export function initEnemies(ctx) {
 
     // anything the server stopped reporting fades out
     for (const rec of enemies.values()) {
-      if (rec.seen !== snapshotTick && !rec.dead && rec.despawn === 0) rec.despawn = 0.0001;
+      if (rec.seen !== snapshotTick && !rec.dead && rec.despawn === 0) {
+        rec.despawn = 0.0001;
+        if (rec.behavior === 'swarm') diveAwayFX(rec);   // the pack scatters into the dark
+      }
     }
   }
 
@@ -1447,6 +1574,14 @@ export function initEnemies(ctx) {
     if (!rec) return;
     rec.flash = 1;
     rec.telegraph = Math.max(rec.telegraph, 0.35);
+    // wave 7: every landed hit flinches — a short recoil kick away from the shooter
+    rec.recoil = Math.max(rec.recoil, 1);
+    _v2.subVectors(rec.renderPos, _camPos);
+    if (_v2.lengthSq() > 1e-6) {
+      _v2.normalize();
+      const push = 0.34 / Math.max(0.6, rec.def.size * 0.5);
+      rec.nudge.addScaledVector(_v2, push);
+    }
     if (typeof payload.hp === 'number') rec.hp = payload.hp;
     sfx('enemyHurt', 0.85, rec.renderPos);
     bubbles.burst(rec.renderPos.x, rec.renderPos.y, rec.renderPos.z, 5, 0.7,
@@ -1483,7 +1618,95 @@ export function initEnemies(ctx) {
     if (best) triggerSting(best);
   }
 
+  // ==================================================================
+  // Wave 7 — deep-water ambushes (MSG.AMBUSH)
+  //
+  // The pack itself arrives through ENEMY_STATE like any other enemy, so packs
+  // hunting OTHER players render normally with no help from here. These phases
+  // add the theatre: the boil of water under the warned swimmer, the eruption
+  // when the ring spawns, and the scatter when the frenzy breaks.
+  // ==================================================================
+  const frenzy = { active: false, targetId: null, mine: false, startedAt: 0 };
+
+  function frenzyLoop(on) {
+    const a = ctx.audio;
+    if (!a || typeof a.sfx !== 'function') return;
+    try { a.sfx('razorFrenzy', { on: !!on }); } catch (e) { /* audio must never break the frame */ }
+  }
+
+  function onAmbush(payload) {
+    if (!payload || payload === lastAmbushRef) return;
+    lastAmbushRef = payload;
+    const phase = payload.phase;
+    if (phase !== 'warn' && phase !== 'start' && phase !== 'end') return;
+    const st = ctx.state;
+    const mine = !!(st && payload.targetId !== undefined && payload.targetId === st.myId);
+    // No position for the target (a remote we cannot see) = no theatre needed;
+    // their razorfins still render from ENEMY_STATE all the same.
+    if (!playerPos(payload.targetId, _v3)) {
+      if (phase === 'end' && frenzy.targetId === payload.targetId) {
+        frenzy.active = false; frenzy.targetId = null;
+        if (frenzy.mine) { frenzy.mine = false; frenzyLoop(false); }
+      }
+      return;
+    }
+    const t = ctx.clock ? ctx.clock.getElapsedTime() : 0;
+    const wy = waterHeight(_v3.x, _v3.z, t);
+    const y = Math.min(_v3.y, wy - 0.2);
+
+    if (phase === 'warn') {
+      // something is circling BENEATH you: a slow boil rising out of the dark
+      for (let i = 0; i < 22; i++) {
+        const a = (i / 22) * Math.PI * 2 + Math.random() * 0.3;
+        const r = 3.5 + Math.random() * 5.5;
+        bubbles.spawn(
+          _v3.x + Math.cos(a) * r, y - 4 - Math.random() * 5, _v3.z + Math.sin(a) * r,
+          (Math.random() - 0.5) * 0.3, 0.9 + Math.random() * 0.7, (Math.random() - 0.5) * 0.3,
+          0.08 + Math.random() * 0.07, 2.4 + Math.random() * 1.2, 0xcfe8ff, 0.5, 0.7
+        );
+      }
+      if (mine) camShake = Math.min(1.0, camShake + 0.28);
+      return;
+    }
+
+    if (phase === 'start') {
+      frenzy.active = true;
+      frenzy.targetId = payload.targetId;
+      frenzy.startedAt = now;   // ENEMY_STATE lags this by a tick — give it a beat
+      const n = Math.max(4, Math.min(16, Number(payload.count) || 8));
+      for (let i = 0; i < n; i++) {
+        const a = (i / n) * Math.PI * 2;
+        const r = 10 + Math.random() * 6;
+        const px = _v3.x + Math.cos(a) * r, pz = _v3.z + Math.sin(a) * r;
+        bubbles.burst(px, y, pz, 5, 1.5, 0.11, 1.6, 0xdff2ff, 1.0, 1.0, 0, 0, 0, 0);
+        sparks.burst(px, y, pz, 3, 2.2, 0.09, 0.3, 0xff5a3a, -0.4, 3.0, 0, 0, 0, 0);
+      }
+      bubbles.burst(_v3.x, y, _v3.z, 14, 2.2, 0.12, 1.4, 0xe6f6ff, 1.1, 1.0, 0, 0, 0, 0);
+      if (mine) {
+        frenzy.mine = true;
+        frenzyLoop(true);
+        camShake = Math.min(1.4, camShake + 0.7);
+      }
+      return;
+    }
+
+    // 'end' — they break off and dive
+    if (frenzy.targetId === payload.targetId || !frenzy.targetId) {
+      frenzy.active = false;
+      frenzy.targetId = null;
+      if (frenzy.mine) { frenzy.mine = false; frenzyLoop(false); }
+    }
+    // the per-fish dive puff is fired from the despawn path in onEnemyState, so
+    // this is just the hole in the water where the pack used to be
+    bubbles.burst(_v3.x, y, _v3.z, 14, 2.6, 0.1, 1.8, 0xdff2ff, 0.9, 0.8, 0, -1, 0, 0.9);
+  }
+
   function clearAll() {
+    if (frenzy.mine) frenzyLoop(false);
+    frenzy.active = false; frenzy.targetId = null; frenzy.mine = false;
+    lastAmbushRef = null;
+    lastEventHead = -10;
+    lastEventBody = -10;
     for (const rec of enemies.values()) destroyEnemy(rec);
     enemies.clear();
     for (let i = 0; i < projectiles.length; i++) {
@@ -1517,7 +1740,9 @@ export function initEnemies(ctx) {
     // Duplicate deliveries of the same payload object are filtered above.
     ctx.net.on(MSG.ENEMY_STATE, onEnemyState);
     ctx.net.on(MSG.ENEMY_HIT, onEnemyHit);
+    ctx.net.on(MSG.AMBUSH, onAmbush);
   }
+  if (bus && typeof bus.on === 'function') bus.on('ambush', onAmbush);
 
   // ==================================================================
   // Weapons
@@ -1715,39 +1940,151 @@ export function initEnemies(ctx) {
     return pr;
   }
 
-  // best enemy hit along a segment; returns the record or null
+  // Best enemy hit along a segment; returns the record or null. The HEAD sphere
+  // is tested first for every candidate, so a shot that grazes both the skull
+  // and the flank is always scored as the headshot. `lastHitWasHead` carries
+  // that verdict back to the caller (read it immediately).
   function hitScan(ax, ay, az, bx, by, bz, extra, outPoint) {
-    let best = null, bestT = 2;
+    let best = null, bestT = 2, bestHead = false;
     for (const rec of enemies.values()) {
       if (rec.dead || rec.despawn > 0) continue;
-      const t = segmentSphere(ax, ay, az, bx, by, bz,
-        rec.renderPos.x, rec.renderPos.y + rec.visual.center.y * 0.4, rec.renderPos.z,
-        rec.radius + extra);
-      if (t >= 0 && t < bestT) { bestT = t; best = rec; }
+      headCenter(rec, _hv);
+      // the head gets only HALF the aim assist — a crit should cost you an aim
+      let t = segmentSphere(ax, ay, az, bx, by, bz, _hv.x, _hv.y, _hv.z, headRadiusOf(rec) + extra * 0.5);
+      const head = t >= 0;
+      if (!head) {
+        t = segmentSphere(ax, ay, az, bx, by, bz,
+          rec.renderPos.x, bodyCenterY(rec), rec.renderPos.z, rec.radius + extra);
+      }
+      if (t >= 0 && t < bestT) { bestT = t; best = rec; bestHead = head; }
     }
+    lastHitWasHead = bestHead;
     if (best && outPoint) {
       outPoint.set(ax + (bx - ax) * bestT, ay + (by - ay) * bestT, az + (bz - az) * bestT);
     }
     return best;
   }
 
+  // ------------------------------------------------------------------
+  // Wave 7 — striking the colossal event creature.
+  // events.js owns the giant; all it exposes is where the head is, how big the
+  // head sphere is, and how far a point is from the hide. Everything here is
+  // optional-chained so an events.js that has not caught up still cannot
+  // break a swing.
+  // ------------------------------------------------------------------
+  function eventHandle() {
+    const e = ctx.events;
+    if (!e || typeof e.headWorld !== 'function' || typeof e.headRadius !== 'function') return null;
+    const st = ctx.state;
+    if (!st || !st.eventActive) return null;   // "only when an event is active"
+    return e;
+  }
+
+  function eventHeadR(e) {
+    let r = 0;
+    try { r = e.headRadius(); } catch (err) { r = 0; }
+    return (typeof r === 'number' && isFinite(r) && r > 0) ? r : 0;
+  }
+
+  function eventBodyDist(e, p) {
+    if (typeof e.bodyDist !== 'function') return Infinity;
+    let d = Infinity;
+    try { d = e.bodyDist(p); } catch (err) { d = Infinity; }
+    return typeof d === 'number' ? d : Infinity;
+  }
+
+  // 0 = missed it entirely, 1 = body connection, 2 = head connection.
+  // outPoint gets the contact point on a hit.
+  function eventHitScan(ax, ay, az, bx, by, bz, outPoint) {
+    const e = eventHandle();
+    if (!e) return 0;
+    let ok = false;
+    try { ok = e.headWorld(_ehead) === true; } catch (err) { ok = false; }
+    if (!ok) return 0;
+    const r = eventHeadR(e);
+    if (r > 0) {
+      const t = segmentSphere(ax, ay, az, bx, by, bz, _ehead.x, _ehead.y, _ehead.z, r);
+      if (t >= 0) {
+        outPoint.set(ax + (bx - ax) * t, ay + (by - ay) * t, az + (bz - az) * t);
+        return 2;
+      }
+    }
+    let pad = 0.75;
+    if (typeof e.bodyHitPad === 'function') {
+      try { const v = e.bodyHitPad(); if (typeof v === 'number' && isFinite(v)) pad = v; } catch (err) { /* default */ }
+    }
+    for (let i = 0; i <= EVENT_BODY_STEPS; i++) {
+      const f = i / EVENT_BODY_STEPS;
+      _epick.set(ax + (bx - ax) * f, ay + (by - ay) * f, az + (bz - az) * f);
+      if (eventBodyDist(e, _epick) <= pad) { outPoint.copy(_epick); return 1; }
+    }
+    return 0;
+  }
+
+  // Report a connection to the server and play the local feedback.
+  // Returns true when the giant swallowed the attack (so callers can stop).
+  function tryEventHit(ax, ay, az, bx, by, bz, weaponId, dirX, dirY, dirZ, outPoint) {
+    const kind = eventHitScan(ax, ay, az, bx, by, bz, _ehit);
+    if (kind === 0) return false;
+    if (outPoint) outPoint.copy(_ehit);
+    if (kind === 2) {
+      if (now - lastEventHead < EVENT_HEAD_GAP) return true;
+      lastEventHead = now;
+      if (ctx.net && typeof ctx.net.send === 'function') {
+        ctx.net.send(MSG.EVENT_HIT, { headshot: true, weaponId: weaponId || null });
+      }
+      eventCritFX(_ehit, dirX, dirY, dirZ);
+      return true;
+    }
+    // body: cosmetic only, and it does not get to spam the wire
+    if (now - lastEventBody < EVENT_BODY_GAP) return true;
+    lastEventBody = now;
+    if (ctx.net && typeof ctx.net.send === 'function') {
+      ctx.net.send(MSG.EVENT_HIT, { headshot: false, weaponId: weaponId || null });
+    }
+    thudFX(_ehit);
+    return true;
+  }
+
+  // Is the giant close enough to jab rather than shoot? (Storm Trident choice.)
+  function eventInMeleeRange(origin, dir, range) {
+    const e = eventHandle();
+    if (!e) return false;
+    _epick.copy(origin).addScaledVector(dir, range * 0.85);
+    let ok = false;
+    try { ok = e.headWorld(_ehead) === true; } catch (err) { ok = false; }
+    if (ok) {
+      const r = eventHeadR(e);
+      if (r > 0 && _epick.distanceTo(_ehead) <= r) return true;
+    }
+    return eventBodyDist(e, _epick) <= 1.2;
+  }
+
   // dmgOverride / kind are optional: ranged callers pass neither and keep the
   // original behaviour, melee callers pass the weapon's melee damage + 'melee'.
-  function dealDamage(rec, def, weaponId, point, dirX, dirY, dirZ, dmgOverride, kind) {
+  // headshot is wave 7: the server applies the bonus damage and the stun, we
+  // only report the connection and play the crit read.
+  function dealDamage(rec, def, weaponId, point, dirX, dirY, dirZ, dmgOverride, kind, headshot) {
     if (!rec || rec.dead) return;
     const dmg = typeof dmgOverride === 'number' ? dmgOverride : def.dmg;
+    const head = headshot === true;
     if (ctx.net && typeof ctx.net.send === 'function') {
-      ctx.net.send(MSG.DAMAGE_ENEMY, { enemyId: rec.id, dmg, weaponId });
+      // body hits keep the pre-wave-7 payload exactly as it was
+      if (head) ctx.net.send(MSG.DAMAGE_ENEMY, { enemyId: rec.id, dmg, weaponId, headshot: true });
+      else ctx.net.send(MSG.DAMAGE_ENEMY, { enemyId: rec.id, dmg, weaponId });
     }
     // local feedback (server confirms with ENEMY_HIT)
     const isMelee = kind === 'melee';
-    rec.flash = Math.max(rec.flash, isMelee ? 1 : 0.85);
+    rec.flash = Math.max(rec.flash, head ? 1.35 : (isMelee ? 1 : 0.85));
+    if (head) rec.crit = 1;
     rec.telegraph = Math.max(rec.telegraph, isMelee ? 0.6 : 0);
-    const push = isMelee ? 0.62 : 0.42;
+    rec.recoil = Math.max(rec.recoil, head ? 1 : 0.7);
+    const push = (isMelee ? 0.62 : 0.42) * (head ? 1.45 : 1);
     rec.nudge.x += dirX * push;
     rec.nudge.y += dirY * (isMelee ? 0.3 : 0.22);
     rec.nudge.z += dirZ * push;
-    if (isMelee) meleeImpactFX(point, dirX, dirY, dirZ, false);
+    if (head) critFX(point, dirX, dirY, dirZ, isMelee);
+    else if (isMelee) meleeImpactFX(point, dirX, dirY, dirZ, false);
     else impactFX(point, dirX, dirY, dirZ, weaponId);
   }
 
@@ -1777,6 +2114,69 @@ export function initEnemies(ctx) {
     if (p.y < waterHeight(p.x, p.z, t)) {
       bubbles.burst(p.x, p.y, p.z, 8, 1.2, 0.1, 1.1, 0xdff0ff, 1.2, 1.2, 0, 0, 0, 0);
     }
+  }
+
+  // ------------------------------------------------------------------
+  // Wave 7 FX — crit hitmarker, dull thud, dazed stars
+  // ------------------------------------------------------------------
+
+  // The headshot read: a hard white pop, a tight gold starburst and the crisp
+  // crit ding. Deliberately different in colour AND shape from a body hit.
+  function critFX(p, dx, dy, dz, isMelee) {
+    sfx('headshot', 1.0, p);
+    sparks.burst(p.x, p.y, p.z, 10, 0.5, 0.26, 0.13, 0xffffff, 0, 7.5, 0, 0, 0, 0);
+    sparks.burst(p.x, p.y, p.z, 16, 3.6, 0.13, 0.34, 0xffe27a, -1.6, 3.6, -dx, -dy, -dz, 1.3);
+    sparks.burst(p.x, p.y, p.z, 8, 5.2, 0.09, 0.22, 0xfff8d8, 0, 2.2, 0, 0, 0, 0);
+    const t = ctx.clock ? ctx.clock.getElapsedTime() : 0;
+    if (p.y < waterHeight(p.x, p.z, t)) {
+      bubbles.burst(p.x, p.y, p.z, 9, 1.3, 0.1, 1.1, 0xeaf8ff, 1.2, 1.2, 0, 0, 0, 0);
+    }
+    camShake = Math.min(1.4, camShake + (isMelee ? 0.3 : 0.22));
+  }
+
+  // The giants do not care. A flat, dull thud and a puff of nothing.
+  function thudFX(p) {
+    sfx('impact', 0.45, p);
+    sparks.burst(p.x, p.y, p.z, 7, 1.7, 0.1, 0.2, 0x9aa6b0, -1.2, 4.5, 0, 0, 0, 0);
+    const t = ctx.clock ? ctx.clock.getElapsedTime() : 0;
+    if (p.y < waterHeight(p.x, p.z, t)) {
+      bubbles.burst(p.x, p.y, p.z, 5, 0.9, 0.09, 0.9, 0xdff0ff, 1.0, 1.2, 0, 0, 0, 0);
+    }
+  }
+
+  // A head hit on something 100 m long deserves rather more.
+  function eventCritFX(p, dx, dy, dz) {
+    sfx('headshot', 1.0, p);
+    sparks.burst(p.x, p.y, p.z, 22, 1.2, 0.34, 0.2, 0xffffff, 0, 6.0, 0, 0, 0, 0);
+    sparks.burst(p.x, p.y, p.z, 30, 6.5, 0.2, 0.55, 0xffd85a, -1.2, 2.6, -dx, -dy, -dz, 1.6);
+    bubbles.burst(p.x, p.y, p.z, 12, 2.0, 0.16, 1.5, 0xeaf8ff, 1.1, 1.0, 0, 0, 0, 0);
+    camShake = Math.min(1.5, camShake + 0.5);
+  }
+
+  function acquireStars() {
+    const g = starPool.pop();
+    if (g) { g.visible = true; return g; }
+    const grp = new THREE.Group();
+    const list = [];
+    for (let i = 0; i < STUN_STAR_COUNT; i++) {
+      const s = makeGlowSprite(i % 2 ? 0xfff2b8 : 0xffcf4a, 0.2, 0.9);
+      grp.add(s);
+      list.push(s);
+    }
+    grp.userData.stars = list;
+    fx.add(grp);
+    return grp;
+  }
+
+  function releaseStars(rec) {
+    const g = rec.stars;
+    if (!g) return;
+    rec.stars = null;
+    g.visible = false;
+    if (starPool.length < 6) { starPool.push(g); return; }
+    if (g.parent) g.parent.remove(g);
+    const list = g.userData.stars || [];
+    for (let i = 0; i < list.length; i++) list[i].material.dispose();
   }
 
   function ensureBeam() {
@@ -1828,7 +2228,15 @@ export function initEnemies(ctx) {
       const range = def.range;
       _v4.copy(_v1).addScaledVector(_v2, range);
       const hit = hitScan(_v1.x, _v1.y, _v1.z, _v4.x, _v4.y, _v4.z, 0.45, _v5);
-      const endX = hit ? _v5.x : _v4.x, endY = hit ? _v5.y : _v4.y, endZ = hit ? _v5.z : _v4.z;
+      const beamHead = lastHitWasHead;
+      // the lance stops on the first thing it finds: an enemy, or the giant
+      let evHit = false;
+      if (!hit) {
+        evHit = tryEventHit(_v1.x, _v1.y, _v1.z, _v4.x, _v4.y, _v4.z,
+          'trident', _v2.x, _v2.y, _v2.z, _v5);
+      }
+      const stopped = hit || evHit;
+      const endX = stopped ? _v5.x : _v4.x, endY = stopped ? _v5.y : _v4.y, endZ = stopped ? _v5.z : _v4.z;
       const b = ensureBeam();
       _v3.set(endX - _v1.x, endY - _v1.y, endZ - _v1.z);
       const len = Math.max(0.2, _v3.length());
@@ -1852,7 +2260,7 @@ export function initEnemies(ctx) {
           0.1, 0.18 + Math.random() * 0.2, i % 3 === 0 ? 0xffffff : 0x8fd8ff, 0, 2.4
         );
       }
-      if (hit) dealDamage(hit, def, 'trident', _v5, _v2.x, _v2.y, _v2.z);
+      if (hit) dealDamage(hit, def, 'trident', _v5, _v2.x, _v2.y, _v2.z, undefined, undefined, beamHead);
     }
   }
 
@@ -1886,9 +2294,11 @@ export function initEnemies(ctx) {
     meleeAim(melee.origin, melee.dir);
     for (const rec of enemies.values()) {
       if (rec.dead || rec.despawn > 0) continue;
-      if (inMeleeArc(rec.renderPos.x, rec.renderPos.y + rec.visual.center.y * 0.4, rec.renderPos.z,
+      if (inMeleeArc(rec.renderPos.x, bodyCenterY(rec), rec.renderPos.z,
         rec.radius, range, melee.origin, melee.dir) >= 0) return true;
     }
+    // wave 7: a wall of kraken arm right on top of you is worth jabbing too
+    if (eventInMeleeRange(melee.origin, melee.dir, range)) return true;
     return flopperInRange(melee.origin, melee.dir, range) !== null;
   }
 
@@ -1942,15 +2352,31 @@ export function initEnemies(ctx) {
     for (const rec of enemies.values()) {
       if (hits >= MELEE_MAX_TARGETS) break;
       if (rec.dead || rec.despawn > 0) continue;
-      const cy = rec.renderPos.y + rec.visual.center.y * 0.4;
-      const d = inMeleeArc(rec.renderPos.x, cy, rec.renderPos.z, rec.radius, range, melee.origin, melee.dir);
+      // wave 7: swing at the HEAD first — a connection there beats the flank
+      headCenter(rec, _hv);
+      const hr = headRadiusOf(rec);
+      let head = true;
+      let cx = _hv.x, cy = _hv.y, cz = _hv.z, cr = hr;
+      let d = inMeleeArc(cx, cy, cz, cr, range, melee.origin, melee.dir);
+      if (d < 0) {
+        head = false;
+        cx = rec.renderPos.x; cy = bodyCenterY(rec); cz = rec.renderPos.z; cr = rec.radius;
+        d = inMeleeArc(cx, cy, cz, cr, range, melee.origin, melee.dir);
+      }
       if (d < 0) continue;
-      _v4.set(rec.renderPos.x - melee.origin.x, cy - melee.origin.y, rec.renderPos.z - melee.origin.z);
+      _v4.set(cx - melee.origin.x, cy - melee.origin.y, cz - melee.origin.z);
       if (_v4.lengthSq() > 1e-6) _v4.normalize(); else _v4.copy(melee.dir);
-      _v5.copy(melee.origin).addScaledVector(_v4, Math.max(0.25, d - rec.radius * 0.55));
-      dealDamage(rec, def, melee.weaponId, _v5, _v4.x, _v4.y, _v4.z, dmg, 'melee');
+      _v5.copy(melee.origin).addScaledVector(_v4, Math.max(0.25, d - cr * 0.55));
+      dealDamage(rec, def, melee.weaponId, _v5, _v4.x, _v4.y, _v4.z, dmg, 'melee', head);
       hits++;
     }
+    // wave 7: and the thing the size of a cathedral, if it happens to be here
+    if (tryEventHit(
+      melee.origin.x, melee.origin.y, melee.origin.z,
+      melee.origin.x + melee.dir.x * range,
+      melee.origin.y + melee.dir.y * range,
+      melee.origin.z + melee.dir.z * range,
+      melee.weaponId, melee.dir.x, melee.dir.y, melee.dir.z, null)) hits++;
     // your own landed catch is a perfectly valid thing to hit
     if (bonkFlopper(melee.origin, melee.dir, range, dmg)) hits++;
 
@@ -2070,11 +2496,22 @@ export function initEnemies(ctx) {
       // hit test along this step
       const def = weaponDef(pr.weaponId);
       const rec = hitScan(pr.prev.x, pr.prev.y, pr.prev.z, pr.pos.x, pr.pos.y, pr.pos.z, 0.1, _v5);
+      const projHead = lastHitWasHead;
       if (rec && def) {
         _v1.copy(pr.vel).normalize();
-        dealDamage(rec, def, pr.weaponId, _v5, _v1.x, _v1.y, _v1.z);
+        dealDamage(rec, def, pr.weaponId, _v5, _v1.x, _v1.y, _v1.z, undefined, undefined, projHead);
         pr.dead = true;
         continue;
+      }
+      // nothing small in the way — did it bury itself in the giant?
+      if (!rec) {
+        _v1.copy(pr.vel);
+        if (_v1.lengthSq() > 1e-8) _v1.normalize(); else _v1.set(0, 0, 1);
+        if (tryEventHit(pr.prev.x, pr.prev.y, pr.prev.z, pr.pos.x, pr.pos.y, pr.pos.z,
+          pr.weaponId, _v1.x, _v1.y, _v1.z, null)) {
+          pr.dead = true;
+          continue;
+        }
       }
 
       // terrain / sea floor / range stop
@@ -2157,12 +2594,15 @@ export function initEnemies(ctx) {
   // `dim` (< 1 only for lurking ambushers) drains both the albedo and the
   // emissive so a coiled moray reads as a lump of seabed until it strikes.
   function applyMaterialState(rec) {
-    const flash = rec.flash, rim = rec.rim, fade = rec.fade, dim = rec.dim;
+    const flash = rec.flash, rim = rec.rim, fade = rec.fade, dim = rec.dim, crit = rec.crit;
     if (Math.abs(flash - rec._lf) < 0.004 && Math.abs(rim - rec._lr) < 0.004 &&
-        Math.abs(fade - rec._ld) < 0.004 && Math.abs(dim - rec._ldim) < 0.004) return;
-    rec._lf = flash; rec._lr = rim; rec._ld = fade; rec._ldim = dim;
+        Math.abs(fade - rec._ld) < 0.004 && Math.abs(dim - rec._ldim) < 0.004 &&
+        Math.abs(crit - rec._lc) < 0.004) return;
+    rec._lf = flash; rec._lr = rim; rec._ld = fade; rec._ldim = dim; rec._lc = crit;
     const mats = rec.visual.mats;
     const hasDim = dim < 0.999;
+    // wave 7: a headshot flashes GOLD, a body hit flashes white
+    const hot = crit > 0.02 ? C_CRIT : C_WHITE;
     for (let i = 0; i < mats.length; i++) {
       const s = mats[i];
       const m = s.mat;
@@ -2172,14 +2612,14 @@ export function initEnemies(ctx) {
         if (hasDim) m.color.multiplyScalar(0.4 + dim * 0.6);
         if (!lit) {
           if (rim > 0.002) m.color.lerp(C_RIM, rim * 0.28);
-          if (flash > 0.002) m.color.lerp(C_WHITE, flash * 0.8);
+          if (flash > 0.002) m.color.lerp(hot, clamp(flash, 0, 1) * 0.8);
         }
       }
       if (lit) {
         m.emissive.copy(s.emissive);
         if (hasDim) m.emissive.multiplyScalar(dim);
         if (rim > 0.002) m.emissive.lerp(C_RIM, clamp(rim * 0.55, 0, 0.8));
-        if (flash > 0.002) m.emissive.lerp(C_WHITE, clamp(flash, 0, 1));
+        if (flash > 0.002) m.emissive.lerp(hot, clamp(flash, 0, 1));
         m.emissiveIntensity = s.ei * (hasDim ? dim : 1) + rim * 0.85 + flash * 2.6;
       }
       if (fade < 0.999) {
@@ -2294,6 +2734,10 @@ export function initEnemies(ctx) {
 
   function updateEnemy(rec, dt, t, weaponActive, weaponRange, hasLocal) {
     const vis = rec.vis;
+    const swarm = rec.behavior === 'swarm';
+    const stunned = rec.stunned && !rec.dead && rec.despawn === 0;
+    // wave 7: the flinch recoil from the last landed hit
+    if (rec.recoil > 0) rec.recoil = Math.max(0, rec.recoil - dt / RECOIL_TIME);
 
     // ---- despawn (server dropped it) ----
     if (rec.despawn > 0) {
@@ -2363,10 +2807,35 @@ export function initEnemies(ctx) {
         desiredPitch = 0;
       }
       const yawErr = shortAngle(rec.yaw, desiredYaw);
-      const turn = yawErr * (1 - Math.exp(-(rec.dead ? 1.2 : 6.5) * dt));
+      // razorfins bank HARD — they change direction like a thrown knife
+      const turnRate = rec.dead ? 1.2 : (swarm ? 13 : 6.5);
+      const turn = yawErr * (1 - Math.exp(-turnRate * dt));
       rec.yaw += turn;
-      rec.pitch = damp(rec.pitch, desiredPitch, rec.dead ? 2 : 5, dt);
-      if (!rec.dead) rec.roll = damp(rec.roll, clamp(-turn / Math.max(dt, 0.001) * 0.12, -0.6, 0.6), 5, dt);
+      rec.pitch = damp(rec.pitch, desiredPitch, rec.dead ? 2 : (swarm ? 8 : 5), dt);
+      if (!rec.dead) {
+        const bankK = swarm ? 0.26 : 0.12, bankMax = swarm ? 1.25 : 0.6;
+        rec.roll = damp(rec.roll, clamp(-turn / Math.max(dt, 0.001) * bankK, -bankMax, bankMax), swarm ? 8 : 5, dt);
+      }
+    }
+
+    // ---- wave 7: a stunned enemy hangs there, listing, pointing nowhere ----
+    if (stunned) {
+      rec.roll = damp(rec.roll, STUN_LIST, 3.0, dt);
+      rec.pitch = damp(rec.pitch, 0.15, 2.2, dt);
+    }
+
+    // ---- wave 7: the razorfin dart-in. Fast enough to be a lunge = a bite. ----
+    if (swarm && !rec.dead && !stunned) {
+      rec.lungeCd -= dt;
+      if (rec.lungeCd <= 0 && speed > rec.def.speed * SWARM_LUNGE_SPEED) {
+        rec.lungeCd = 0.42 + Math.random() * 0.34;
+        rec.lunge = Math.max(rec.lunge, 0.92);
+        rec.telegraph = Math.max(rec.telegraph, 0.7);
+        if (Math.random() < 0.4) {
+          bubbles.burst(rec.renderPos.x, rec.renderPos.y, rec.renderPos.z, 3, 0.7,
+            0.07, 0.8, 0xdff2ff, 0.9, 1.4, 0, 0, 0, 0);
+        }
+      }
     }
 
     // ---- transform ----
@@ -2378,12 +2847,32 @@ export function initEnemies(ctx) {
       swayX = Math.sin(t * 0.37 + rec.phase) * 0.13;
       swayZ = Math.cos(t * 0.41 + rec.phase * 1.7) * 0.13;
     }
+    // ---- wave 7: frenzied schooling jitter (razorfins never hold a line) ----
+    let jitYaw = 0, jitRoll = 0;
+    if (swarm && !rec.dead) {
+      const ph = rec.swarmSeed;
+      const hot = rec.aggro ? 1.7 : 1;
+      if (stunned) {
+        // dazed: a slow woozy wallow instead of the frenzy
+        bob += Math.sin(t * 1.1 + ph) * 0.09;
+        jitRoll = Math.sin(t * 0.9 + ph) * 0.12;
+      } else {
+        swayX += Math.sin(t * 9.3 * hot + ph) * 0.15 + Math.sin(t * 23.1 + ph * 2.3) * 0.05;
+        bob += Math.sin(t * 7.9 * hot + ph * 1.7) * 0.12;
+        swayZ += Math.cos(t * 8.7 * hot + ph * 0.7) * 0.15 + Math.cos(t * 19.7 + ph * 1.3) * 0.05;
+        jitYaw = Math.sin(t * 6.3 * hot + ph) * 0.30 + Math.sin(t * 18.1 + ph * 3.1) * 0.10;
+        jitRoll = Math.sin(t * 5.1 * hot + ph * 2.3) * 0.5;
+      }
+    } else if (stunned) {
+      bob += Math.sin(t * 0.9 + rec.phase) * 0.06 * vis.bob;
+    }
+
     rec.wrapper.position.set(
       rec.renderPos.x + rec.nudge.x + swayX,
       rec.renderPos.y + rec.nudge.y + rec.sinkY + bob,
       rec.renderPos.z + rec.nudge.z + swayZ
     );
-    rec.wrapper.rotation.set(rec.pitch, rec.yaw, rec.roll);
+    rec.wrapper.rotation.set(rec.pitch, rec.yaw + jitYaw, rec.roll + jitRoll);
 
     // ---- aggro / telegraph / lunge ----
     const aggro = rec.aggro && !rec.dead;
@@ -2426,6 +2915,13 @@ export function initEnemies(ctx) {
       );
     }
 
+    // ---- wave 7: recoil kick — a short backwards yank on any landed hit ----
+    if (rec.recoil > 0.001 && !rec.dead) {
+      const rk = rec.recoil * rec.recoil;
+      rec.visual.holder.position.z -= rk * rec.visual.size.z * 0.16;
+      rec.visual.holder.position.y += rk * rec.visual.size.y * 0.06;
+    }
+
     const s = 1 + pulse * 0.14 + rec.lunge * 0.22;
     rec.wrapper.scale.set(s, s, s + rec.lunge * 0.18 + rear * 0.16);
 
@@ -2440,20 +2936,42 @@ export function initEnemies(ctx) {
       sp.scale.set(asz, asz, 1);
     }
 
-    // ---- swim animation ----
+    // ---- swim animation (a stunned enemy is frozen mid-stroke) ----
     const speedFactor = clamp(speed / Math.max(1, rec.def.speed), 0, 1.6);
-    const rate = vis.animBase * (aggro ? 2.1 : 1.0) * (0.75 + speedFactor * 0.9) * (rec.dead ? 0.25 : 1) * (dreadMode ? 1.15 : 1);
+    const rate = stunned ? 0
+      : vis.animBase * (aggro ? 2.1 : 1.0) * (0.75 + speedFactor * 0.9) * (rec.dead ? 0.25 : 1) * (dreadMode ? 1.15 : 1);
     rec.animClock += dt * rate;
     if (rec.visual.hasAnim) {
       try { rec.visual.fishGroup.userData.update(rec.animClock); } catch (e) { rec.visual.hasAnim = false; }
     }
 
+    // ---- wave 7: dazed stars orbiting the head ----
+    if (stunned) {
+      if (!rec.stars) rec.stars = acquireStars();
+      const g = rec.stars;
+      headCenter(rec, _hv);
+      const rr = Math.max(0.32, rec.def.size * 0.52);
+      g.position.set(_hv.x, _hv.y + rr * 1.15, _hv.z);
+      const list = g.userData.stars;
+      for (let i = 0; i < list.length; i++) {
+        const a = t * 3.1 + (i / list.length) * Math.PI * 2;
+        list[i].position.set(Math.cos(a) * rr, Math.sin(a * 2 + i) * rr * 0.22, Math.sin(a) * rr);
+        const sz = rr * 0.5 * (0.75 + 0.25 * Math.sin(t * 8.5 + i * 1.9));
+        list[i].scale.set(sz, sz, 1);
+        list[i].material.opacity = clamp(rec.fade * (0.5 + 0.5 * Math.sin(t * 6.2 + i * 1.7)), 0, 1);
+      }
+    } else if (rec.stars) {
+      releaseStars(rec);
+    }
+
     // ---- eyes ----
-    const eyeTarget = rec.dead ? 0 : (aggro ? 1 : (dreadMode ? vis.eyeIdle * 2.2 : vis.eyeIdle));
+    const eyeTarget = rec.dead ? 0
+      : (stunned ? vis.eyeIdle * 0.55 : (aggro ? 1 : (dreadMode ? vis.eyeIdle * 2.2 : vis.eyeIdle)));
     // ambushers snap their eyes open on the telegraph and cool off slowly
     const eyeRate = aggro ? (rec.uncoil > 0 ? 26 : 12) : (rec.behavior === 'ambush' ? 1.6 : 4);
     rec.eyeLit = damp(rec.eyeLit, eyeTarget, eyeRate, dt);
-    const flicker = aggro ? (0.82 + Math.sin(t * 17 + rec.phase) * 0.18) : 1;
+    const flicker = stunned ? (0.3 + 0.7 * Math.abs(Math.sin(t * 8.7 + rec.phase)))
+      : (aggro ? (0.82 + Math.sin(t * 17 + rec.phase) * 0.18) : 1);
     const eyeBase = Math.max(0.06, rec.visual.size.z * vis.eyeSize);
     const eyeScale = eyeBase * (1 + pulse * 0.5 + (aggro ? 0.35 : 0));
     for (let i = 0; i < rec.visual.eyes.length; i++) {
@@ -2531,6 +3049,7 @@ export function initEnemies(ctx) {
     }
     rec.rim = damp(rec.rim, rimTarget, 11, dt);
     rec.flash = Math.max(0, rec.flash - dt * 4.2);
+    rec.crit = Math.max(0, rec.crit - dt * 4.2);
     applyMaterialState(rec);
   }
 
@@ -2563,8 +3082,20 @@ export function initEnemies(ctx) {
 
     // Map iteration tolerates deletion of the visited entry, so enemies that
     // finish dying inside updateEnemy can remove themselves safely.
+    let swarmLive = 0;
     for (const rec of enemies.values()) {
+      if (rec.behavior === 'swarm' && !rec.dead && rec.despawn === 0) swarmLive++;
       updateEnemy(rec, dt, t, weaponActive, weaponRange, hasLocal);
+    }
+
+    // ---- wave 7: your own frenzy keeps the lens rattling while it lasts ----
+    if (frenzy.mine && frenzy.active) {
+      if (swarmLive > 0) camShake = Math.max(camShake, 0.14 + Math.min(0.16, swarmLive * 0.02));
+      else if (now - frenzy.startedAt > 3) {
+        // the pack is gone and no 'end' ever arrived — do not rattle forever
+        frenzy.active = false; frenzy.mine = false; frenzy.targetId = null;
+        frenzyLoop(false);
+      }
     }
 
     updateProjectiles(dt, t);

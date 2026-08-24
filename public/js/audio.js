@@ -30,7 +30,7 @@
 // export: initAudio(ctx) -> { update, cutMusic, sfx, setUnderwater, startMusic, setVolume }
 // =============================================================
 
-import { ECON, MSG } from '/shared/constants.js';
+import { AMBUSH, ECON, MSG } from '/shared/constants.js';
 
 // ---------------- musical constants ----------------
 const TEMPO = 76;                  // unhurried: this is a hammock, not a chase
@@ -72,6 +72,10 @@ const EMPTY = Object.freeze({});
 function mtof(m) { return 440 * Math.pow(2, (m - 69) / 12); }
 function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
 function smoothstep(a, b, x) { const t = clamp((x - a) / (b - a || 1e-6), 0, 1); return t * t * (3 - 2 * t); }
+
+// wave 7: hard ceiling on the razorfin swarm bed — the server's frenzy window
+// plus slack, so a lost 'end' beat can never leave the loop running forever.
+const FRENZY_MAX = clamp(Number(AMBUSH && AMBUSH.DURATION) || 22, 4, 120) + 14;
 
 // ------------------------------------------------------------------
 // AudioParam safety layer - EVERY param write in this file goes through it
@@ -183,6 +187,8 @@ export function initAudio(ctx) {
   // wave 5 loops: the revive channel shimmer and the doomsday rumble bed
   let chanNodes = null, chanAt = 0, chanSeen = 0;
   let quakeNodes = null, quakeAt = 0, doomAt = -99;
+  // wave 6/7 loop: the razorfin swarm bed (frenzyWant survives a rebuild)
+  let frenzyNodes = null, frenzyAt = 0, frenzyWant = false, nextChomp = 0;
   // per-call sfx modifiers, set by sfx() from opts (volume/vol/gain and pos)
   let curScale = 1, curPan = 0;
   let started = false;
@@ -1893,6 +1899,62 @@ export function initAudio(ctx) {
       duckAmbience(0.35, 3.0);
     },
 
+    // ---------- wave 7: headshots, stuns, deep-water ambushes ----------
+    // A CRIT, not a hit: a metallic tick and two bright partials a fifth
+    // apart, pitch-jittered so a run of head hits never machine-guns the
+    // same ding. Deliberately short — enemies.js may fire it every swing.
+    headshot(t, o) {
+      const p = 0.94 + Math.random() * 0.17;
+      noise(t, 0.03, 0.2, sfxBus, { type: 'bandpass', f0: fHz(5200 * p, 5200), Q: 9, atk: 0.0008 });
+      tone('square', 1980 * p, t, 0.05, 0.1, sfxBus, { f1: 1320 * p, atk: 0.0008, filter: 'lowpass', ff0: 6000 });
+      bell(t + 0.008, mtof(96) * p, 0.17, 0.5, sfxBus, revS);
+      bell(t + 0.052, mtof(103) * p, 0.11, 0.8, sfxBus, revM);
+      tone('sine', 150, t, 0.16, 0.12, sfxBus, { f1: 68, glide: 0.11, atk: 0.001 });
+      noise(t + 0.02, 0.2, 0.04, sfxBus, { type: 'highpass', f0: 8000, atk: 0.006, rev: revS });
+    },
+    // the water goes wrong under you: a low hit, a falling smear, bubbles
+    ambushSting(t, o) {
+      tone('sine', 96, t, 2.2, 0.42, sfxBus, { f1: 27, glide: 1.7, atk: 0.004, rev: revL, prio: true });
+      tone('square', 48, t, 2.0, 0.12, sfxBus, { f1: 15, glide: 1.6, filter: 'lowpass', ff0: 340, atk: 0.02, prio: true });
+      noise(t, 1.5, 0.2, sfxBus, {
+        type: 'lowpass', f0: 1600, f1: 190, sweep: 1.2, Q: 1.3, atk: 0.006, brown: true, rev: revL, prio: true,
+      });
+      tone('sawtooth', 1500, t + 0.02, 1.1, 0.06, sfxBus, {
+        f1: 220, glide: 1.0, filter: 'bandpass', ff0: 1800, ff1: 420, fsweep: 1.0, fq: 8,
+        atk: 0.02, shape: 'soft', rev: revM,
+      });
+      for (let i = 0; i < 6; i++) SFX.bubble(t + 0.08 + i * 0.07, EMPTY);
+      duckAmbience(0.4, 1.8);
+    },
+    // the swarm bed. {on:true} starts it, {on:false} sends them away.
+    razorFrenzy(t, o) {
+      if (o && o.on === false) { frenzyStop(0.7); return; }
+      frenzyStart();
+    },
+    // a hit the size of a building: a gong, then the world wobbling off-key
+    eventStunned(t, o) {
+      const f0 = 52;
+      noise(t, 0.09, 0.26, sfxBus, { type: 'bandpass', f0: 1700, Q: 3, atk: 0.001, prio: true });
+      tone('sine', f0 * 0.5, t, 5.4, 0.3, sfxBus, { atk: 0.012, hold: 2.0, rev: revL, prio: true });
+      tone('sine', f0, t, 4.6, 0.3, sfxBus, { atk: 0.006, hold: 1.6, rev: revL, prio: true });
+      tone('triangle', f0 * 1.5, t, 3.4, 0.16, sfxBus, { atk: 0.005, hold: 1.1, rev: revL });
+      tone('triangle', f0 * 2.41, t, 2.6, 0.1, sfxBus, { atk: 0.004, hold: 0.8, rev: revL });
+      // the detuned warble — three voices sliding past each other, off-centre
+      const g = tone('sine', 320, t + 0.1, 3.0, 0.1, sfxBus, { f1: 232, glide: 2.6, atk: 0.06, rev: revL });
+      tone('sine', 316, t + 0.1, 3.0, 0.085, sfxBus, { f1: 244, glide: 2.6, atk: 0.06, pan: 0.5 });
+      tone('triangle', 158, t + 0.12, 2.8, 0.07, sfxBus, { f1: 122, glide: 2.4, atk: 0.08, pan: -0.5 });
+      if (g && ac) {
+        const lfo = ac.createOscillator(); lfo.type = 'sine';
+        pAt(lfo.frequency, oHz(7.4), t);
+        pExp(lfo.frequency, oHz(2.6), t + 3.0);
+        const lg = gainNode(0.06);
+        lfo.connect(lg); lg.connect(g.gain);
+        lfo.start(t); lfo.stop(t + 3.2);
+        reg(t + 3.3, [lfo, lg]);
+      }
+      duckAmbience(0.3, 3.0);
+    },
+
     // ---------- shop / progression (boat.js, ui.js) ----------
     upgrade(t, o) {
       const lv = clamp(Math.round(o.level || 2), 1, 6);
@@ -2053,6 +2115,13 @@ export function initAudio(ctx) {
     claw: 'clawGrab', rescueClaw: 'clawGrab', towBody: 'clawGrab', grabBody: 'clawGrab',
     quake: 'doomQuake', doomRumble: 'doomQuake', groundShake: 'doomQuake',
     bell: 'doomBell', dreadBell: 'doomBell', toll: 'doomBell',
+    // wave 7: headshots, stuns, deep-water ambushes. ('ambush' already means
+    // the moray's lunge — the swimmer's telegraph is 'ambushSting'.)
+    crit: 'headshot', critHit: 'headshot', headHit: 'headshot', headShot: 'headshot',
+    stun: 'headshot', enemyStun: 'headshot',
+    frenzy: 'razorFrenzy', razorfin: 'razorFrenzy', razorfins: 'razorFrenzy', swarm: 'razorFrenzy',
+    ambushWarn: 'ambushSting', dread: 'ambushSting', circling: 'ambushSting',
+    eventStun: 'eventStunned', daze: 'eventStunned', dazed: 'eventStunned', giantStun: 'eventStunned',
     // ui
     blip: 'uiBlip', click: 'uiBlip', uiClick: 'uiBlip', select: 'uiBlip', tick: 'uiBlip',
     open: 'uiOpen', menuOpen: 'uiOpen', shopOpen: 'uiOpen',
@@ -2084,6 +2153,9 @@ export function initAudio(ctx) {
     // The two loop toggles are deliberately absent: an on/off pair must never
     // be swallowed by a dedup floor.
     perfectCast: 0.25, revive: 0.4, clawGrab: 0.2, doomBell: 4.0,
+    // wave 7 — AMBUSH and EVENT_PHASE both arrive over net AND the bus relay.
+    // 'razorFrenzy' is deliberately absent: it is an on/off pair.
+    headshot: 0.06, ambushSting: 0.8, eventStunned: 1.2,
   };
 
   let tickCount = 0;
@@ -2271,6 +2343,92 @@ export function initAudio(ctx) {
   }
 
   // ------------------------------------------------------------------
+  // wave 7 — the razorfin swarm bed
+  // ------------------------------------------------------------------
+  // Same shape as the other loops: one envelope gain (out.gain, single
+  // writer), every modulator on its own node, everything torn down on stop /
+  // rebuild / phase change. It sits UNDER the music on purpose — the swarm is
+  // a texture you feel, and the individual bites (chomp, scheduled from
+  // update) are what actually make you flinch.
+  function frenzyStart() {
+    frenzyWant = true;
+    if (!ac || !built || frenzyNodes) return;
+    const t = ac.currentTime;
+    const out = gainNode(0.0001);
+    out.connect(sfxBus);
+    out.connect(revS);
+    const bed = gainNode(1);        // the chitter gate rides here, never on out.gain
+    bed.connect(out);
+
+    // churned water underneath
+    const ws = pNoiseLocal(brownBuf, 0.8);
+    const wf = ac.createBiquadFilter(); wf.type = 'lowpass';
+    pSet(wf.frequency, fHz(520)); pSet(wf.Q, qVal(0.7));
+    const wg = gainNode(0.34);
+    ws.connect(wf); wf.connect(wg); wg.connect(bed);
+
+    // the chittering: a narrow band of hiss, gated fast
+    const cs = pNoiseLocal(whiteBuf, 1.35);
+    const cf = ac.createBiquadFilter(); cf.type = 'bandpass';
+    pSet(cf.frequency, fHz(2600)); pSet(cf.Q, qVal(4.5));
+    const cgate = gainNode(0.5);
+    const cg = gainNode(0.3);
+    cs.connect(cf); cf.connect(cgate); cgate.connect(cg); cg.connect(bed);
+    // depth 0.45 against a 0.5 gate: it flutters, it never inverts
+    const chit = ac.createOscillator(); chit.type = 'square'; pSet(chit.frequency, oHz(17));
+    const chitG = ac.createGain(); pSet(chitG.gain, mVal(0.45, 1));
+    chit.connect(chitG); chitG.connect(cgate.gain);
+    // and a slow sweep so the pack circles instead of sitting still
+    // (2600 +/- 900 Hz — nowhere near the cutoff floor)
+    const sw = ac.createOscillator(); sw.type = 'sine'; pSet(sw.frequency, oHz(0.37));
+    const swG = ac.createGain(); pSet(swG.gain, mVal(modDepth(2600, 900, 400), F_MAX));
+    sw.connect(swG); swG.connect(cf.frequency);
+
+    ws.start(0); cs.start(0); chit.start(t); sw.start(t);
+    pAt(out.gain, 0.0001, t);
+    pExp(out.gain, gVal(0.32), t + 0.35);
+    frenzyNodes = {
+      out,
+      list: [out, bed, ws, wf, wg, cs, cf, cgate, cg, chit, chitG, sw, swG],
+      osc: [chit, sw], src: [ws, cs],
+    };
+    frenzyAt = t;
+    nextChomp = t + 0.1;
+    duckAmbience(0.55, 3.0);
+  }
+  function frenzyStop(fade) {
+    frenzyWant = false;
+    nextChomp = 0;
+    if (!frenzyNodes) return;
+    const n = frenzyNodes;
+    frenzyNodes = null;
+    stopLoop(n, fade === undefined ? 0.7 : fade);
+  }
+  // a looping noise source that is NOT registered as a persistent node —
+  // the loop owns it, stopLoop() reaps it (pNoiseSrc is for the always-on bed)
+  function pNoiseLocal(buf, rate) {
+    const s = ac.createBufferSource();
+    s.buffer = buf; s.loop = true;
+    pSet(s.playbackRate, rVal(rate, 1));
+    return s;
+  }
+  // one razorfin taking a pass at you
+  function chomp(t) {
+    if (!ac || !built || full()) return;
+    const p = 0.82 + Math.random() * 0.5;
+    const pan = (Math.random() - 0.5) * 1.5;
+    noise(t, 0.045, 0.13, sfxBus, { type: 'bandpass', f0: fHz(2200 * p, 2200), Q: 7, atk: 0.001, pan });
+    noise(t + 0.02, 0.09, 0.07, sfxBus, {
+      type: 'bandpass', f0: fHz(800 * p, 800), f1: 380, sweep: 0.07, Q: 2, atk: 0.002, pan,
+    });
+    if (Math.random() < 0.45) {
+      tone('square', 900 * p, t, 0.035, 0.05, sfxBus, {
+        f1: 520 * p, atk: 0.001, filter: 'lowpass', ff0: 3400, pan,
+      });
+    }
+  }
+
+  // ------------------------------------------------------------------
   // public sfx entry
   // ------------------------------------------------------------------
   // callers across the codebase pass loudness as {volume}, {vol} or {gain}, and
@@ -2437,6 +2595,12 @@ export function initAudio(ctx) {
       quakeNodes = null;
       for (let i = 0; i < n.list.length; i++) killNode(n.list[i]);
     }
+    if (frenzyNodes) {
+      // frenzyWant is left alone on purpose — restoreState re-arms the swarm
+      const n = frenzyNodes;
+      frenzyNodes = null;
+      for (let i = 0; i < n.list.length; i++) killNode(n.list[i]);
+    }
 
     for (let i = 0; i < persistRun.length; i++) { try { persistRun[i].stop(0); } catch (e) { /* noop */ } }
     for (let i = 0; i < persist.length; i++) { try { persist[i].disconnect(); } catch (e) { /* noop */ } }
@@ -2494,6 +2658,9 @@ export function initAudio(ctx) {
     chanSeen = 0;
     // a rebuild in the middle of the doomsday must not silence the ground
     if (t - doomAt < 40) quakeStart();
+    // ...and a rebuild mid-frenzy must not silence the pack chewing on you
+    nextChomp = 0;
+    if (frenzyWant) frenzyStart();
     pendingThunder.length = 0;
   }
 
@@ -2576,13 +2743,18 @@ export function initAudio(ctx) {
     bus.on('weather', (d) => setWeatherType(d && d.type ? d.type : d));
     bus.on('lightning', (d) => onLightning(d));
     bus.on('tsunami', () => onDoomsday());
-    bus.on('gameOver', () => { quakeStop(2.5); stopMusic(1.2); sfxDedup('gameOver', EMPTY, 3); });
-    bus.on('gameWon', () => { quakeStop(1.0); stopMusic(1.0); sfxDedup('gameWon', EMPTY, 3); });
+    bus.on('gameOver', () => { frenzyStop(0.6); quakeStop(2.5); stopMusic(1.2); sfxDedup('gameOver', EMPTY, 3); });
+    bus.on('gameWon', () => { frenzyStop(0.6); quakeStop(1.0); stopMusic(1.0); sfxDedup('gameWon', EMPTY, 3); });
     // wave 5
     bus.on('perfectCast', () => sfxDedup('perfectCast', EMPTY, 0.25));
     bus.on('reviveChannel', (d) => onReviveChannel(d));
     bus.on('revived', (d) => onRevived(d));
     bus.on('bodyTowed', (d) => onBodyTowed(d));
+    // wave 7 — enemies.js fires 'headshot' itself, but the crit ding must
+    // land even if it forgets; the dedup floor stops the two doubling up
+    bus.on('headshot', () => sfxDedup('headshot', EMPTY, 0.06));
+    bus.on('ambush', (d) => onAmbushMsg(d));
+    bus.on('eventPhase', (d) => onEventPhaseMsg(d));
     // shop, wallet, portal and the UI had no voice at all before wave 3
     bus.on('shopResult', (d) => onShop(d));
     bus.on('wallet', (d) => onWallet(d));
@@ -2752,6 +2924,33 @@ export function initAudio(ctx) {
     sfxDedup('clawGrab', EMPTY, 0.25);
   }
 
+  // --- wave 7: deep-water ambushes + the giants' daze -------------------
+  // These fire straight off the protocol so the cues work even if no other
+  // module remembers to call sfx() — ui.js only paints. Everything is gated
+  // on the ambush being OURS: a crewmate's frenzy is happening somewhere
+  // else in the ocean and has no business in your ears.
+  function onAmbushMsg(d) {
+    if (!d || typeof d !== 'object') return;
+    if (!ensureContext(gestureSeen || started)) return;
+    const phase = String(d.phase || '');
+    if (phase !== 'warn' && phase !== 'start' && phase !== 'end') return;
+    const target = (d.targetId != null) ? String(d.targetId) : '';
+    const me = myNetId();
+    const mine = target ? (!!me && target === String(me)) : true;
+    if (!mine) return;
+    if (phase === 'warn') sfxDedup('ambushSting', EMPTY, 0.8);
+    else if (phase === 'start') sfx('razorFrenzy', { on: true });
+    else sfx('razorFrenzy', { on: false });
+  }
+
+  // EVENT_PHASE 'stunned' = a head hit landed on one of the giants
+  function onEventPhaseMsg(d) {
+    if (!d || typeof d !== 'object') return;
+    if (String(d.phase || '') !== 'stunned') return;
+    if (!ensureContext(gestureSeen || started)) return;
+    sfxDedup('eventStunned', EMPTY, 1.2);
+  }
+
   // --- wave 5: doomsday -------------------------------------------------
   // TSUNAMI now means the run is ending one way or another. Music cuts through
   // the existing path, the horror layer hands the low end over to the quake
@@ -2764,6 +2963,7 @@ export function initAudio(ctx) {
     doomAt = now;
     cutMusic();
     channelStop(0.15);
+    frenzyStop(0.5);          // nothing is nibbling now; the sea is arriving
     if (horrorNodes) stopHorror(1.2);
     quakeStart();
     sfxDedup('tsunamiRoar', EMPTY, 3);
@@ -2782,6 +2982,7 @@ export function initAudio(ctx) {
         motorStop();
         reelOn = false;
         channelStop(0.2);
+        frenzyStop(0.4);
         quakeStop(0.8);
         doomAt = -99;
         if (horrorNodes) stopHorror(0.6);
@@ -2790,6 +2991,7 @@ export function initAudio(ctx) {
       motorStop();
       reelOn = false;
       channelStop(0.2);
+      frenzyStop(0.5);
       quakeStop(2.5);        // the ground settles as the end screen comes up
       if (horrorNodes) stopHorror(1.2);
       stopMusic(1.6);
@@ -2806,12 +3008,15 @@ export function initAudio(ctx) {
       net.on(MSG.CAST_RESULT, (d) => onCatch(d));
       net.on(MSG.QUOTA_DONE, () => sfxDedup('quotaDone', EMPTY, 1.0));
       net.on(MSG.TSUNAMI, () => onDoomsday());
-      net.on(MSG.GAME_OVER, () => { quakeStop(2.5); stopMusic(1.2); sfxDedup('gameOver', EMPTY, 3); });
-      net.on(MSG.GAME_WON, () => { quakeStop(1.0); stopMusic(1.0); sfxDedup('gameWon', EMPTY, 3); });
+      net.on(MSG.GAME_OVER, () => { frenzyStop(0.6); quakeStop(2.5); stopMusic(1.2); sfxDedup('gameOver', EMPTY, 3); });
+      net.on(MSG.GAME_WON, () => { frenzyStop(0.6); quakeStop(1.0); stopMusic(1.0); sfxDedup('gameWon', EMPTY, 3); });
       net.on(MSG.REVIVED, (d) => onRevived(d));
       net.on(MSG.BODY_TOWED, (d) => onBodyTowed(d));
       net.on(MSG.EVENT_START, (d) => onEventStart(d && d.type));
       net.on(MSG.EVENT_END, () => onEventEnd());
+      // wave 7: the ambush beats and the giants' daze
+      net.on(MSG.AMBUSH, (d) => onAmbushMsg(d));
+      net.on(MSG.EVENT_PHASE, (d) => onEventPhaseMsg(d));
       net.on(MSG.ENEMY_HIT, () => sfxDedup('enemyHurt', EMPTY, 0.08));
       net.on(MSG.SHOP_RESULT, (d) => onShop(d));
       net.on(MSG.WEATHER, (d) => { if (d && typeof d.type === 'string') setWeatherType(d.type); });
@@ -3058,6 +3263,16 @@ export function initAudio(ctx) {
       else if (now - chanAt > 12) channelStop(0.3);     // absolute backstop
     }
     if (quakeNodes && now - quakeAt > 90) quakeStop(2.5);
+
+    // --- wave 7: the swarm keeps taking passes at you while it lasts ---
+    if (frenzyNodes) {
+      if (now >= nextChomp) {
+        chomp(now + 0.02);
+        nextChomp = now + 0.16 + Math.random() * 0.3;
+      }
+      // the server owns the window; this is only the "we lost the end" net
+      if (now - frenzyAt > FRENZY_MAX) frenzyStop(1.2);
+    }
 
     // --- reel ticks (reelHold > 0 means the caller re-arms it every frame) ---
     if (reelOn && reelHold > 0 && now > reelHold) { reelOn = false; reelHold = 0; }
